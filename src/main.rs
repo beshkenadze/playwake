@@ -54,6 +54,7 @@ struct RemotePlay {
     stream_commands: Option<mpsc::Sender<media::StreamCommand>>,
     overlay_open: bool,
     overlay_index: usize,
+    restore_windowed: bool,
     resolution: xbox::Resolution,
     lsfg_enabled: bool,
     device: Option<DevicePrompt>,
@@ -74,7 +75,7 @@ fn x11_window(window: &Window) -> Option<media::VideoWindow> {
         RawWindowHandle::Xlib(handle) => handle.window,
         _ => return None,
     };
-    Some(media::VideoWindow { xid, top_inset: (58.0 * window.scale_factor()).ceil() as u32 })
+    Some(media::VideoWindow { xid })
 }
 
 impl RemotePlay {
@@ -108,9 +109,12 @@ impl RemotePlay {
         });
     }
 
-    fn start_stream(&mut self, console: xbox::Console, window: Option<media::VideoWindow>) {
+    fn start_stream(&mut self, console: xbox::Console, window: &mut Window) {
         if self.stream.is_some() || self.sign_in.is_some() { return; }
         let Some(account) = self.account.clone() else { return; };
+        let native_window = x11_window(window);
+        self.restore_windowed = native_window.is_some() && !window.is_fullscreen();
+        if self.restore_windowed { window.toggle_fullscreen(); }
         let cancel = Arc::new(AtomicBool::new(false));
         self.stream = Some(cancel.clone());
         self.status = "Connecting to Xbox…".into();
@@ -120,7 +124,7 @@ impl RemotePlay {
         let (controls, rx) = mpsc::channel();
         self.stream_commands = Some(controls);
         thread::spawn(move || {
-            let result = media::play(account, console, resolution, window, cancel, run, Some(rx),
+            let result = media::play(account, console, resolution, native_window, cancel, run, Some(rx),
                 |event| { let _ = tx.send(Event::Stream(event)); });
             let _ = tx.send(Event::StreamEnded(result));
         });
@@ -139,7 +143,8 @@ impl RemotePlay {
         match index {
             0 => self.control_stream(media::StreamCommand::CloseOverlay),
             1 => self.control_stream(media::StreamCommand::XboxGuide),
-            2 => self.stop_stream(),
+            2 => self.control_stream(media::StreamCommand::ToggleDiagnostics),
+            3 => self.stop_stream(),
             _ => {}
         }
     }
@@ -151,7 +156,7 @@ impl RemotePlay {
         self.consoles = consoles;
     }
 
-    fn receive(&mut self, event: Event) {
+    fn receive(&mut self, event: Event, window: &mut Window) {
         match event {
             Event::Device(prompt) => {
                 self.status = "Waiting for Microsoft confirmation".into();
@@ -169,18 +174,27 @@ impl RemotePlay {
                 self.overlay_open = open;
                 self.overlay_index = 0;
             }
-            Event::Stream(media::StreamEvent::OverlayKey(key)) if self.overlay_open => match key {
-                media::OverlayKey::Left => self.overlay_index = (self.overlay_index + 2) % 3,
-                media::OverlayKey::Right => self.overlay_index = (self.overlay_index + 1) % 3,
-                media::OverlayKey::Activate => self.use_overlay_action(self.overlay_index),
-                media::OverlayKey::Back => self.control_stream(media::StreamCommand::CloseOverlay),
-            },
+            Event::Stream(media::StreamEvent::OverlayKey(key)) if self.overlay_open => {
+                let count = if x11_window(window).is_some() { 4 } else { 3 };
+                match key {
+                    media::OverlayKey::Left => self.overlay_index = (self.overlay_index + count - 1) % count,
+                    media::OverlayKey::Right => self.overlay_index = (self.overlay_index + 1) % count,
+                    media::OverlayKey::Activate => self.use_overlay_action(
+                        if count == 3 && self.overlay_index == 2 { 3 } else { self.overlay_index }),
+                    media::OverlayKey::Back => self.control_stream(media::StreamCommand::CloseOverlay),
+                    media::OverlayKey::Select(index) => self.use_overlay_action(index),
+                }
+                self.control_stream(media::StreamCommand::OverlaySelection(self.overlay_index));
+            }
             Event::Stream(media::StreamEvent::OverlayKey(_)) => {}
             Event::StreamEnded(result) => {
                 journal::record("stream_ended", json!({"success": result.is_ok()}));
                 self.stream = None;
                 self.stream_commands = None;
                 self.overlay_open = false;
+                if std::mem::take(&mut self.restore_windowed) && window.is_fullscreen() {
+                    window.toggle_fullscreen();
+                }
                 self.status = result.err().unwrap_or_else(|| "Stream stopped".into());
             }
         }
@@ -189,17 +203,21 @@ impl RemotePlay {
 
 impl Render for RemotePlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let native_video = self.stream.is_some() && x11_window(window).is_some();
         let sign_button = Button::new("sign-in").primary().label("Sign in with Microsoft")
             .on_click(cx.listener(|view, _, _, cx| { view.start_login(); cx.notify(); }));
         let mut header = div().h(px(58.)).px_4().flex().items_center().justify_between()
             .child(Label::new(self.status.clone()));
-        if self.stream.is_some() && self.overlay_open {
+        if native_video {
+            header = header.justify_center();
+        }
+        else if self.stream.is_some() && self.overlay_open {
             let mut actions = div().flex().gap_2();
             for (index, label) in ["Resume", "Xbox Guide", "Stop stream"].into_iter().enumerate() {
                 let mut button = Button::new(("overlay-action", index)).label(label);
                 if index == self.overlay_index { button = button.primary(); }
                 actions = actions.child(button.on_click(cx.listener(move |view, _, _, cx| {
-                    view.use_overlay_action(index);
+                    view.use_overlay_action(if index == 2 { 3 } else { index });
                     cx.notify();
                 })));
             }
@@ -280,12 +298,16 @@ impl Render for RemotePlay {
                 let selected = console.clone();
                 content = content.child(Button::new(("console", index)).label(label)
                     .on_click(cx.listener(move |view, _, window, cx| {
-                        view.start_stream(selected.clone(), x11_window(window));
+                        view.start_stream(selected.clone(), window);
                         cx.notify();
                     })));
             }
         }
-        div().size_full().flex().flex_col().child(header).child(content)
+        if native_video {
+            div().size_full().bg(rgb(0x000000)).flex().items_center().justify_center().child(header)
+        } else {
+            div().size_full().flex().flex_col().child(header).child(content)
+        }
     }
 }
 
@@ -316,15 +338,14 @@ fn main() {
                 cx.observe_window_activation(window, |view: &mut RemotePlay, window, _| {
                     view.control_stream(media::StreamCommand::InputFocus(window.is_window_active()));
                 }).detach();
-                cx.spawn(async move |view, cx| loop {
-                    cx.background_executor().timer(Duration::from_millis(120)).await;
+                cx.spawn_in(window, async move |view, cx| loop {
+                    cx.background_executor().timer(Duration::from_millis(40)).await;
                     while let Ok(event) = rx.try_recv() {
-                        if view.update(cx, |view: &mut RemotePlay, cx| { view.receive(event); cx.notify(); }).is_err() { return; }
-                        cx.refresh();
+                        if view.update_in(cx, |view: &mut RemotePlay, window, cx| { view.receive(event, window); cx.notify(); }).is_err() { return; }
                     }
                 }).detach();
                 let mut view = RemotePlay { tx, account: None, consoles: Vec::new(), sign_in: None,
-                    stream: None, stream_commands: None, overlay_open: false, overlay_index: 0,
+                    stream: None, stream_commands: None, overlay_open: false, overlay_index: 0, restore_windowed: false,
                     resolution: xbox::Resolution::default(), device: None,
                     lsfg_enabled: session_store::load_lsfg(),
                     status: if media::runtime_available() { "Playwake".into() } else { "GStreamer worker missing".into() } };

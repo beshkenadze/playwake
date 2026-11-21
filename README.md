@@ -30,14 +30,21 @@ report the actual decoder dimensions separately from the requested size.
 
 ### Stream controls
 
-Hold **View + Menu** together for half a second to open the stream menu.
-Use the D-pad to select **Resume**, **Xbox Guide**, or **Stop stream**.
-Press **A** to confirm or **B** to resume. The toolbar also opens the menu
-with a pointer. The menu pauses controller input to the Xbox and waits for
+On SteamOS, the stream fills the fullscreen window and preserves the video's
+aspect ratio. Hold **View + Menu** together for half a second or right-click
+the video to open the stream menu above it. Use the D-pad and **A** to select
+**Resume**, **Xbox Guide**, **Show diagnostics**, or **Stop stream**. Press
+**B** to resume. The menu pauses controller input to the Xbox and waits for
 the controls to return to neutral before resuming.
 
+The diagnostics HUD shows the incoming resolution, viewport size, decoded
+FPS, measured video bitrate, requested bitrate limit, decoder, LSFG state,
+available WebRTC RTT and jitter, and video queue and sink drops. Decoded FPS
+counts source frames. The HUD leaves gameplay input active when the menu is
+closed.
+
 To play from Steam Gaming Mode, run `cargo build --release --locked` and
-place the resulting `playwake` binary, `media/gstreamer_player.py`, and
+place the resulting `playwake` binary, both Python files in `media/`, and
 `launch-steamos.sh` in the same directory. Add the launcher as a non-Steam
 game and keep Steam's overlay enabled. The launcher lets Steam manage
 Gamescope focus, and the media worker clears controller input to Xbox

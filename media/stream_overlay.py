@@ -1,0 +1,147 @@
+"""X11 stream controls and diagnostics, composited above the video child."""
+import ctypes as c
+
+
+class ButtonEvent(c.Structure):
+    _fields_ = [('type', c.c_int), ('serial', c.c_ulong), ('send_event', c.c_int),
+                ('display', c.c_void_p), ('window', c.c_ulong), ('root', c.c_ulong),
+                ('subwindow', c.c_ulong), ('time', c.c_ulong), ('x', c.c_int),
+                ('y', c.c_int), ('root_x', c.c_int), ('root_y', c.c_int),
+                ('state', c.c_uint), ('button', c.c_uint)]
+
+
+class StreamOverlay:
+    def __init__(self, x11, display, parent, create_child, toggle, select):
+        self.x11, self.display, self.parent = x11, display, parent
+        self.toggle, self.select = toggle, select
+        ptr, xid, i, u, d = c.c_void_p, c.c_ulong, c.c_int, c.c_uint, c.c_double
+
+        def bind(library, *definitions):
+            for name, result, args in definitions:
+                function = getattr(library, name)
+                function.restype, function.argtypes = result, args
+
+        bind(x11,
+            ('XSelectInput', i, [ptr, xid, c.c_long]),
+            ('XUnmapWindow', i, [ptr, xid]),
+            ('XGrabButton', i, [ptr, u, u, xid, i, u, i, i, xid, xid]))
+        self.shape = c.CDLL('libXext.so.6')
+        bind(self.shape,
+            ('XShapeCombineRectangles', None, [ptr, xid, i, i, i, ptr, i, i, i]),
+            ('XShapeCombineMask', None, [ptr, xid, i, i, i, xid, i]))
+        self.cairo = c.CDLL('libcairo.so.2')
+        bind(self.cairo,
+            ('cairo_xlib_surface_create', ptr, [ptr, xid, ptr, i, i]),
+            ('cairo_surface_destroy', None, [ptr]),
+            ('cairo_create', ptr, [ptr]),
+            ('cairo_destroy', None, [ptr]),
+            ('cairo_set_source_rgb', None, [ptr, d, d, d]),
+            ('cairo_rectangle', None, [ptr, d, d, d, d]),
+            ('cairo_fill', None, [ptr]),
+            ('cairo_scale', None, [ptr, d, d]),
+            ('cairo_move_to', None, [ptr, d, d]),
+            ('cairo_select_font_face', None, [ptr, c.c_char_p, i, i]),
+            ('cairo_set_font_size', None, [ptr, d]),
+            ('cairo_show_text', None, [ptr, c.c_char_p]))
+
+        self.xid = create_child(1, 1)
+        screen = x11.XDefaultScreen(display)
+        self.visual = x11.XDefaultVisual(display, screen)
+        x11.XStoreName(display, self.xid, b'Playwake stream overlay')
+        x11.XSelectInput(display, self.xid, (1 << 15) | (1 << 2))  # ExposureMask | ButtonPressMask
+        # Right click opens the menu from the video or its parent, with no visible toolbar.
+        x11.XGrabButton(display, 3, 1 << 15, parent, 0, (1 << 2) | (1 << 3), 1, 1, 0, 0)
+        self.menu = False
+        self.diagnostics = False
+        self.selection = 0
+        self.metrics = ()
+        self.rendered = None
+        self.geometry = None
+        self.scale = 1.0
+
+    def handle(self, event):
+        entry = c.cast(event, c.POINTER(ButtonEvent)).contents
+        if entry.type == 12 and entry.window == self.xid:  # Expose
+            self.rendered = None
+        if entry.type != 4:  # ButtonPress
+            return
+        if entry.button == 3 and entry.window in (self.parent, self.xid):
+            self.toggle()
+        elif entry.button == 1 and entry.window == self.xid and self.menu:
+            x, y = entry.x / self.scale, entry.y / self.scale
+            index = int((y - 58) // 42)
+            if 18 <= x <= 342 and 58 <= y < 226:
+                self.select(index)
+
+    def update(self, video_size):
+        mode = 'menu' if self.menu else 'hud' if self.diagnostics else None
+        if mode is None:
+            if self.geometry is not None:
+                self.x11.XUnmapWindow(self.display, self.xid)
+                self.x11.XFlush(self.display)
+                self.geometry = self.rendered = None
+            return
+
+        width, height = video_size
+        self.scale = min(1.5, width / 400, height / 290, max(0.8, height / 800))
+        logical_width, logical_height = (360, 256) if self.menu else (356, 140)
+        w, h = (max(1, round(value * self.scale)) for value in (logical_width, logical_height))
+        if self.menu:
+            x, y = (width - w) // 2, (height - h) // 2
+        else:
+            x = y = round(12 * self.scale)
+        layout = (mode, x, y, w, h)
+        if layout != self.geometry:
+            self.x11.XMoveResizeWindow(self.display, self.xid, x, y, w, h)
+            # HUD is click-through. The open menu receives pointer events.
+            if self.menu:
+                self.shape.XShapeCombineMask(self.display, self.xid, 2, 0, 0, 0, 0)
+            else:
+                self.shape.XShapeCombineRectangles(self.display, self.xid, 2, 0, 0, None, 0, 0, 0)
+            self.x11.XMapRaised(self.display, self.xid)
+            self.geometry = layout
+
+        frame = (layout, self.selection, self.diagnostics, self.metrics if not self.menu else ())
+        if self.rendered != frame:
+            self.draw(w, h, logical_width, logical_height)
+            self.rendered = frame
+
+    def draw(self, pixel_width, pixel_height, width, height):
+        lib = self.cairo
+        surface = lib.cairo_xlib_surface_create(self.display, self.xid, self.visual,
+                                                pixel_width, pixel_height)
+        ctx = lib.cairo_create(surface)
+        try:
+            lib.cairo_scale(ctx, pixel_width / width, pixel_height / height)
+
+            def rect(x, y, w, h, color):
+                lib.cairo_set_source_rgb(ctx, *color)
+                lib.cairo_rectangle(ctx, x, y, w, h)
+                lib.cairo_fill(ctx)
+
+            def text(x, y, value, size, bold=False, color=(0.93, 0.95, 0.99)):
+                lib.cairo_set_source_rgb(ctx, *color)
+                lib.cairo_select_font_face(ctx, b'sans-serif', 0, int(bold))
+                lib.cairo_set_font_size(ctx, size)
+                lib.cairo_move_to(ctx, x, y)
+                lib.cairo_show_text(ctx, value.encode())
+
+            rect(0, 0, width, height, (0.065, 0.079, 0.112))
+            if self.menu:
+                text(18, 35, 'Stream menu', 21, True)
+                diagnostics = 'Hide diagnostics' if self.diagnostics else 'Show diagnostics'
+                for index, label in enumerate(('Resume', 'Xbox Guide', diagnostics, 'Stop stream')):
+                    y = 58 + 42 * index
+                    selected = index == self.selection
+                    color = (0.19, 0.42, 0.65) if selected else (0.11, 0.14, 0.19)
+                    rect(18, y, width - 36, 36, color)
+                    text(28, y + 24, label, 16, selected)
+                text(18, 242, 'D-pad · A Select · B Resume', 13, color=(0.67, 0.73, 0.81))
+            else:
+                text(12, 23, 'Stream diagnostics', 16, True)
+                for index, line in enumerate(self.metrics or ('Collecting samples…',)):
+                    text(12, 46 + 18 * index, line, 13)
+        finally:
+            lib.cairo_destroy(ctx)
+            lib.cairo_surface_destroy(surface)
+            self.x11.XFlush(self.display)
