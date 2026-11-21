@@ -1,0 +1,17 @@
+[package]
+name = "playwake"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = "=0.10.0"
+qrcode = { version = "0.14", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+url = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+raw-window-handle = "0.6"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+gilrs = "0.11"
