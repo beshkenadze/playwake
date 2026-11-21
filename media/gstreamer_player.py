@@ -93,6 +93,7 @@ class X11VideoWindow:
             ('XStoreName', int_, [ptr, xid, c.c_char_p]),
             ('XMapRaised', int_, [ptr, xid]),
             ('XFlush', int_, [ptr]),
+            ('XSync', int_, [ptr, int_]),
             ('XInternAtom', xid, [ptr, c.c_char_p, int_]),
             ('XSetWMProtocols', int_, [ptr, xid, pointer(xid), int_]),
             ('XPending', int_, [ptr]),
@@ -114,6 +115,7 @@ class X11VideoWindow:
         self.focus_timer = 0
         self.adopt_vulkan = adopt_vulkan
         self.adoption_started = None
+        self.vulkan_surface_ready = threading.Event()
         if adopt_vulkan:
             self.xid = 0
             try:
@@ -194,7 +196,8 @@ class X11VideoWindow:
                 self.x11.XReparentWindow(self.display, xid, self.parent, 0, 0)
                 self.x11.XMoveResizeWindow(self.display, xid, 0, 0, *self.size)
                 self.x11.XMapRaised(self.display, xid)
-                self.x11.XFlush(self.display)
+                self.x11.XSync(self.display, False)
+                self.vulkan_surface_ready.set()
                 emit('vulkan-window-embedded')
                 emit('video-surface', width=self.size[0], height=self.size[1])
                 return
@@ -202,6 +205,17 @@ class X11VideoWindow:
             self.adoption_started = None
             emit('error', message='Could not attach the Vulkan video window')
             self.on_close()
+
+    def wait_for_vulkan_surface(self, _pad, info):
+        if info.get_event().type != Gst.EventType.CAPS:
+            return Gst.PadProbeReturn.OK
+        # vulkansink creates its swapchain on the first CAPS event. X11
+        # initially creates a 320×240 window. With LSFG it can keep presenting
+        # the first swapchain after a resize, so attach and size it first.
+        if not self.vulkan_surface_ready.wait(6) or not self.xid:
+            GLib.idle_add(self.on_close)
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.REMOVE
 
     def update(self):
         if self.adopt_vulkan and not self.xid:
@@ -858,6 +872,8 @@ class Player:
                 GstVideo.VideoOverlay.set_window_handle(self.video_sink, self.window_id)
             branch.get_by_name('depay').get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.receive_rtp)
             sink_pad = self.video_sink.get_static_pad('sink')
+            if self.window and self.window.adopt_vulkan:
+                sink_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.window.wait_for_vulkan_surface)
             if self.lsfg:
                 sink_pad.add_probe(Gst.PadProbeType.BUFFER, self.check_lsfg_layer)
             if self.renderer == 'vulkan':
@@ -1336,6 +1352,8 @@ class Player:
         finally:
             if self.hud_timer is not None:
                 GLib.source_remove(self.hud_timer)
+            if self.window:
+                self.window.vulkan_surface_ready.set()
             self.pipeline.set_state(Gst.State.NULL)
             if self.gamescope_timer is not None:
                 GLib.source_remove(self.gamescope_timer)
