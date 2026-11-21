@@ -18,6 +18,7 @@ import gi
 for namespace in ('Gst', 'GstSdp', 'GstWebRTC', 'GstVideo'):
     gi.require_version(namespace, '1.0')
 from gi.repository import GLib, Gst, GstSdp, GstVideo, GstWebRTC
+from stream_overlay import StreamOverlay
 
 Gst.init(None)
 
@@ -69,7 +70,7 @@ class XResClientIdValue(c.Structure):
 
 
 class X11VideoWindow:
-    def __init__(self, parent, on_close, adopt_vulkan=False):
+    def __init__(self, parent, on_close, adopt_vulkan=False, overlay_actions=None):
         self.x11 = c.CDLL('libX11.so.6')
         ptr, xid, int_, uint = c.c_void_p, c.c_ulong, c.c_int, c.c_uint
         pointer = c.POINTER
@@ -105,9 +106,10 @@ class X11VideoWindow:
         if not self.display:
             raise RuntimeError('Native playback requires an X11 display')
         self.parent = parent or self.x11.XDefaultRootWindow(self.display)
-        self.inset = int(os.getenv('GREENLIGHT_VIDEO_PARENT_INSET', '162')) if parent else 0
         self.on_close = on_close
         self.size = self.dimensions()
+        self.overlay = (StreamOverlay(self.x11, self.display, self.parent, self.create_child, *overlay_actions)
+                        if parent and overlay_actions else None)
         self.prior_focus = None
         self.focus_timer = 0
         self.adopt_vulkan = adopt_vulkan
@@ -132,11 +134,7 @@ class X11VideoWindow:
         if parent:
             # GPUI's Xwayland window is ARGB32. ximagesink creates its image
             # for the screen's default visual, so the child must use that depth.
-            screen = self.x11.XDefaultScreen(self.display)
-            attributes = X11WindowAttributes(colormap=self.x11.XDefaultColormap(self.display, screen))
-            self.xid = self.x11.XCreateWindow(self.display, self.parent, 0, self.inset, *self.size, 0,
-                self.x11.XDefaultDepth(self.display, screen), 1, self.x11.XDefaultVisual(self.display, screen),
-                (1 << 1) | (1 << 3) | (1 << 13), c.byref(attributes))
+            self.xid = self.create_child(*self.size)
         else:
             self.xid = self.x11.XCreateSimpleWindow(self.display, self.parent, 0, 0, *self.size, 0, 0, 0)
         self.x11.XStoreName(self.display, self.xid, b'Greenlight Native Video')
@@ -144,9 +142,18 @@ class X11VideoWindow:
         self.x11.XSetWMProtocols(self.display, self.xid, c.byref(delete), 1)
         self.x11.XMapRaised(self.display, self.xid)
         self.x11.XFlush(self.display)
+        if parent:
+            emit('video-surface', width=self.size[0], height=self.size[1])
         self.timer = GLib.timeout_add(120, self.update)
         if not parent and os.getenv('GREENLIGHT_GAMESCOPE_FOCUS') == '1':
             self.focus_timer = GLib.timeout_add(200, self.focus)
+
+    def create_child(self, width, height):
+        screen = self.x11.XDefaultScreen(self.display)
+        attributes = X11WindowAttributes(colormap=self.x11.XDefaultColormap(self.display, screen))
+        return self.x11.XCreateWindow(self.display, self.parent, 0, 0, width, height, 0,
+            self.x11.XDefaultDepth(self.display, screen), 1, self.x11.XDefaultVisual(self.display, screen),
+            (1 << 1) | (1 << 3) | (1 << 13), c.byref(attributes))
 
     def dimensions(self):
         root = c.c_ulong()
@@ -154,7 +161,7 @@ class X11VideoWindow:
         width, height, border, depth = (c.c_uint() for _ in range(4))
         self.x11.XGetGeometry(self.display, self.parent, c.byref(root), c.byref(x), c.byref(y),
                               c.byref(width), c.byref(height), c.byref(border), c.byref(depth))
-        return max(1, width.value), max(1, height.value - self.inset)
+        return max(1, width.value), max(1, height.value)
 
     def root_windows(self):
         root, parent, count = c.c_ulong(), c.c_ulong(), c.c_uint()
@@ -184,11 +191,12 @@ class X11VideoWindow:
             if self.owns_window(xid):
                 self.xid = xid
                 self.size = self.dimensions()
-                self.x11.XReparentWindow(self.display, xid, self.parent, 0, self.inset)
-                self.x11.XMoveResizeWindow(self.display, xid, 0, self.inset, *self.size)
+                self.x11.XReparentWindow(self.display, xid, self.parent, 0, 0)
+                self.x11.XMoveResizeWindow(self.display, xid, 0, 0, *self.size)
                 self.x11.XMapRaised(self.display, xid)
                 self.x11.XFlush(self.display)
                 emit('vulkan-window-embedded')
+                emit('video-surface', width=self.size[0], height=self.size[1])
                 return
         if milliseconds() - self.adoption_started > 5000:
             self.adoption_started = None
@@ -203,16 +211,21 @@ class X11VideoWindow:
         while self.x11.XPending(self.display):
             event = (c.c_long * 24)()
             self.x11.XNextEvent(self.display, c.byref(event))
+            if self.overlay:
+                self.overlay.handle(event)
             if c.cast(event, c.POINTER(c.c_int))[0] == 33:  # WM_DELETE_WINDOW client message
                 self.on_close()
                 return GLib.SOURCE_CONTINUE
         size = self.dimensions()
         # The embedded surface follows the GPUI window size; the top-level
         # surface is sized by Gamescope.
-        if (self.inset or self.adopt_vulkan) and size != self.size:
+        if size != self.size:
             self.size = size
-            self.x11.XMoveResizeWindow(self.display, self.xid, 0, self.inset, *size)
+            self.x11.XMoveResizeWindow(self.display, self.xid, 0, 0, *size)
             self.x11.XFlush(self.display)
+            emit('video-surface', width=size[0], height=size[1])
+        if self.overlay:
+            self.overlay.update(size)
         return GLib.SOURCE_CONTINUE
 
     @staticmethod
@@ -242,6 +255,8 @@ class X11VideoWindow:
             self.xprop('-root', '-f', name, '32c', '-set', name, self.prior_focus)
         if not self.adopt_vulkan:
             self.x11.XDestroyWindow(self.display, self.xid)
+        if self.overlay:
+            self.x11.XDestroyWindow(self.display, self.overlay.xid)
         self.x11.XCloseDisplay(self.display)
 
 
@@ -337,7 +352,7 @@ class StreamInput:
         if not self.focused:
             return neutral
         if self.overlay:
-            for bit, key in ((1024, 'left'), (2048, 'right'), (16, 'activate'), (32, 'back')):
+            for bit, key in ((1024 | 256, 'left'), (2048 | 512, 'right'), (16, 'activate'), (32, 'back')):
                 if pressed & bit:
                     emit('stream-overlay-key', key=key)
                     break
@@ -455,6 +470,12 @@ class Player:
         self.motion_profile = []
         self.window_id = int(os.getenv('GREENLIGHT_VIDEO_XID', '0'), 0)
         self.window = None
+        self.hud_timer = None
+        self.hud_sample = None
+        self.transport_pending = False
+        self.hud_rtt = None
+        self.hud_jitter = None
+        self.hud_loss = None
         self.decoder_name = None
         self.external_pad = None
 
@@ -487,13 +508,45 @@ class Player:
                     self.held.clear()
         return GLib.SOURCE_CONTINUE
 
+    def set_overlay(self, open_, guide=False):
+        was_open = self.stream_input.overlay
+        if open_:
+            self.stream_input.open_overlay()
+        else:
+            self.stream_input.close_overlay(guide)
+        if self.window and self.window.overlay:
+            overlay = self.window.overlay
+            overlay.menu = self.stream_input.overlay
+            if overlay.menu and not was_open:
+                overlay.selection = 0
+
+    def toggle_overlay(self):
+        if self.stream_input.focused:
+            self.set_overlay(not self.stream_input.overlay)
+
+    def set_diagnostics(self):
+        overlay = self.window.overlay if self.window else None
+        if not overlay:
+            return
+        overlay.diagnostics = not overlay.diagnostics
+        emit('stream-diagnostics', enabled=overlay.diagnostics)
+        if overlay.diagnostics:
+            self.hud_sample = None
+            overlay.metrics = ()
+            self.refresh_hud()
+            self.hud_timer = GLib.timeout_add_seconds(1, self.refresh_hud)
+        elif self.hud_timer is not None:
+            GLib.source_remove(self.hud_timer)
+            self.hud_timer = None
+
     def handle(self, command):
         try:
             match command['action']:
                 case 'start':
                     self.start(command['bitrate'], command.get('width', 1920), command.get('height', 1080),
                                command.get('benchmark', False), command.get('capture_diagnostics', False),
-                               command.get('renderer', 'auto'), command.get('lsfg', False))
+                               command.get('renderer', 'auto'), command.get('lsfg', False),
+                               command.get('interactive', False))
                 case 'answer':
                     if self.capture_diagnostics:
                         self.inspect_timestamps(command['sdp'])
@@ -524,11 +577,16 @@ class Player:
                                              max(0, min(65535, int(command.get('lt', 0)))),
                                              max(0, min(65535, int(command.get('rt', 0)))))
                 case 'overlay-open':
-                    self.stream_input.open_overlay()
+                    self.set_overlay(True)
                 case 'overlay-close':
-                    self.stream_input.close_overlay()
+                    self.set_overlay(False)
                 case 'xbox-guide':
-                    self.stream_input.close_overlay(guide=True)
+                    self.set_overlay(False, guide=True)
+                case 'diagnostics-toggle':
+                    self.set_diagnostics()
+                case 'overlay-selection':
+                    if self.window and self.window.overlay:
+                        self.window.overlay.selection = int(command['index'])
                 case 'input-focus':
                     self.window_focused = bool(command['active'])
                     self.update_input_focus()
@@ -541,8 +599,10 @@ class Player:
             self.loop.quit()
         return GLib.SOURCE_REMOVE
 
-    def start(self, bitrate, width, height, benchmark=False, capture_diagnostics=False, renderer='auto', lsfg=False):
+    def start(self, bitrate, width, height, benchmark=False, capture_diagnostics=False, renderer='auto',
+              lsfg=False, interactive=False):
         self.target_width, self.target_height = int(width), int(height)
+        self.bitrate_limit = int(bitrate)
         self.benchmark = benchmark
         self.capture_diagnostics = capture_diagnostics
         self.renderer = renderer
@@ -576,7 +636,9 @@ class Player:
         if not self.window_id and sys.platform.startswith('linux') and os.getenv('DISPLAY'):
             parent = int(os.getenv('GREENLIGHT_VIDEO_PARENT_XID', '0'), 0)
             if renderer != 'vulkan' or parent:
-                self.window = X11VideoWindow(parent, self.loop.quit, adopt_vulkan=renderer == 'vulkan')
+                actions = (self.toggle_overlay, lambda index: emit('stream-overlay-key', key='select', index=index))
+                self.window = X11VideoWindow(parent, self.loop.quit, adopt_vulkan=renderer == 'vulkan',
+                                             overlay_actions=actions if interactive else None)
                 self.window_id = self.window.xid
         direction = GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY
         for caps in (
@@ -720,6 +782,9 @@ class Player:
             else:
                 self.override = None
         axes, buttons, left_trigger, right_trigger = self.stream_input.route(axes, buttons, left_trigger, right_trigger, polled)
+        if self.window and self.window.overlay and self.window.overlay.menu != self.stream_input.overlay:
+            self.window.overlay.menu = self.stream_input.overlay
+            self.window.overlay.selection = 0
         if self.input_audit:
             sample = (buttons, any(axes), bool(left_trigger or right_trigger))
             if self.last_input_sample != sample:
@@ -1165,13 +1230,73 @@ class Player:
         if self.capture_diagnostics:
             self.transport_stats()
 
+    def refresh_hud(self):
+        overlay = self.window.overlay
+        now = milliseconds()
+        sample = (now, self.decoded_frames, self.encoded_bytes)
+        if self.hud_sample and self.width and self.height:
+            previous_time, previous_frames, previous_bytes = self.hud_sample
+            seconds = (now - previous_time) / 1000
+            fps = (sample[1] - previous_frames) / seconds
+            mbps = (sample[2] - previous_bytes) * 8 / seconds / 1_000_000
+            sink_stats = self.video_sink.get_property('stats') if self.video_sink else None
+            dropped = sink_stats.get_value('dropped') if sink_stats else 0
+            depth = self.video_queue.get_property('current-level-buffers') if self.video_queue else 0
+            queue_drops = max(0, self.video_queue_in - self.video_queue_out - depth)
+            size = self.window.size
+            ms = lambda value: f'{value:.0f} ms' if value is not None else '—'
+            loss = self.hud_loss if self.hud_loss is not None else '—'
+            overlay.metrics = (
+                f'Video {self.width}×{self.height} · {fps:.1f} decoded FPS',
+                f'Viewport {size[0]}×{size[1]} · {self.decoder_name} · LSFG {"on" if self.lsfg else "off"}',
+                f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s',
+                f'RTT {ms(self.hud_rtt)} · jitter {ms(self.hud_jitter)} · RTP lost {loss}',
+                f'Queue {depth} · queue drops ≈{queue_drops} · sink drops {dropped}',
+            )
+            emit('hud-stats', width=self.width, height=self.height, viewportWidth=size[0], viewportHeight=size[1],
+                 decodedFps=round(fps, 2), videoMbps=round(mbps, 2), limitKbps=self.bitrate_limit,
+                 rttMs=self.hud_rtt, jitterMs=self.hud_jitter, rtpLost=self.hud_loss,
+                 queueDepth=depth, queueDrops=queue_drops, sinkDrops=dropped)
+        self.hud_sample = sample
+        if not self.transport_pending:
+            self.transport_pending = True
+            promise = Gst.Promise.new_with_change_func(self.hud_transport_reply, None)
+            self.rtc.emit('get-stats', None, promise)
+        return GLib.SOURCE_CONTINUE
+
+    @staticmethod
+    def parse_transport(report):
+        records = [report.get_value(report.nth_field_name(i)) for i in range(report.n_fields())]
+        records = [record for record in records if isinstance(record, Gst.Structure)]
+        pair = next((report.get_value(record.get_string('selected-candidate-pair-id')) for record in records
+                     if record.has_field('selected-candidate-pair-id')), None)
+        return records, pair
+
+    def hud_transport_reply(self, promise, *_):
+        rtt = jitter = loss = None
+        if promise.wait() == Gst.PromiseResult.REPLIED and (report := promise.get_reply()):
+            records, pair = self.parse_transport(report)
+            if pair and pair.has_field('current-round-trip-time'):
+                rtt = 1000 * pair.get_value('current-round-trip-time')
+            inbound_video = next((record for record in records if record.get_name() == 'inbound-rtp'
+                                  and record.get_string('kind') == 'video'), None)
+            if inbound_video:
+                if inbound_video.has_field('jitter'):
+                    jitter = 1000 * inbound_video.get_value('jitter')
+                if inbound_video.has_field('packets-lost'):
+                    loss = inbound_video.get_value('packets-lost')
+        GLib.idle_add(self.update_hud_transport, rtt, jitter, loss)
+
+    def update_hud_transport(self, rtt, jitter, loss):
+        self.hud_rtt, self.hud_jitter, self.hud_loss = rtt, jitter, loss
+        self.transport_pending = False
+        return GLib.SOURCE_REMOVE
+
     def transport_stats(self):
         promise = Gst.Promise.new()
         self.rtc.emit('get-stats', None, promise)
         report = checked(promise, 'WebRTC statistics unavailable')
-        records = [report.get_value(report.nth_field_name(i)) for i in range(report.n_fields())]
-        pair = next((report.get_value(record.get_string('selected-candidate-pair-id')) for record in records
-                     if isinstance(record, Gst.Structure) and record.has_field('selected-candidate-pair-id')), None)
+        _, pair = self.parse_transport(report)
         remote = report.get_value(pair.get_string('remote-candidate-id')) if pair and pair.has_field('remote-candidate-id') else None
         if remote and os.getenv('ALLY_TRACE_PEER'):
             try:
@@ -1209,6 +1334,8 @@ class Player:
         try:
             self.loop.run()
         finally:
+            if self.hud_timer is not None:
+                GLib.source_remove(self.hud_timer)
             self.pipeline.set_state(Gst.State.NULL)
             if self.gamescope_timer is not None:
                 GLib.source_remove(self.gamescope_timer)

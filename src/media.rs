@@ -11,7 +11,6 @@ use std::{
 #[derive(Clone, Copy)]
 pub struct VideoWindow {
     pub xid: u64,
-    pub top_inset: u32,
 }
 
 struct Player(Child);
@@ -50,8 +49,7 @@ fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, interactive
         cmd.env("DISABLE_LSFGVK", "1").env("DISABLE_LSFG", "1");
     }
     if let Some(window) = window {
-        cmd.env("GREENLIGHT_VIDEO_PARENT_XID", window.xid.to_string())
-            .env("GREENLIGHT_VIDEO_PARENT_INSET", window.top_inset.to_string());
+        cmd.env("GREENLIGHT_VIDEO_PARENT_XID", window.xid.to_string());
     }
     if let Some(root) = env::var_os("ALLY_GST_RUNTIME") {
         let root = PathBuf::from(root);
@@ -86,6 +84,8 @@ pub enum StreamCommand {
     OpenOverlay,
     CloseOverlay,
     XboxGuide,
+    ToggleDiagnostics,
+    OverlaySelection(usize),
     InputFocus(bool),
 }
 
@@ -95,7 +95,7 @@ pub enum StreamEvent {
     OverlayKey(OverlayKey),
 }
 
-pub enum OverlayKey { Left, Right, Activate, Back }
+pub enum OverlayKey { Left, Right, Activate, Back, Select(usize) }
 
 pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: Option<VideoWindow>,
             cancel: Arc<AtomicBool>, run: Run, controls: Option<mpsc::Receiver<StreamCommand>>,
@@ -132,7 +132,7 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
         });
         command(&mut player, json!({"action":"start","bitrate":bitrate,"width":requested_width,
             "height":requested_height,"benchmark":benchmark,"capture_diagnostics":matches!(run, Run::Transport),
-            "renderer":renderer,"lsfg":enable_lsfg}))?;
+            "renderer":renderer,"lsfg":enable_lsfg,"interactive":interactive}))?;
         status("Negotiating the GStreamer connection…".into());
         let start = Instant::now();
         let mut keepalive = Instant::now();
@@ -153,6 +153,8 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         StreamCommand::OpenOverlay => json!({"action":"overlay-open"}),
                         StreamCommand::CloseOverlay => json!({"action":"overlay-close"}),
                         StreamCommand::XboxGuide => json!({"action":"xbox-guide"}),
+                        StreamCommand::ToggleDiagnostics => json!({"action":"diagnostics-toggle"}),
+                        StreamCommand::OverlaySelection(index) => json!({"action":"overlay-selection","index":index}),
                         StreamCommand::InputFocus(active) => json!({"action":"input-focus","active":active}),
                     };
                     command(&mut player, message)?;
@@ -214,10 +216,34 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                             Some("right") => Some(OverlayKey::Right),
                             Some("activate") => Some(OverlayKey::Activate),
                             Some("back") => Some(OverlayKey::Back),
+                            Some("select") => event.get("index").and_then(Value::as_u64)
+                                .filter(|index| *index < 4).map(|index| OverlayKey::Select(index as usize)),
                             _ => None,
                         };
                         if let Some(key) = key { notify(StreamEvent::OverlayKey(key)); }
                     }
+                    Some("stream-diagnostics") => journal::record("stream_diagnostics", json!({
+                        "enabled": event.get("enabled").and_then(Value::as_bool),
+                    })),
+                    Some("hud-stats") => journal::record("stream_diagnostics_sample", json!({
+                        "width": event.get("width").and_then(Value::as_u64),
+                        "height": event.get("height").and_then(Value::as_u64),
+                        "viewport_width": event.get("viewportWidth").and_then(Value::as_u64),
+                        "viewport_height": event.get("viewportHeight").and_then(Value::as_u64),
+                        "decoded_fps": event.get("decodedFps").and_then(Value::as_f64),
+                        "video_mbps": event.get("videoMbps").and_then(Value::as_f64),
+                        "limit_kbps": event.get("limitKbps").and_then(Value::as_u64),
+                        "rtt_ms": event.get("rttMs").and_then(Value::as_f64),
+                        "jitter_ms": event.get("jitterMs").and_then(Value::as_f64),
+                        "rtp_lost": event.get("rtpLost").and_then(Value::as_i64),
+                        "queue_depth": event.get("queueDepth").and_then(Value::as_u64),
+                        "estimated_queue_drops": event.get("queueDrops").and_then(Value::as_u64),
+                        "sink_drops": event.get("sinkDrops").and_then(Value::as_u64),
+                    })),
+                    Some("video-surface") => journal::record("video_surface", json!({
+                        "width": event.get("width").and_then(Value::as_u64),
+                        "height": event.get("height").and_then(Value::as_u64),
+                    })),
                     Some("stream-input-focus") => journal::record("stream_input_focus", json!({
                         "active":event.get("active").and_then(Value::as_bool),
                     })),
