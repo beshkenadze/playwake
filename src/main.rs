@@ -22,6 +22,8 @@ enum Event {
     SignInEnded(xbox::Result<()>),
     Stream(media::StreamEvent),
     StreamEnded(xbox::Result<()>),
+    Preview(media::PreviewEvent),
+    PreviewEnded(xbox::Result<()>),
     Menu(Key),
     Consoles(Arc<xbox::Xbox>, xbox::Result<Vec<xbox::Console>>, bool),
     CachedCloudCatalog(Arc<xbox::Xbox>, Vec<cloud::Game>),
@@ -67,6 +69,7 @@ struct RemotePlay {
     menu_player: Option<media::Player>,
     keyboard_focus: FocusHandle,
     active_target: Option<media::Target>,
+    preview: Option<Preview>,
     cloud_catalog: Option<Vec<cloud::Game>>,
     cloud_refreshed_at: Option<Instant>,
     cloud_loading: bool,
@@ -78,10 +81,18 @@ struct RemotePlay {
     status: String,
 }
 
+struct Preview {
+    cancel: Arc<AtomicBool>,
+    prefs: Preferences,
+    ready: bool,
+    compare: bool,
+}
+
 impl Drop for RemotePlay {
     fn drop(&mut self) {
         if let Some(cancel) = &self.sign_in { cancel.store(true, Ordering::Relaxed); }
         if let Some(cancel) = &self.stream { cancel.store(true, Ordering::Relaxed); }
+        if let Some(preview) = &self.preview { preview.cancel.store(true, Ordering::Relaxed); }
     }
 }
 
@@ -126,7 +137,7 @@ impl RemotePlay {
     }
 
     fn start_stream(&mut self, target: media::Target, window: &mut Window) {
-        if self.stream.is_some() || self.sign_in.is_some() { return; }
+        if self.stream.is_some() || self.preview.is_some() || self.sign_in.is_some() { return; }
         let Some(account) = self.account.clone() else { return; };
         let native_window = x11_window(window);
         let streaming_tab = if matches!(&target, media::Target::Home(_)) { Tab::Xbox } else { Tab::Cloud };
@@ -149,6 +160,25 @@ impl RemotePlay {
             let result = media::play(account, target, resolution, native_window, cancel, run, Some(rx),
                 |event| { let _ = tx.send(Event::Stream(event)); });
             let _ = tx.send(Event::StreamEnded(result));
+        });
+    }
+
+    fn start_preview(&mut self, prefs: Preferences, window: &Window) {
+        if self.stream.is_some() || self.preview.is_some() || self.sign_in.is_some() { return; }
+        let Some(window) = x11_window(window) else {
+            self.status = deck::Text(self.prefs.russian()).t(
+                "Для превью LSFG нужен X11 или XWayland", "LSFG preview needs X11 or XWayland").into();
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preview = Some(Preview { cancel: cancel.clone(), prefs, ready: false, compare: false });
+        self.status.clear();
+        let resolution = self.resolution();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = media::preview(window, resolution, prefs, cancel,
+                |event| { let _ = tx.send(Event::Preview(event)); });
+            let _ = tx.send(Event::PreviewEnded(result));
         });
     }
 
@@ -314,6 +344,12 @@ impl RemotePlay {
                 self.status.clear();
                 true
             }
+            Action::LsfgPerformance => { self.prefs.lsfg_performance = !self.prefs.lsfg_performance; true }
+            Action::LsfgFlowScale => {
+                self.prefs.lsfg_flow_percent = if self.prefs.lsfg_flow_percent == 75 { 100 } else { 75 };
+                true
+            }
+            Action::LsfgPreview => { self.start_preview(self.prefs, window); false }
             Action::Volume => { self.prefs.volume = (self.prefs.volume as isize + 10 * direction).clamp(0,100) as u32; true }
             Action::Mute => { self.prefs.mute = !self.prefs.mute; true }
             Action::Compact => { self.prefs.compact_stats = !self.prefs.compact_stats; true }
@@ -329,6 +365,20 @@ impl RemotePlay {
     }
 
     fn menu_key(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(preview) = &mut self.preview {
+            match key {
+                Key::Accept if preview.ready && !preview.cancel.load(Ordering::Relaxed) => {
+                    preview.compare = true;
+                    preview.cancel.store(true, Ordering::Relaxed);
+                }
+                Key::Back => {
+                    preview.compare = false;
+                    preview.cancel.store(true, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.stream.is_some() {
             if !self.video_ready && key == Key::Back { self.stop_stream(); }
             return;
@@ -355,8 +405,9 @@ impl RemotePlay {
     fn receive(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         // X11 video and its controls are drawn by the media worker. Presenting
         // another GPUI backing frame during playback can flash black in Gamescope.
-        let native_video = self.stream.is_some() && self.video_ready && x11_window(window).is_some();
-        let redraw = !native_video || matches!(&event, Event::StreamEnded(_));
+        let native_video = (self.stream.is_some() && self.video_ready
+            || self.preview.as_ref().is_some_and(|preview| preview.ready)) && x11_window(window).is_some();
+        let redraw = !native_video || matches!(&event, Event::StreamEnded(_) | Event::PreviewEnded(_));
         match event {
             Event::Menu(key) => {
                 let managed = std::env::var_os("ALLY_GAMESCOPE_CONTROL_DISPLAY").is_some();
@@ -415,6 +466,21 @@ impl RemotePlay {
                 if let Err(error) = result { self.status = error; }
             }
             Event::Stream(media::StreamEvent::VideoReady) => self.video_ready = true,
+            Event::Preview(media::PreviewEvent::Ready) => {
+                if let Some(preview) = &mut self.preview { preview.ready = true; }
+            }
+            Event::Preview(media::PreviewEvent::Toggle) => self.menu_key(Key::Accept, window, cx),
+            Event::Preview(media::PreviewEvent::Back) => self.menu_key(Key::Back, window, cx),
+            Event::PreviewEnded(result) => {
+                if let Some(preview) = self.preview.take() {
+                    if preview.compare && result.is_ok() {
+                        let mut prefs = preview.prefs;
+                        prefs.lsfg_enabled = !prefs.lsfg_enabled;
+                        self.start_preview(prefs, window);
+                    }
+                    if let Err(error) = result { self.status = error; }
+                }
+            }
             Event::Stream(media::StreamEvent::Status(status)) => self.status = status,
             Event::Stream(media::StreamEvent::Overlay(open)) => {
                 self.overlay_open = open;
@@ -506,7 +572,7 @@ fn main() {
                 let mut view = RemotePlay { tx, account: None, consoles: Vec::new(), sign_in: None,
                     stream: None, stream_commands: None, overlay_open: false, overlay_index: 0, restore_windowed: false,
                     prefs: session_store::load_preferences(), device: None, menu: Menu::default(),
-                    menu_player: None, keyboard_focus: cx.focus_handle(), active_target: None,
+                    menu_player: None, keyboard_focus: cx.focus_handle(), active_target: None, preview: None,
                     cloud_catalog: None, cloud_refreshed_at: None, cloud_loading: false, cloud_error: None,
                     reconnect: false, video_ready: false, refreshing: false,
                     status: if media::runtime_available() { String::new() } else { "GStreamer worker missing".into() } };

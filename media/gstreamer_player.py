@@ -39,6 +39,11 @@ def milliseconds():
     return time.monotonic_ns() / 1_000_000
 
 
+def gpu_vulkan_output():
+    return ('vulkanupload name=upload ! vulkancolorconvert ! '
+            'video/x-raw(memory:VulkanImage),format=BGRA ! vulkansink')
+
+
 def ntp_unix_ms(timestamp):
     seconds, fraction = struct.unpack('>II', timestamp)
     return (seconds - 2_208_988_800 + fraction / 2**32) * 1000
@@ -72,7 +77,7 @@ class XResClientIdValue(c.Structure):
 
 
 class X11VideoWindow:
-    def __init__(self, parent, on_close, adopt_vulkan=False, overlay_actions=None):
+    def __init__(self, parent, on_close, adopt_vulkan=False, overlay_actions=None, on_key=None):
         self.x11 = c.CDLL('libX11.so.6')
         ptr, xid, int_, uint = c.c_void_p, c.c_ulong, c.c_int, c.c_uint
         pointer = c.POINTER
@@ -110,6 +115,12 @@ class X11VideoWindow:
             raise RuntimeError('Native playback requires an X11 display')
         self.parent = parent or self.x11.XDefaultRootWindow(self.display)
         self.on_close = on_close
+        self.on_key = on_key
+        if self.on_key:
+            self.x11.XSelectInput.argtypes = [ptr, xid, c.c_long]
+            self.x11.XLookupKeysym.argtypes = [ptr, int_]
+            self.x11.XLookupKeysym.restype = xid
+            self.x11.XSelectInput(self.display, self.parent, 1)  # KeyPressMask
         self.size = self.dimensions()
         self.overlay = (StreamOverlay(self.x11, self.display, self.parent, self.create_child, *overlay_actions)
                         if parent and overlay_actions else None)
@@ -196,6 +207,8 @@ class X11VideoWindow:
                 self.xid = xid
                 self.size = self.dimensions()
                 self.x11.XReparentWindow(self.display, xid, self.parent, 0, 0)
+                if self.on_key:
+                    self.x11.XSelectInput(self.display, xid, 1)  # KeyPressMask
                 self.x11.XMoveResizeWindow(self.display, xid, 0, 0, *self.size)
                 self.x11.XMapRaised(self.display, xid)
                 self.x11.XSync(self.display, False)
@@ -227,9 +240,12 @@ class X11VideoWindow:
         while self.x11.XPending(self.display):
             event = (c.c_long * 24)()
             self.x11.XNextEvent(self.display, c.byref(event))
+            event_type = c.cast(event, c.POINTER(c.c_int))[0]
+            if self.on_key and event_type == 2:  # KeyPress
+                self.on_key(self.x11.XLookupKeysym(c.byref(event), 0))
             if self.overlay:
                 self.overlay.handle(event)
-            if c.cast(event, c.POINTER(c.c_int))[0] == 33:  # WM_DELETE_WINDOW client message
+            if event_type == 33:  # WM_DELETE_WINDOW client message
                 self.on_close()
                 return GLib.SOURCE_CONTINUE
         size = self.dimensions()
@@ -638,6 +654,7 @@ class Player:
         self.video_queue_out = 0
         self.vulkan_conversion = None
         self.lsfg = False
+        self.preview_mode = None
         self.motion_in_parallel = False
         self.queue_times = {}
         self.stage_profile = []
@@ -742,6 +759,8 @@ class Player:
                                command.get('benchmark', False), command.get('capture_diagnostics', False),
                                command.get('renderer', 'auto'), command.get('lsfg', False),
                                command.get('interactive', False), command)
+                case 'preview':
+                    self.start_preview(command)
                 case 'answer':
                     if self.capture_diagnostics:
                         self.inspect_timestamps(command['sdp'])
@@ -819,6 +838,56 @@ class Player:
             emit('error', message=str(error))
             self.loop.quit()
         return GLib.SOURCE_REMOVE
+
+    def start_preview(self, options):
+        os.environ['DISABLE_GAMESCOPE_WSI'] = '1'
+        os.environ['GST_VULKAN_WINDOW'] = 'xcb'
+        self.renderer = 'vulkan'
+        self.lsfg = options['lsfg']
+        self.preview_mode = (options['performance'], options['flow_scale'])
+        self.benchmark = False
+        self.capture_diagnostics = False
+        width, height = int(options['width']), int(options['height'])
+        parent = int(os.getenv('GREENLIGHT_VIDEO_PARENT_XID', '0'), 0)
+        if not parent:
+            raise RuntimeError('LSFG preview requires an X11 or XWayland window')
+        if display := os.getenv('ALLY_GAMESCOPE_CONTROL_DISPLAY'):
+            try:
+                self.gamescope_focus = GamescopeInputFocus(display)
+            except OSError:
+                pass
+        self.window = X11VideoWindow(parent, self.loop.quit, adopt_vulkan=True, on_key=self.preview_key, overlay_actions=(
+            lambda: emit('preview-toggle'), lambda _: None, lambda _: None,
+        ))
+        overlay = self.window.overlay
+        overlay.russian = options.get('russian', False)
+        overlay.xbox_palette = options.get('xbox_palette', False)
+        overlay.diagnostics = True
+        overlay.preview_back = lambda: emit('preview-back')
+        overlay.compact = 'A  LSFG on/off    B  Back' if not overlay.russian else 'A  Вкл./выкл. LSFG    B  Назад'
+        branch = Gst.parse_bin_from_description(
+            'videotestsrc name=scene is-live=true pattern=ball motion=sweep '
+            'foreground-color=0xff7cdb8c background-color=0xff161c26 ! '
+            f'video/x-raw,format=NV12,width={width},height={height},framerate=60/1 ! '
+            f'{gpu_vulkan_output()} name=video_sink sync=false force-aspect-ratio=true', True)
+        self.video_sink = branch.get_by_name('video_sink')
+        sink_pad = self.video_sink.get_static_pad('sink')
+        sink_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.window.wait_for_vulkan_surface)
+        if self.lsfg:
+            sink_pad.add_probe(Gst.PadProbeType.BUFFER, self.check_lsfg_layer)
+        branch.get_by_name('scene').get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, self.decoded)
+        self.pipeline.add(branch)
+        self.window.adoption_started = milliseconds()
+        if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError('Cannot start the Vulkan preview')
+        self.sync_hud_timer(overlay)
+
+    @staticmethod
+    def preview_key(keysym):
+        if keysym in (0xff0d, 0xff8d):  # Return or KP_Enter
+            emit('preview-toggle')
+        elif keysym == 0xff1b:  # Escape
+            emit('preview-back')
 
     def start(self, bitrate, width, height, benchmark=False, capture_diagnostics=False, renderer='auto',
               lsfg=False, interactive=False, options=None):
@@ -1107,8 +1176,7 @@ class Player:
                                   and Gst.ElementFactory.find('vulkancolorconvert') is not None)
                 if convert_on_gpu:
                     self.vulkan_conversion = 'gpu_nv12'
-                    conversion = ('vulkanupload name=upload ! vulkancolorconvert ! '
-                                  'video/x-raw(memory:VulkanImage),format=BGRA ! vulkansink')
+                    conversion = gpu_vulkan_output()
                 else:
                     self.vulkan_conversion = 'cpu_bgra'
                     conversion = 'videoconvert ! video/x-raw,format=BGRA ! vulkanupload name=upload ! vulkansink'
@@ -1524,6 +1592,26 @@ class Player:
         present_fps = self.presentation.sample() if self.presentation else None
         display_hz = self.gamescope_focus.display_hz() if self.gamescope_focus else None
         sample = (now, self.decoded_frames, self.encoded_bytes)
+        if self.preview_mode is not None:
+            if self.hud_sample and self.width and self.height:
+                previous_time, previous_frames, _ = self.hud_sample
+                fps = (self.decoded_frames - previous_frames) * 1000 / (now - previous_time)
+                present = f'{present_fps:.0f}' if present_fps is not None else '—'
+                performance, flow = self.preview_mode
+                if self.lsfg:
+                    mode = 'Performance' if performance else ('Качество' if overlay.russian else 'Quality')
+                    title = f'LSFG 2× {mode} · Flow Scale {flow}'
+                else:
+                    title = 'LSFG выкл.' if overlay.russian else 'LSFG off'
+                overlay.compact_rate = title
+                source, output, display = ('Источник', 'Вывод', 'Экран') if overlay.russian else ('Source', 'Present', 'Display')
+                overlay.compact = f'{self.height}p · {source} {fps:.0f} FPS · {output} {present} FPS · {display} {display_hz or "—"} Hz'
+                overlay.preview_controls = (('A / Enter  Сравнить', 'B / Esc  Назад') if overlay.russian
+                                            else ('A / Enter  Compare', 'B / Esc  Back'))
+                emit('preview-stats', sourceFps=round(fps, 2),
+                     presentFps=round(present_fps, 2) if present_fps is not None else None, displayHz=display_hz)
+            self.hud_sample = sample
+            return GLib.SOURCE_CONTINUE
         if self.hud_sample and self.width and self.height:
             previous_time, previous_frames, previous_bytes = self.hud_sample
             seconds = (now - previous_time) / 1000
@@ -1655,6 +1743,7 @@ class Player:
             self.pipeline.set_state(Gst.State.NULL)
             if self.gamescope_timer is not None:
                 GLib.source_remove(self.gamescope_timer)
+            if self.gamescope_focus:
                 self.gamescope_focus.close()
             if self.window:
                 self.window.close()

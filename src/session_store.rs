@@ -64,6 +64,8 @@ pub enum Language {
 #[serde(default)]
 pub struct Preferences {
     pub lsfg_enabled: bool,
+    pub lsfg_performance: bool,
+    pub lsfg_flow_percent: u8,
     pub height: u32,
     pub bitrate_mbps: u32,
     pub compact_stats: bool,
@@ -76,12 +78,17 @@ pub struct Preferences {
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { lsfg_enabled: false, height: 1080, bitrate_mbps: 20, compact_stats: false,
+        Self { lsfg_enabled: false, lsfg_performance: true, lsfg_flow_percent: 100,
+            height: 1080, bitrate_mbps: 20, compact_stats: false,
             auto_connect: false, xbox_palette: false, language: Language::System, volume: 100, mute: false }
     }
 }
 
 impl Preferences {
+    pub fn lsfg_flow_scale(self) -> &'static str {
+        if self.lsfg_flow_percent == 75 { "0.75" } else { "1.0" }
+    }
+
     pub fn russian(self) -> bool {
         match self.language {
             Language::Russian => true,
@@ -147,6 +154,8 @@ mod tests {
     fn reads_existing_lsfg_only_preferences() {
         let prefs: Preferences = serde_json::from_str(r#"{"lsfg_enabled":true}"#).unwrap();
         assert!(prefs.lsfg_enabled);
+        assert!(prefs.lsfg_performance);
+        assert_eq!(prefs.lsfg_flow_scale(), "1.0");
         assert_eq!(prefs.height, 1080);
         assert_eq!(prefs.bitrate_mbps, 20);
         assert_eq!(prefs.volume, 100);
