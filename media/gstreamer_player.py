@@ -45,17 +45,18 @@ def gpu_vulkan_output():
 
 
 class LanczosUpscale:
-    pipeline = ('videoscale name=upscale method=lanczos n-threads=2 ! '
+    pipeline = ('capsfilter name=upscale_input caps-change-mode=delayed ! '
+                'videoscale method=lanczos n-threads=2 ! '
                 'capsfilter name=upscale_caps caps-change-mode=delayed ! ')
 
-    def __init__(self, branch, viewport):
+    def __init__(self, branch, source_pad, viewport):
         self.viewport = viewport
         self.source = None
         self.requested = None
         self.result = None
+        self.input_filter = branch.get_by_name('upscale_input')
         self.filter = branch.get_by_name('upscale_caps')
-        branch.get_by_name('upscale').get_static_pad('sink').add_probe(
-            Gst.PadProbeType.EVENT_DOWNSTREAM, self.source_caps)
+        source_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.source_caps)
         self.filter.get_static_pad('src').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.output_caps)
 
     @staticmethod
@@ -74,9 +75,18 @@ class LanczosUpscale:
     def source_caps(self, _, info):
         event = info.get_event()
         if event.type == Gst.EventType.CAPS:
-            self.source = self.dimensions(event)
-            self.update()
+            source = self.dimensions(event)
+            if self.source != source:
+                self.source = source
+                self.update()
+                # VA-API postprocessing must only download/convert here. Letting
+                # it negotiate the destination size can hide a source change.
+                self.input_filter.set_property('caps', self.size_caps(source))
         return Gst.PadProbeReturn.OK
+
+    @staticmethod
+    def size_caps(size):
+        return Gst.Caps.from_string(f'video/x-raw,width={size[0]},height={size[1]}')
 
     def update(self):
         if not self.source:
@@ -84,8 +94,7 @@ class LanczosUpscale:
         size = self.fit(self.source, self.viewport())
         if size != self.requested:
             self.requested = size
-            self.filter.set_property('caps', Gst.Caps.from_string(
-                f'video/x-raw,width={size[0]},height={size[1]}'))
+            self.filter.set_property('caps', self.size_caps(size))
 
     def output_caps(self, _, info):
         event = info.get_event()
@@ -1263,7 +1272,10 @@ class Player:
                 f'{video_output} name=video_sink {options}{motion_branch}', True)
             self.video_sink = branch.get_by_name('video_sink')
             if upscale:
-                self.lanczos = LanczosUpscale(branch, lambda: self.window.size)
+                # After the queue, so CAPS and buffers retain their order when
+                # decoders send startup and steady-state sizes in quick succession.
+                source = branch.get_by_name('video_queue' if self.renderer == 'vulkan' else 'decoder')
+                self.lanczos = LanczosUpscale(branch, source.get_static_pad('src'), lambda: self.window.size)
                 self.window.on_resize = self.lanczos.update
             if self.window_id:
                 GstVideo.VideoOverlay.set_window_handle(self.video_sink, self.window_id)
