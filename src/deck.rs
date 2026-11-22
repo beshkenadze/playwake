@@ -373,10 +373,20 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
             Row::new(
                 t.t("Открыть оверлей", "Open stream overlay"),
                 t.t(
-                    "Одиночные нажатия уходят на Xbox",
-                    "Individual presses are sent to Xbox",
+                    "Коротко нажмите обе кнопки одновременно",
+                    "Tap both buttons together",
                 ),
-                "View + Menu · 0.5 s",
+                "View + Menu",
+                None,
+            ),
+            Row::new(
+                t.t("Схема кнопок", "Button layout"),
+                "",
+                if crate::device::current().id == "gamepad" {
+                    t.t("Геймпад", "Gamepad")
+                } else {
+                    crate::device::current().name
+                },
                 None,
             ),
             Row::new(

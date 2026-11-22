@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 
 import gi
 for namespace in ('Gst', 'GstSdp', 'GstWebRTC', 'GstVideo'):
@@ -26,6 +27,7 @@ BUTTONS = {304: 16, 305: 32, 307: 64, 308: 128, 310: 4096, 311: 8192,
            314: 8, 315: 4, 317: 16384, 318: 32768}
 AXES = (0, 1, 3, 4)
 VIEW_MENU = 8 | 4
+VIEW_MENU_WINDOW_MS = 90
 GUIDE = 2
 
 
@@ -411,7 +413,6 @@ class StreamInput:
         self.release_gate = False
         self.previous = 0
         self.chord_started = None
-        self.both_started = None
         self.pending_buttons = 0
         self.passthrough = False
         self.guide = False
@@ -419,7 +420,6 @@ class StreamInput:
 
     def reset_chord(self):
         self.chord_started = None
-        self.both_started = None
         self.pending_buttons = 0
         self.passthrough = False
 
@@ -486,20 +486,17 @@ class StreamInput:
             return (axes, buttons, left, right)
         if self.chord_started is None:
             self.chord_started = now
+        elapsed = now - self.chord_started
+        # The second button must arrive before the first is sent to Xbox.
+        if chord == VIEW_MENU and elapsed <= VIEW_MENU_WINDOW_MS:
+            self.open_overlay()
+            return neutral
         self.pending_buttons |= chord
-        if chord == VIEW_MENU:
-            if self.both_started is None:
-                self.both_started = now
-            if now - self.both_started >= 500:
-                self.open_overlay()
-                return neutral
-        else:
-            self.both_started = None
-            if now - self.chord_started >= 90:
-                self.passthrough = True
-                replay = self.pending_buttons
-                self.pending_buttons = 0
-                return (axes, buttons | replay, left, right)
+        if elapsed >= VIEW_MENU_WINDOW_MS:
+            self.passthrough = True
+            replay = self.pending_buttons
+            self.pending_buttons = 0
+            return (axes, buttons | replay, left, right)
         return (axes, buttons & ~VIEW_MENU, left, right)
 
 
@@ -575,6 +572,7 @@ class Player:
         self.window = None
         self.hud_timer = None
         self.hud_sample = None
+        self.hud_video_latency = deque(maxlen=60)
         self.audio_volume = 1.0
         self.transport_pending = False
         self.hud_rtt = None
@@ -647,6 +645,7 @@ class Player:
         wants_stats = not overlay.guide_handoff and (overlay.menu or overlay.diagnostics)
         if wants_stats and self.hud_timer is None:
             self.hud_sample = None
+            self.hud_video_latency.clear()
             overlay.compact = '—'
             overlay.metrics = ()
             self.refresh_hud()
@@ -769,6 +768,8 @@ class Player:
                     overlay.russian = options.get('russian', False)
                     overlay.xbox_palette = options.get('xbox_palette', False)
                     overlay.console_name = options.get('console_name') or 'Xbox'
+                    overlay.control_layout = options.get('control_layout', 'gamepad')
+                    overlay.control_device = options.get('control_device', 'Gamepad')
                     if options.get('compact_stats'):
                         self.set_diagnostics()
         direction = GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY
@@ -1052,6 +1053,7 @@ class Player:
             first_packet = self.ingress_rtp.get(self.rtp_key(buffer))
             timing = {
                 'receivedAt': self.pending_rtp[1] if first_packet is None else first_packet,
+                'postJitterAt': self.pending_rtp[1],
                 'preJitter': first_packet is not None,
             }
             if self.capture_diagnostics and key is not None and (anchor := self.capture_anchors.get(ssrc)):
@@ -1272,11 +1274,13 @@ class Player:
 
     def present_frame(self, pad, probe):
         trial = self.frame_trial
-        if trial is None and not self.benchmark:
+        if trial is None and not self.benchmark and self.hud_timer is None:
             return Gst.PadProbeReturn.OK
         now = milliseconds()
         buffer = probe.get_buffer()
         timing = self.frame_timing.get(buffer.pts)
+        if self.hud_timer is not None and timing is not None:
+            self.hud_video_latency.append(now - timing['postJitterAt'])
         if self.renderer != 'vulkan':
             self.video_timing(timing, now)
         if trial is None:
@@ -1381,7 +1385,11 @@ class Player:
                     return '—'
                 return f'{value:.2f} ms' if value < 1 else f'{value:.0f} ms'
             loss = self.hud_loss if self.hud_loss is not None else '—'
-            overlay.compact = (f'{self.height}p · {fps:.0f} FPS · {mbps:.1f} Mb/s · {ms(self.hud_rtt)}'
+            recent_latency = self.hud_video_latency.copy()
+            client_ms = statistics.median(recent_latency) if recent_latency else None
+            client_label = 'Видео' if overlay.russian else 'Video'
+            overlay.compact = (f'{self.height}p · {fps:.0f} FPS · {mbps:.1f} Mb/s'
+                               f' · RTT {ms(self.hud_rtt)} · {client_label} {ms(client_ms)}'
                                f' · {queue_drops + dropped} ' +
                                ('кадр. отброш.' if overlay.russian else 'frame drops'))
             overlay.metrics = (
@@ -1389,11 +1397,14 @@ class Player:
                 f'Viewport {size[0]}×{size[1]} · {self.decoder_name} · LSFG {"on" if self.lsfg else "off"}',
                 f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s',
                 f'RTT {ms(self.hud_rtt)} · jitter {ms(self.hud_jitter)} · RTP lost {loss}',
+                (f'Видео: после джиттер-буфера → вход видеовывода {ms(client_ms)}'
+                 if overlay.russian else f'Video: after jitter buffer → sink input {ms(client_ms)}'),
                 f'Queue {depth} · queue drops ~{queue_drops} · sink drops {dropped}',
             )
             emit('hud-stats', width=self.width, height=self.height, viewportWidth=size[0], viewportHeight=size[1],
                  decodedFps=round(fps, 2), videoMbps=round(mbps, 2), limitKbps=self.bitrate_limit,
                  rttMs=self.hud_rtt, jitterMs=self.hud_jitter, rtpLost=self.hud_loss,
+                 videoClientMs=round(client_ms, 2) if client_ms is not None else None,
                  queueDepth=depth, queueDrops=queue_drops, sinkDrops=dropped)
         self.hud_sample = sample
         if self.width and self.height and not self.transport_pending:
