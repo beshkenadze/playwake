@@ -2,12 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::{env, fs, io, path::PathBuf};
 
 #[derive(Deserialize, Serialize)]
-struct Session {
+pub struct Session {
     client_id: String,
-    refresh_token: String,
+    pub refresh_token: String,
+    #[serde(default)]
+    pub catalog_key: Option<String>,
 }
 
-fn path() -> io::Result<PathBuf> {
+pub(super) fn path() -> io::Result<PathBuf> {
     if let Some(path) = env::var_os("ALLY_SESSION_FILE").filter(|path| !path.is_empty()) {
         return Ok(path.into());
     }
@@ -23,7 +25,7 @@ fn path() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Application state directory unavailable"))
 }
 
-pub fn load(client_id: &str) -> io::Result<Option<String>> {
+pub fn load(client_id: &str) -> io::Result<Option<Session>> {
     let path = path()?;
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -41,11 +43,12 @@ pub fn load(client_id: &str) -> io::Result<Option<String>> {
         }
     }
     let session: Session = serde_json::from_reader(fs::File::open(path)?)?;
-    Ok((session.client_id == client_id && !session.refresh_token.is_empty()).then_some(session.refresh_token))
+    Ok((session.client_id == client_id && !session.refresh_token.is_empty()).then_some(session))
 }
 
-pub fn save(client_id: &str, refresh_token: &str) -> io::Result<()> {
-    write_json(path()?, &Session { client_id: client_id.into(), refresh_token: refresh_token.into() })
+pub fn save(client_id: &str, refresh_token: &str, catalog_key: &str) -> io::Result<()> {
+    write_json(path()?, &Session { client_id: client_id.into(), refresh_token: refresh_token.into(),
+        catalog_key: Some(catalog_key.into()) })
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
@@ -104,7 +107,7 @@ pub fn save_preferences(prefs: Preferences) -> io::Result<()> {
     write_json(path()?.with_extension("preferences.json"), &prefs)
 }
 
-fn write_json(path: PathBuf, data: &impl Serialize) -> io::Result<()> {
+pub(super) fn write_json(path: PathBuf, data: &impl Serialize) -> io::Result<()> {
     let parent = path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
     let mut dir = fs::DirBuilder::new();
     dir.recursive(true);

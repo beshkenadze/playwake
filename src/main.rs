@@ -1,3 +1,4 @@
+mod cloud;
 mod deck;
 mod device;
 mod input;
@@ -13,16 +14,18 @@ use gpui_kit::*;
 use qrcode::{Color, QrCode};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde_json::json;
-use std::{sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc}, thread, time::Duration};
+use std::{sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc}, thread, time::{Duration, Instant}};
 
 enum Event {
     Device(DevicePrompt),
-    Account { xbox: Arc<xbox::Xbox>, consoles: Vec<xbox::Console> },
+    Account { xbox: Arc<xbox::Xbox> },
     SignInEnded(xbox::Result<()>),
     Stream(media::StreamEvent),
     StreamEnded(xbox::Result<()>),
     Menu(Key),
-    Consoles(Arc<xbox::Xbox>, xbox::Result<Vec<xbox::Console>>),
+    Consoles(Arc<xbox::Xbox>, xbox::Result<Vec<xbox::Console>>, bool),
+    CachedCloudCatalog(Arc<xbox::Xbox>, Vec<cloud::Game>),
+    CloudCatalog(Arc<xbox::Xbox>, xbox::Result<Vec<cloud::Game>>),
 }
 
 struct DevicePrompt {
@@ -63,7 +66,11 @@ struct RemotePlay {
     menu: Menu,
     menu_player: Option<media::Player>,
     keyboard_focus: FocusHandle,
-    active_console: Option<xbox::Console>,
+    active_target: Option<media::Target>,
+    cloud_catalog: Option<Vec<cloud::Game>>,
+    cloud_refreshed_at: Option<Instant>,
+    cloud_loading: bool,
+    cloud_error: Option<String>,
     reconnect: bool,
     video_ready: bool,
     refreshing: bool,
@@ -111,21 +118,21 @@ impl RemotePlay {
                     prefilled,
                 }));
                 let xbox = Arc::new(xbox::finish_sign_in(client, client_id, device, &cancel)?);
-                let consoles = xbox.consoles()?;
-                let _ = tx.send(Event::Account { xbox, consoles });
+                let _ = tx.send(Event::Account { xbox });
                 Ok(())
             })();
             let _ = tx.send(Event::SignInEnded(result));
         });
     }
 
-    fn start_stream(&mut self, console: xbox::Console, window: &mut Window) {
+    fn start_stream(&mut self, target: media::Target, window: &mut Window) {
         if self.stream.is_some() || self.sign_in.is_some() { return; }
         let Some(account) = self.account.clone() else { return; };
         let native_window = x11_window(window);
-        self.active_console = Some(console.clone());
+        let streaming_tab = if matches!(&target, media::Target::Home(_)) { Tab::Xbox } else { Tab::Cloud };
+        self.active_target = Some(target.clone());
         self.video_ready = false;
-        self.menu.select_tab(Tab::Xbox);
+        self.menu.select_tab(streaming_tab);
         self.restore_windowed = native_window.is_some() && !window.is_fullscreen();
         if self.restore_windowed { window.toggle_fullscreen(); }
         let cancel = Arc::new(AtomicBool::new(false));
@@ -139,7 +146,7 @@ impl RemotePlay {
         let (controls, rx) = mpsc::channel();
         self.stream_commands = Some(controls);
         thread::spawn(move || {
-            let result = media::play(account, console, resolution, native_window, cancel, run, Some(rx),
+            let result = media::play(account, target, resolution, native_window, cancel, run, Some(rx),
                 |event| { let _ = tx.send(Event::Stream(event)); });
             let _ = tx.send(Event::StreamEnded(result));
         });
@@ -165,11 +172,27 @@ impl RemotePlay {
         }
     }
 
-    fn show_account(&mut self, xbox: Arc<xbox::Xbox>, consoles: Vec<xbox::Console>) {
-        journal::record("xbox_discovery_completed", json!({"console_count": consoles.len()}));
+    fn show_account(&mut self, xbox: Arc<xbox::Xbox>) {
         self.status = String::new();
         self.account = Some(xbox);
-        self.consoles = consoles;
+        self.refresh_consoles(true);
+        if self.menu.tab == Tab::Cloud { self.refresh_cloud(); }
+    }
+
+    fn refresh_cloud(&mut self) {
+        if self.cloud_loading { return; }
+        let Some(account) = self.account.clone() else { return; };
+        self.cloud_loading = true;
+        self.cloud_error = None;
+        let read_cache = self.cloud_catalog.is_none();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            if read_cache && let Some(games) = cloud::cached_catalog(&account) {
+                let _ = tx.send(Event::CachedCloudCatalog(account.clone(), games));
+            }
+            let result = cloud::catalog(&account);
+            let _ = tx.send(Event::CloudCatalog(account, result));
+        });
     }
 
     fn resolution(&self) -> xbox::Resolution {
@@ -183,7 +206,7 @@ impl RemotePlay {
         }
     }
 
-    fn refresh_consoles(&mut self) {
+    fn refresh_consoles(&mut self, auto_connect: bool) {
         if self.refreshing { return; }
         let Some(account) = self.account.clone() else { return; };
         self.refreshing = true;
@@ -191,7 +214,7 @@ impl RemotePlay {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let consoles = account.consoles();
-            let _ = tx.send(Event::Consoles(account, consoles));
+            let _ = tx.send(Event::Consoles(account, consoles, auto_connect));
         });
     }
 
@@ -199,7 +222,7 @@ impl RemotePlay {
         if self.prefs.auto_connect && self.consoles.len() == 1 {
             let console = self.consoles[0].clone();
             if ["on", "standby", "connectedstandby"].iter().any(|power| console.power.eq_ignore_ascii_case(power)) {
-                self.start_stream(console, window);
+                self.start_stream(media::Target::Home(console), window);
             }
         }
     }
@@ -212,14 +235,28 @@ impl RemotePlay {
                 self.menu.select_tab(if action == Action::Settings { Tab::Settings } else { Tab::Xbox });
                 false
             }
-            Action::Play(index) => {
-                if let Some(console) = self.consoles.get(index).cloned() {
-                    self.menu.console = index;
-                    self.start_stream(console, window);
+            Action::Cloud => {
+                self.menu.select_tab(Tab::Cloud);
+                if self.cloud_refreshed_at.is_none_or(|time| time.elapsed() >= Duration::from_secs(300)) {
+                    self.refresh_cloud();
                 }
                 false
             }
-            Action::SignIn => { self.menu.select_tab(Tab::Xbox); self.start_login(); false }
+            Action::Play(index) => {
+                if let Some(console) = self.consoles.get(index).cloned() {
+                    self.menu.console = index;
+                    self.start_stream(media::Target::Home(console), window);
+                }
+                false
+            }
+            Action::CloudGame(index) => {
+                if let Some(game) = self.cloud_catalog.as_ref().and_then(|catalog| catalog.get(index)) {
+                    self.menu.cloud_game = index;
+                    self.start_stream(media::Target::Cloud(game.clone()), window);
+                }
+                false
+            }
+            Action::SignIn => { self.start_login(); false }
             Action::Browser => {
                 if let Some(device) = &self.device { cx.open_url(&device.url); }
                 false
@@ -234,7 +271,10 @@ impl RemotePlay {
                 self.menu.select_section(index);
                 false
             }
-            Action::Refresh => { self.refresh_consoles(); false }
+            Action::Refresh => {
+                if self.menu.tab == Tab::Cloud { self.refresh_cloud(); } else { self.refresh_consoles(false); }
+                false
+            }
             Action::SignOut => {
                 self.menu.confirming_sign_out = true;
                 self.menu.browser_cancel = false;
@@ -245,6 +285,10 @@ impl RemotePlay {
                     self.account = None;
                     self.consoles.clear();
                     self.refreshing = false;
+                    self.cloud_catalog = None;
+                    self.cloud_refreshed_at = None;
+                    self.cloud_loading = false;
+                    self.cloud_error = None;
                     self.menu = Menu::default();
                     self.status.clear();
                     journal::record("signed_out", json!({}));
@@ -318,17 +362,43 @@ impl RemotePlay {
                 let managed = std::env::var_os("ALLY_GAMESCOPE_CONTROL_DISPLAY").is_some();
                 if managed || window.is_window_active() { self.menu_key(key, window, cx); }
             }
-            Event::Consoles(account, result) => {
+            Event::Consoles(account, result, auto_connect) => {
                 if self.account.as_ref().is_some_and(|current| Arc::ptr_eq(current, &account)) {
                     self.refreshing = false;
                     match result {
                         Ok(consoles) => {
                             self.consoles = consoles;
                             self.menu.console = self.menu.console.min(self.consoles.len().saturating_sub(1));
-                            self.status.clear();
-                            journal::record("consoles_refreshed", json!({"count": self.consoles.len()}));
+                            if self.menu.tab == Tab::Xbox && self.stream.is_none() { self.status.clear(); }
+                            journal::record("xbox_discovery_completed", json!({"console_count": self.consoles.len()}));
+                            if auto_connect && self.menu.tab == Tab::Xbox { self.auto_connect(window); }
                         }
-                        Err(error) => self.status = error,
+                        Err(error) if self.menu.tab == Tab::Xbox && self.stream.is_none() => self.status = error,
+                        Err(_) => {},
+                    }
+                }
+            }
+            Event::CachedCloudCatalog(account, games) => {
+                if self.account.as_ref().is_some_and(|current| Arc::ptr_eq(current, &account)) {
+                    self.menu.cloud_game = self.menu.cloud_game.min(games.len().saturating_sub(1));
+                    self.cloud_catalog = Some(games);
+                }
+            }
+            Event::CloudCatalog(account, result) => {
+                if self.account.as_ref().is_some_and(|current| Arc::ptr_eq(current, &account)) {
+                    self.cloud_loading = false;
+                    match result {
+                        Ok(games) => {
+                            let previous = self.cloud_catalog.as_ref().and_then(|list| list.get(self.menu.cloud_game));
+                            self.menu.cloud_game = previous.and_then(|game| games.iter().position(|item| item.id == game.id))
+                                .unwrap_or_else(|| self.menu.cloud_game.min(games.len().saturating_sub(1)));
+                            self.cloud_catalog = Some(games);
+                            self.cloud_refreshed_at = Some(Instant::now());
+                        }
+                        Err(error) => {
+                            journal::record("cloud_catalog_failed", json!({}));
+                            self.cloud_error = Some(error);
+                        }
                     }
                 }
             }
@@ -337,12 +407,12 @@ impl RemotePlay {
                 self.status = "Waiting for Microsoft confirmation".into();
                 self.device = Some(prompt);
             }
-            Event::Account { xbox, consoles } => self.show_account(xbox, consoles),
+            Event::Account { xbox } => self.show_account(xbox),
             Event::SignInEnded(result) => {
                 journal::record("sign_in_ended", json!({"success": result.is_ok()}));
                 self.sign_in = None;
                 self.device = None;
-                match result { Ok(()) => self.auto_connect(window), Err(error) => self.status = error }
+                if let Err(error) = result { self.status = error; }
             }
             Event::Stream(media::StreamEvent::VideoReady) => self.video_ready = true,
             Event::Stream(media::StreamEvent::Status(status)) => self.status = status,
@@ -374,14 +444,15 @@ impl RemotePlay {
                 self.overlay_open = false;
                 self.video_ready = false;
                 if std::mem::take(&mut self.reconnect) {
-                    if let Some(console) = self.active_console.take() {
+                    if let Some(target) = self.active_target.take() {
                         let was_windowed = self.restore_windowed;
-                        self.start_stream(console, window);
+                        self.start_stream(target, window);
                         self.restore_windowed = was_windowed;
+                        cx.notify();
                         return;
                     }
                 }
-                self.active_console = None;
+                self.active_target = None;
                 if std::mem::take(&mut self.restore_windowed) && window.is_fullscreen() {
                     window.toggle_fullscreen();
                 }
@@ -412,10 +483,7 @@ fn main() {
         _ => {}
     }
     let (tx, rx) = mpsc::channel();
-    let saved_account = xbox::restore_sign_in().and_then(|account| account.map(|xbox| {
-        let consoles = xbox.consoles()?;
-        Ok((Arc::new(xbox), consoles))
-    }).transpose());
+    let saved_account = xbox::restore_sign_in().map(|account| account.map(Arc::new));
     application().with_assets(deck::Branding).run(move |cx| {
         init(cx);
         let bounds = Bounds::centered(None, size(px(1120.), px(690.)), cx);
@@ -438,7 +506,8 @@ fn main() {
                 let mut view = RemotePlay { tx, account: None, consoles: Vec::new(), sign_in: None,
                     stream: None, stream_commands: None, overlay_open: false, overlay_index: 0, restore_windowed: false,
                     prefs: session_store::load_preferences(), device: None, menu: Menu::default(),
-                    menu_player: None, keyboard_focus: cx.focus_handle(), active_console: None,
+                    menu_player: None, keyboard_focus: cx.focus_handle(), active_target: None,
+                    cloud_catalog: None, cloud_refreshed_at: None, cloud_loading: false, cloud_error: None,
                     reconnect: false, video_ready: false, refreshing: false,
                     status: if media::runtime_available() { String::new() } else { "GStreamer worker missing".into() } };
                 window.focus(&view.keyboard_focus, cx);
@@ -447,7 +516,7 @@ fn main() {
                     view.menu_player = media::menu_input(move |key| { let _ = input_events.send(Event::Menu(key)); }).ok();
                 }
                 match saved_account {
-                    Ok(Some((xbox, consoles))) => { view.show_account(xbox, consoles); view.auto_connect(window); }
+                    Ok(Some(xbox)) => view.show_account(xbox),
                     Ok(None) => {}
                     Err(error) => {
                         journal::record("session_restore_failed", json!({}));
@@ -481,7 +550,7 @@ fn probe(run: media::Run) -> xbox::Result<()> {
         _ => &[P720, P800, P900],
     };
     for resolution in resolutions {
-        let result = media::play(xbox.clone(), console.clone(), *resolution, None,
+        let result = media::play(xbox.clone(), media::Target::Home(console.clone()), *resolution, None,
             Arc::new(AtomicBool::new(false)), run, None, |_| {});
         journal::record("probe_stream_ended", json!({
             "requested_height": resolution.dimensions().1,

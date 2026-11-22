@@ -11,6 +11,11 @@ class ButtonEvent(c.Structure):
                 ('state', c.c_uint), ('button', c.c_uint)]
 
 
+class TextExtents(c.Structure):
+    _fields_ = [(name, c.c_double) for name in
+                ('x_bearing', 'y_bearing', 'width', 'height', 'x_advance', 'y_advance')]
+
+
 class StreamOverlay:
     def __init__(self, x11, display, parent, create_child, toggle, select, hint_visibility):
         self.x11, self.display, self.parent = x11, display, parent
@@ -52,6 +57,7 @@ class StreamOverlay:
             ('cairo_line_to', None, [ptr, d, d]),
             ('cairo_select_font_face', None, [ptr, c.c_char_p, i, i]),
             ('cairo_set_font_size', None, [ptr, d]),
+            ('cairo_text_extents', None, [ptr, c.c_char_p, c.POINTER(TextExtents)]),
             ('cairo_show_text', None, [ptr, c.c_char_p]))
 
         self.xid = create_child(1, 1)
@@ -166,10 +172,20 @@ class StreamOverlay:
                 lib.cairo_rectangle(ctx, x, y, w, h)
                 lib.cairo_fill(ctx)
 
-            def text(x, y, value, size, bold=False, color=(0.93, 0.95, 0.99)):
+            def text(x, y, value, size, bold=False, color=(0.93, 0.95, 0.99), max_width=None):
                 lib.cairo_set_source_rgb(ctx, *color)
                 lib.cairo_select_font_face(ctx, b'DejaVu Sans', 0, int(bold))
                 lib.cairo_set_font_size(ctx, size)
+                if max_width is not None:
+                    extents = TextExtents()
+                    lib.cairo_text_extents(ctx, value.encode(), c.byref(extents))
+                    if extents.x_advance > max_width:
+                        for length in range(len(value) - 1, 0, -1):
+                            shortened = value[:length].rstrip() + '…'
+                            lib.cairo_text_extents(ctx, shortened.encode(), c.byref(extents))
+                            if extents.x_advance <= max_width:
+                                value = shortened
+                                break
                 lib.cairo_move_to(ctx, x, y)
                 lib.cairo_show_text(ctx, value.encode())
 
@@ -182,12 +198,12 @@ class StreamOverlay:
             if self.menu:
                 rect(0, 0, width, height, (0.12, 0.12, 0.13))
                 rect(0, 0, 1, height, (0.28, 0.28, 0.29))
-                text(32, 53, self.console_name[:26], 26, True)
+                text(32, 53, self.console_name[:100], 26, True, max_width=width - 64)
                 lib.cairo_set_source_rgb(ctx, *accent)
                 lib.cairo_arc(ctx, 36, 79, 4, 0, 6.284)
                 lib.cairo_fill(ctx)
                 text(48, 85, label('Стрим идёт', 'Streaming'), 16, color=accent)
-                text(32, 117, self.compact, 14, color=muted)
+                text(32, 117, self.compact, 13, color=muted, max_width=width - 64)
                 diagnostics = label('Скрыть статистику', 'Hide statistics') if self.diagnostics else label('Статистика', 'Statistics')
                 names = (label('Продолжить', 'Resume'), 'Xbox Guide', diagnostics,
                          label('Переподключить', 'Reconnect'), label('Завершить стрим', 'End stream'))
@@ -216,7 +232,7 @@ class StreamOverlay:
                 self.draw_control_layout(ctx, rect, text, accent)
             else:
                 rect(0, 0, width, height, (0.08, 0.09, 0.09))
-                text(10, 21, self.compact, 14)
+                text(10, 21, self.compact, 13, max_width=width - 20)
         finally:
             lib.cairo_destroy(ctx)
             lib.cairo_surface_destroy(surface)

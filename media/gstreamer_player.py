@@ -513,6 +513,7 @@ class Player:
         self.rtc.connect('on-ice-candidate', self.candidate)
         self.rtc.connect('pad-added', self.link_track)
         self.rtc.connect('notify::connection-state', self.connection_changed)
+        self.rtc.connect('notify::ice-connection-state', self.ice_connection_changed)
         self.rtc.connect('notify::ice-gathering-state', self.gathering_changed)
         self.pipeline.get_bus().add_signal_watch()
         self.pipeline.get_bus().connect('message', self.bus_message)
@@ -665,6 +666,16 @@ class Player:
                 case 'answer':
                     if self.capture_diagnostics:
                         self.inspect_timestamps(command['sdp'])
+                    if self.cloud:
+                        lines = command['sdp'].splitlines()
+                        emit('cloud-answer-info', video=sum(line.startswith('m=video ') for line in lines),
+                             inactive=lines.count('a=inactive'), sendonly=lines.count('a=sendonly'),
+                             bundle=any(line.startswith('a=group:BUNDLE') for line in lines),
+                             embeddedCandidates=sum(line.startswith('a=candidate:') for line in lines),
+                             iceLite='a=ice-lite' in lines,
+                             audioPortOpen=any(line.startswith('m=audio ') and line.split()[1] != '0' for line in lines),
+                             videoPortOpen=any(line.startswith('m=video ') and line.split()[1] != '0' for line in lines),
+                             dataPortOpen=any(line.startswith('m=application ') and line.split()[1] != '0' for line in lines))
                     _, sdp = GstSdp.SDPMessage.new_from_text(command['sdp'])
                     answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdp)
                     promise = Gst.Promise.new()
@@ -672,10 +683,23 @@ class Player:
                     checked(promise, 'Remote description rejected')
                     emit('answer-set')
                 case 'ice':
+                    added = 0
                     for candidate in command['candidates']:
                         value = candidate.get('candidate', '').removeprefix('a=')
                         if value.startswith('candidate:'):
-                            self.rtc.emit('add-ice-candidate', int(candidate.get('sdpMLineIndex') or 0), value)
+                            index = int(candidate.get('sdpMLineIndex') or 0)
+                            if self.cloud:
+                                if not self.add_cloud_candidate(index, value):
+                                    continue
+                            else:
+                                self.rtc.emit('add-ice-candidate', index, value)
+                            added += 1
+                    if self.cloud:
+                        if not added:
+                            raise RuntimeError('GStreamer rejected the Xbox Cloud ICE candidates')
+                        self.rtc.emit('add-ice-candidate', 0, None)
+                        emit('cloud-ice-applied', count=added,
+                             state=self.rtc.get_property('ice-connection-state').value_nick)
                 case 'pulse':
                     self.override = (command.get('axis', 0), command.get('buttons', 0),
                                      milliseconds() + command.get('duration', 230))
@@ -720,8 +744,11 @@ class Player:
     def start(self, bitrate, width, height, benchmark=False, capture_diagnostics=False, renderer='auto',
               lsfg=False, interactive=False, options=None):
         self.target_width, self.target_height = int(width), int(height)
-        self.bitrate_limit = int(bitrate)
+        self.bitrate_limit = int(bitrate) if bitrate is not None else None
         options = options or {}
+        self.cloud = options.get('cloud', False)
+        if options.get('stun'):
+            self.rtc.set_property('stun-server', options['stun'])
         self.audio_volume = max(0, min(100, int(options.get('volume', 100)))) / 100
         self.benchmark = benchmark
         self.capture_diagnostics = capture_diagnostics
@@ -799,16 +826,19 @@ class Player:
         offer = reply.get_value('offer')
         sdp = offer.sdp.as_text()
         lines = sdp.splitlines()
+        self.media_ids = [line.removeprefix('a=mid:') for line in lines if line.startswith('a=mid:')]
         video = next(i for i, line in enumerate(lines) if line.startswith('m=video '))
         end = next((i for i in range(video + 1, len(lines)) if lines[i].startswith('m=')), len(lines))
         # Place bandwidth ahead of media attributes (RFC 4566 field order).
         before_attributes = next((i for i in range(video + 1, end) if lines[i].startswith('a=')), end)
-        lines.insert(before_attributes, f'b=AS:{int(bitrate)}')
+        if self.bitrate_limit is not None:
+            lines.insert(before_attributes, f'b=AS:{self.bitrate_limit}')
+            before_attributes += 1
         if self.capture_diagnostics:
             used = {int(match[1]) for line in lines if (match := re.match(r'a=extmap:(\d+)', line))}
             extension = next((value for value in range(14, 0, -1) if value not in used), None)
             if extension is not None:
-                lines.insert(before_attributes + 1, f'a=extmap:{extension}/recvonly http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time')
+                lines.insert(before_attributes, f'a=extmap:{extension}/recvonly http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time')
         sdp = '\r\n'.join(lines) + '\r\n'
         _, description = GstSdp.SDPMessage.new_from_text(sdp)
         offer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.OFFER, description)
@@ -830,7 +860,36 @@ class Player:
         emit('capture-negotiation', capture=self.capture_extension is not None, sendTime=self.send_time_offered)
 
     def candidate(self, _, index, candidate):
-        self.candidates.append({'candidate': candidate, 'sdpMLineIndex': index})
+        description = {'candidate': candidate, 'sdpMLineIndex': index}
+        if self.cloud and index < len(self.media_ids):
+            description['sdpMid'] = self.media_ids[index]
+        self.candidates.append(description)
+
+    def add_cloud_candidate(self, index, value):
+        # libnice splits candidates on literal spaces. Xbox Cloud sometimes
+        # adds padding after the final attribute, which otherwise looks like
+        # an incomplete extension pair.
+        fields = value.split()
+        value = ' '.join(fields)
+        promise = Gst.Promise.new()
+        self.rtc.emit('add-ice-candidate-full', index, value, promise)
+        reply = promise.get_reply() if promise.wait() == Gst.PromiseResult.REPLIED else None
+        error = reply.get_value('error') if reply is not None and reply.has_field('error') else None
+        if error:
+            message = error.message
+            reason = ('unknown_mline' if message.startswith('Unknown mline') else
+                      'address_format' if message.startswith('Failed to retrieve address') else
+                      'candidate_syntax' if message.startswith(('Could not parse candidate', 'candidate address')) else 'other')
+            family = None
+            try:
+                family = ipaddress.ip_address(fields[4]).version
+            except (IndexError, ValueError):
+                pass
+            emit('cloud-ice-rejected', reason=reason, mediaLine=index, addressFamily=family,
+                 fieldCount=len(fields), candidateType=fields[7] if len(fields) > 7 and fields[7] in
+                 ('host', 'srflx', 'prflx', 'relay') else None)
+            return False
+        return True
 
     def gathering_changed(self, *_):
         if self.rtc.get_property('ice-gathering-state') == GstWebRTC.WebRTCICEGatheringState.COMPLETE:
@@ -838,6 +897,10 @@ class Player:
 
     def connection_changed(self, *_):
         emit('connection', state=self.rtc.get_property('connection-state').value_nick)
+
+    def ice_connection_changed(self, *_):
+        if getattr(self, 'cloud', False):
+            emit('ice-connection', state=self.rtc.get_property('ice-connection-state').value_nick)
 
     def send_json(self, label, data):
         channel = self.channels[label]
@@ -850,12 +913,16 @@ class Player:
     def handshake_ack(self):
         width, height = self.target_width, self.target_height
         dimensions = {'width': width, 'height': height}
+        resolution = {'message': 'userRequestedResolutionUpdate', 'resolutionAlias': str(height)}
+        if self.cloud:
+            self.send_json('control', resolution)
         self.send_json('control', {'message': 'authorizationRequest',
             'accessKey': '4BDB3609-C1F1-4195-9B37-FEFF45DA8B8E'})
         self.send_json('control', {'message': 'gamepadChanged', 'gamepadIndex': 0, 'wasAdded': True})
-        self.send_json('control', {'message': 'VideoPreference', 'type': 'VideoPreference',
-            'resolution': dimensions, 'dimensions': dimensions, 'maxFPS': 60})
-        self.send_json('control', {'message': 'userRequestedResolutionUpdate', 'resolutionAlias': str(height)})
+        if not self.cloud:
+            self.send_json('control', {'message': 'VideoPreference', 'type': 'VideoPreference',
+                'resolution': dimensions, 'dimensions': dimensions, 'maxFPS': 60})
+            self.send_json('control', resolution)
         for target, content in (
             ('systemUi/configuration', {'version': [0, 1, 0], 'systemUis': []}),
             ('properties/clientappinstallidchanged', {'clientAppInstallId': str(uuid.uuid4())}),
@@ -1388,14 +1455,15 @@ class Player:
             recent_latency = self.hud_video_latency.copy()
             client_ms = statistics.median(recent_latency) if recent_latency else None
             client_label = 'Видео' if overlay.russian else 'Video'
+            client_drops = 'Пропуски' if overlay.russian else 'Drops'
             overlay.compact = (f'{self.height}p · {fps:.0f} FPS · {mbps:.1f} Mb/s'
                                f' · RTT {ms(self.hud_rtt)} · {client_label} {ms(client_ms)}'
-                               f' · {queue_drops + dropped} ' +
-                               ('кадр. отброш.' if overlay.russian else 'frame drops'))
+                               f' · {client_drops} {queue_drops + dropped}')
             overlay.metrics = (
                 f'Video {self.width}×{self.height} · {fps:.1f} decoded FPS',
                 f'Viewport {size[0]}×{size[1]} · {self.decoder_name} · LSFG {"on" if self.lsfg else "off"}',
-                f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s',
+                (f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s'
+                 if self.bitrate_limit is not None else f'Video {mbps:.1f} Mb/s'),
                 f'RTT {ms(self.hud_rtt)} · jitter {ms(self.hud_jitter)} · RTP lost {loss}',
                 (f'Видео: после джиттер-буфера → вход видеовывода {ms(client_ms)}'
                  if overlay.russian else f'Video: after jitter buffer → sink input {ms(client_ms)}'),
