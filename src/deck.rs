@@ -57,7 +57,9 @@ impl Key {
 pub enum Action {
     Settings,
     Home,
+    Cloud,
     Play(usize),
+    CloudGame(usize),
     SignIn,
     Browser,
     Cancel,
@@ -68,7 +70,11 @@ pub enum Action {
     ConfirmSignOut,
     Resolution,
     Bitrate,
+    Upscale,
     Lsfg,
+    LsfgPerformance,
+    LsfgFlowScale,
+    LsfgPreview,
     Compact,
     Language,
     Palette,
@@ -80,6 +86,7 @@ pub enum Action {
 pub enum Tab {
     #[default]
     Xbox,
+    Cloud,
     Settings,
 }
 
@@ -87,10 +94,19 @@ impl Tab {
     fn action(self) -> Action {
         match self {
             Self::Xbox => Action::Home,
+            Self::Cloud => Action::Cloud,
             Self::Settings => Action::Settings,
         }
     }
+
+    fn step(self, offset: isize) -> Self {
+        let tabs = [Self::Xbox, Self::Cloud, Self::Settings];
+        tabs[(self as isize + offset).rem_euclid(tabs.len() as isize) as usize]
+    }
 }
+
+const CLOUD_COLUMNS: usize = 3;
+const CLOUD_PAGE: usize = 9;
 
 #[derive(Default)]
 pub struct Menu {
@@ -100,6 +116,7 @@ pub struct Menu {
     pub row: Option<usize>,
     pub editing_value: bool,
     pub console: usize,
+    pub cloud_game: usize,
     pub browser_cancel: bool,
     pub confirming_sign_out: bool,
 }
@@ -133,8 +150,8 @@ impl Menu {
             Tab::Xbox
         };
         match key {
-            PreviousTab => return run(Tab::Xbox.action()),
-            NextTab => return run(Tab::Settings.action()),
+            PreviousTab => return run(self.tab.step(-1).action()),
+            NextTab => return run(self.tab.step(1).action()),
             Settings => return run(other_tab.action()),
             Refresh => return run(Action::Refresh),
             _ => {}
@@ -142,10 +159,25 @@ impl Menu {
 
         if let Some(tab) = self.focused_tab {
             match key {
-                Left => self.focused_tab = Some(Tab::Xbox),
-                Right => self.focused_tab = Some(Tab::Settings),
+                Left => self.focused_tab = Some(tab.step(-1)),
+                Right => self.focused_tab = Some(tab.step(1)),
                 Accept => return run(tab.action()),
                 Down | Back => self.focused_tab = None,
+                _ => {}
+            }
+            return None;
+        }
+
+        if self.tab == Tab::Cloud {
+            let last = consoles.len().saturating_sub(1);
+            match key {
+                Up if self.cloud_game < CLOUD_COLUMNS => self.focused_tab = Some(self.tab),
+                Up => self.cloud_game -= CLOUD_COLUMNS,
+                Down => self.cloud_game = (self.cloud_game + CLOUD_COLUMNS).min(last),
+                Left => self.cloud_game = self.cloud_game.saturating_sub(1),
+                Right => self.cloud_game = (self.cloud_game + 1).min(last),
+                Accept => return consoles.get(self.cloud_game.min(last)).copied().and_then(run),
+                Back => return run(Action::Home),
                 _ => {}
             }
             return None;
@@ -321,10 +353,11 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 Some(Bitrate),
             ),
             Row::new(
-                t.t("Масштабирование", "Scaling"),
-                "",
-                t.t("Вписать", "Fit"),
-                None,
+                t.t("Апскейлинг", "Upscaling"),
+                t.t("Для видео меньше экрана · со следующего подключения",
+                    "For video smaller than the screen · applies on reconnect"),
+                if p.lanczos_upscale { "Lanczos" } else { t.t("Вписать", "Fit") },
+                Some(Upscale),
             ),
             Row::new(
                 t.t("Полноэкранный режим", "Fullscreen"),
@@ -335,7 +368,7 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
         ],
         2 => vec![
             Row::new(
-                "LSFG 2× Performance",
+                "LSFG 2×",
                 t.t(
                     "Применяется при следующем подключении",
                     "Applies on the next connection",
@@ -344,12 +377,19 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 Some(Lsfg),
             ),
             Row::new(
-                "Vulkan",
+                t.t("Режим LSFG", "LSFG mode"),
                 "",
-                t.t("Вывод при включённом LSFG", "Video output with LSFG"),
-                None,
+                if p.lsfg_performance { t.t("Производительность", "Performance") }
+                else { t.t("Качество", "Quality") },
+                Some(LsfgPerformance),
             ),
-            Row::new("Flow Scale", "", "1.0", None),
+            Row::new("Flow Scale", "", p.lsfg_flow_scale(), Some(LsfgFlowScale)),
+            Row::new(
+                t.t("Предпросмотр LSFG", "LSFG preview"),
+                t.t("Сравнить движение и FPS вывода", "Compare motion and presentation FPS"),
+                t.t("Открыть", "Open"),
+                Some(LsfgPreview),
+            ),
         ],
         3 => vec![
             Row::new(
@@ -373,10 +413,20 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
             Row::new(
                 t.t("Открыть оверлей", "Open stream overlay"),
                 t.t(
-                    "Одиночные нажатия уходят на Xbox",
-                    "Individual presses are sent to Xbox",
+                    "Коротко нажмите обе кнопки одновременно",
+                    "Tap both buttons together",
                 ),
-                "View + Menu · 0.5 s",
+                "View + Menu",
+                None,
+            ),
+            Row::new(
+                t.t("Схема кнопок", "Button layout"),
+                "",
+                if crate::device::current().id == "gamepad" {
+                    t.t("Геймпад", "Gamepad")
+                } else {
+                    crate::device::current().name
+                },
                 None,
             ),
             Row::new(
@@ -453,6 +503,12 @@ pub fn order(v: &RemotePlay) -> Vec<Action> {
     if v.account.is_none() {
         return vec![Action::SignIn];
     }
+    if v.menu.tab == Tab::Cloud {
+        return match &v.cloud_catalog {
+            Some(catalog) if !catalog.is_empty() => (0..catalog.len()).map(Action::CloudGame).collect(),
+            _ => vec![Action::Refresh],
+        };
+    }
     if v.consoles.is_empty() {
         return vec![Action::Refresh];
     }
@@ -490,6 +546,12 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
     let s = |p| px(p * unit);
     let t = Text(v.prefs.russian());
     let (accent, primary) = colors(v.prefs);
+    if let Some(preview) = &v.preview {
+        return div().id("lsfg-preview").size_full().bg(rgb(0)).text_color(rgb(TEXT))
+            .flex().items_center().justify_center().track_focus(&v.keyboard_focus)
+            .when(!preview.ready, |el| el.child(t.t("Открывается превью… · B Назад", "Starting preview… · B Back")))
+            .into_any_element();
+    }
     let native_stream = v.stream.is_some() && super::x11_window(window).is_some();
     if native_stream && v.video_ready {
         return div().size_full().bg(rgb(0)).into_any_element();
@@ -525,8 +587,9 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             cx,
         )
     };
-    let home = tab("Xbox", Tab::Xbox, 0);
-    let settings = tab(t.t("Настройки", "Settings"), Tab::Settings, 1);
+    let home = tab("Remote Play", Tab::Xbox, 0);
+    let cloud = tab("Xbox Cloud", Tab::Cloud, 1);
+    let settings = tab(t.t("Настройки", "Settings"), Tab::Settings, 2);
     let top = div()
         .h(s(72.))
         .flex_none()
@@ -545,7 +608,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                 .mr(s(16.))
                 .child("Playwake"),
         )
-        .when(tabs_available, |bar| bar.child(home).child(settings))
+        .when(tabs_available, |bar| bar.child(home).child(cloud).child(settings))
         .child(div().flex_1())
         .when(v.account.is_none(), |bar| {
             bar.child(
@@ -572,9 +635,9 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             ("↓", t.t("К содержимому", "Back to content")),
             ("LB/RB", t.t("Вкладки", "Tabs")),
         ];
-    } else if v.menu.tab == Tab::Xbox && v.account.is_some() && v.stream.is_none() {
+    } else if v.menu.tab != Tab::Settings && v.account.is_some() && v.stream.is_none() {
         hints = vec![
-            ("◀▶", t.t("Выбор", "Move")),
+            (if v.menu.tab == Tab::Cloud { "↔↕" } else { "◀▶" }, t.t("Выбор", "Move")),
             ("A", t.t("Играть", "Play")),
             ("Y", t.t("Обновить", "Refresh")),
             ("LB/RB", t.t("Вкладки", "Tabs")),
@@ -911,12 +974,14 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                     div()
                         .text_size(s(43.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(t.t("Стриминг с вашей Xbox", "Stream from your Xbox")),
+                        .child(if v.menu.tab == Tab::Cloud { "Xbox Cloud Gaming" }
+                               else { t.t("Стриминг с вашей Xbox", "Stream from your Xbox") }),
                 )
-                .child(div().max_w(s(530.)).text_color(rgb(0xc9d3d0)).child(t.t(
-                    "Войдите в аккаунт Microsoft, к которому привязана консоль.",
-                    "Sign in to the Microsoft account your console uses.",
-                )))
+                .child(div().max_w(s(530.)).text_color(rgb(0xc9d3d0)).child(if v.menu.tab == Tab::Cloud {
+                    t.t("Войдите в аккаунт Microsoft для доступа к облачным играм.", "Sign in to Microsoft to access cloud games.")
+                } else {
+                    t.t("Войдите в аккаунт Microsoft, к которому привязана консоль.", "Sign in to the Microsoft account your console uses.")
+                }))
                 .child(
                     action(
                         ("welcome", 0),
@@ -944,6 +1009,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                         .child(v.status.clone()),
                 ),
         );
+    } else if v.menu.tab == Tab::Cloud {
+        body = body.child(cloud_library(v, &t, accent, unit, cx));
     } else {
         let heading = div()
             .flex()
@@ -1129,6 +1196,47 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         .into_any_element()
 }
 
+fn cloud_library(v: &RemotePlay, t: &Text, accent: u32, unit: f32, cx: &mut Context<RemotePlay>) -> Div {
+    let s = |p| px(p * unit);
+    let games = v.cloud_catalog.as_deref().unwrap_or_default();
+    let start = (v.menu.cloud_game / CLOUD_PAGE) * CLOUD_PAGE;
+    let end = (start + CLOUD_PAGE).min(games.len());
+    let mut page = div().p(s(38.)).size_full().flex().flex_col().gap(s(16.))
+        .child(div().text_size(s(34.)).font_weight(FontWeight::SEMIBOLD).child("Xbox Cloud Gaming"));
+    if v.cloud_loading {
+        page = page.child(if v.cloud_catalog.is_some() {
+            t.t("Обновление каталога…", "Refreshing cloud library…")
+        } else {
+            t.t("Загрузка каталога…", "Loading cloud library…")
+        });
+    }
+    if let Some(error) = &v.cloud_error {
+        page = page.child(div().text_color(rgb(MUTED)).child(error.clone()));
+    }
+    if games.is_empty() && !v.cloud_loading {
+        if v.cloud_error.is_none() {
+            page = page.child(t.t("Для этого аккаунта нет доступных облачных игр.", "No cloud games are available for this account."));
+        }
+        return page.child(action(("cloud-refresh", 0), div().p(s(12.))
+            .child(t.t("Обновить каталог", "Refresh library")), Action::Refresh,
+            v.menu.focused_tab.is_none(), accent, unit, cx).w(s(240.)));
+    }
+    for (row, chunk) in games[start..end].chunks(CLOUD_COLUMNS).enumerate() {
+        page = page.child(div().flex().gap(s(14.)).children(chunk.iter().enumerate().map(|(column, game)| {
+            let index = start + row * CLOUD_COLUMNS + column;
+            let card = div().w(s(335.)).h(s(76.)).px(s(14.)).flex().items_center()
+                .bg(rgb(CARD)).rounded(s(10.)).text_size(s(18.)).child(game.name.clone());
+            action(("cloud-game", index), card, Action::CloudGame(index),
+                v.menu.cloud_game == index && v.menu.focused_tab.is_none(), accent, unit, cx)
+        })));
+    }
+    if !games.is_empty() {
+        page = page.child(div().text_color(rgb(MUTED)).child(format!("{}–{} / {}", start + 1, end, games.len())));
+        if !v.status.is_empty() { page = page.child(div().text_color(rgb(MUTED)).child(v.status.clone())); }
+    }
+    page
+}
+
 fn hero(body: Div, unit: f32) -> Div {
     body.child(
         img("branding/hero.png")
@@ -1155,11 +1263,11 @@ mod navigation_tests {
         assert_eq!(menu.navigate(Key::Up, &[], &consoles), None);
         assert_eq!(menu.focused_tab, Some(Tab::Xbox));
         assert_eq!(menu.navigate(Key::Right, &[], &consoles), None);
-        assert_eq!(menu.focused_tab, Some(Tab::Settings));
+        assert_eq!(menu.focused_tab, Some(Tab::Cloud));
         assert_eq!(menu.tab, Tab::Xbox);
         assert_eq!(
             menu.navigate(Key::Accept, &[], &consoles),
-            Some((Action::Settings, 1))
+            Some((Action::Cloud, 1))
         );
     }
 
@@ -1178,12 +1286,12 @@ mod navigation_tests {
         assert_eq!(menu.focused_tab, Some(Tab::Settings));
         assert_eq!(
             menu.navigate(Key::PreviousTab, &rows, &[]),
-            Some((Action::Home, 1))
+            Some((Action::Cloud, 1))
         );
         menu.select_tab(Tab::Xbox);
         assert_eq!(
             menu.navigate(Key::NextTab, &[], &[]),
-            Some((Action::Settings, 1))
+            Some((Action::Cloud, 1))
         );
     }
 

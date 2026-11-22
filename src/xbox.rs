@@ -2,7 +2,7 @@ use crate::{journal, session_store};
 use reqwest::{Method, Url, blocking::{Client, RequestBuilder, Response}, redirect::Policy};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{sync::atomic::{AtomicBool, Ordering}, thread, time::{Duration, Instant}};
+use std::{io::Read, sync::{Mutex, atomic::{AtomicBool, Ordering}}, thread, time::{Duration, Instant}};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -14,24 +14,20 @@ const TRANSFER_SCOPE: &str = "service::http://Passport.NET/purpose::PURPOSE_XBOX
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Resolution {
     P720,
-    P800,
-    P900,
     #[default]
     P1080,
     P1440,
 }
 
 impl Resolution {
-    pub const CHOICES: [(Self, &'static str); 5] = [
-        (Self::P720, "720p"), (Self::P800, "800p (test)"), (Self::P900, "900p (test)"),
+    pub const CHOICES: [(Self, &'static str); 3] = [
+        (Self::P720, "720p"),
         (Self::P1080, "1080p"), (Self::P1440, "1440p"),
     ];
 
     pub fn dimensions(self) -> (u32, u32) {
         match self {
             Self::P720 => (1280, 720),
-            Self::P800 => (1422, 800),
-            Self::P900 => (1600, 900),
             Self::P1080 => (1920, 1080),
             Self::P1440 => (2560, 1440),
         }
@@ -108,11 +104,27 @@ struct Offering { regions: Vec<Region> }
 struct Region { base_uri: String, #[serde(default)] is_default: bool }
 
 pub struct Xbox {
+    pub(super) client: Client,
+    pub(super) xsts: String,
+    pub(super) cloud_cache_key: String,
+    refresh_token: String,
+    client_id: String,
+    home: Mutex<Option<Streaming>>,
+}
+
+#[derive(Clone)]
+pub struct Streaming {
     client: Client,
     base: Url,
     gs_token: String,
+    cloud_route: Option<(String, &'static str)>,
     refresh_token: String,
     client_id: String,
+}
+
+pub struct SessionConfig {
+    pub heartbeat: Duration,
+    pub stun: Option<String>,
 }
 
 pub fn client() -> Result<Client> {
@@ -127,12 +139,16 @@ pub fn read(response: Response, stage: &str) -> Result<Value> {
         return Err(format!("{stage}: HTTP {status}"));
     }
     if response.status().as_u16() == 204 || response.content_length() == Some(0) { return Ok(Value::Null); }
-    let bytes = response.bytes().map_err(|_| format!("{stage}: incomplete response"))?;
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    response.take(LIMIT as u64 + 1).read_to_end(&mut bytes)
+        .map_err(|_| format!("{stage}: incomplete response"))?;
+    if bytes.len() > LIMIT { return Err(format!("{stage}: response too large")); }
     if bytes.is_empty() { return Ok(Value::Null); }
     serde_json::from_slice(&bytes).map_err(|_| format!("{stage}: invalid response"))
 }
 
-fn send(request: RequestBuilder, stage: &str) -> Result<Response> {
+pub(super) fn send(request: RequestBuilder, stage: &str) -> Result<Response> {
     request.send().map_err(|error| {
         let reason = if error.is_timeout() { "timed out" } else { "network request failed" };
         journal::record("network_error", json!({"stage": stage, "reason": reason}));
@@ -140,7 +156,7 @@ fn send(request: RequestBuilder, stage: &str) -> Result<Response> {
     })
 }
 
-fn field(value: &Value, key: &str, stage: &str) -> Result<String> {
+pub(super) fn field(value: &Value, key: &str, stage: &str) -> Result<String> {
     value.get(key).and_then(Value::as_str).filter(|text| !text.is_empty()).map(str::to_owned)
         .ok_or_else(|| format!("{stage}: missing {key}"))
 }
@@ -209,12 +225,13 @@ pub fn finish_sign_in(client: Client, client_id: String, device: DeviceCode, can
     };
     let access = response.access_token.ok_or("Microsoft returned no access token")?;
     let refresh_token = response.refresh_token.ok_or("Microsoft returned no refresh token")?;
-    save_session(&client_id, &refresh_token);
-    xbox_login(client, client_id, access, refresh_token)
+    let catalog_key = uuid::Uuid::new_v4().simple().to_string();
+    save_session(&client_id, &refresh_token, &catalog_key);
+    xbox_login(client, client_id, access, refresh_token, catalog_key)
 }
 
-fn save_session(client_id: &str, refresh_token: &str) {
-    journal::record("session_saved", json!({"success": session_store::save(client_id, refresh_token).is_ok()}));
+fn save_session(client_id: &str, refresh_token: &str, catalog_key: &str) {
+    journal::record("session_saved", json!({"success": session_store::save(client_id, refresh_token, catalog_key).is_ok()}));
 }
 
 pub fn restore_sign_in() -> Result<Option<Xbox>> {
@@ -226,7 +243,7 @@ pub fn restore_sign_in() -> Result<Option<Xbox>> {
     let client = client()?;
     let stage = "Microsoft refresh";
     let raw = send(client.post(format!("{OAUTH}/token")).form(&[
-        ("grant_type", "refresh_token"), ("client_id", &client_id), ("refresh_token", &previous), ("scope", SCOPE),
+        ("grant_type", "refresh_token"), ("client_id", &client_id), ("refresh_token", &previous.refresh_token), ("scope", SCOPE),
     ]), stage)?;
     let status = raw.status();
     let response = raw.json::<OAuthToken>().map_err(|_| format!("{stage}: invalid response"))?;
@@ -240,16 +257,17 @@ pub fn restore_sign_in() -> Result<Option<Xbox>> {
         return Err(format!("{stage}: HTTP {}", status.as_u16()));
     }
     let access = response.access_token.ok_or("Microsoft returned no access token")?;
-    let refresh_token = match response.refresh_token {
-        Some(token) => { save_session(&client_id, &token); token }
-        None => previous,
-    };
-    let xbox = xbox_login(client, client_id, access, refresh_token)?;
+    let catalog_key = previous.catalog_key.clone().filter(|key| uuid::Uuid::parse_str(key).is_ok())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let updated = response.refresh_token.is_some() || previous.catalog_key.as_deref() != Some(&catalog_key);
+    let refresh_token = response.refresh_token.unwrap_or(previous.refresh_token);
+    if updated { save_session(&client_id, &refresh_token, &catalog_key); }
+    let xbox = xbox_login(client, client_id, access, refresh_token, catalog_key)?;
     journal::record("session_restored", json!({}));
     Ok(Some(xbox))
 }
 
-fn xbox_login(client: Client, client_id: String, access: String, refresh_token: String) -> Result<Xbox> {
+fn xbox_login(client: Client, client_id: String, access: String, refresh_token: String, cloud_cache_key: String) -> Result<Xbox> {
     let stage = "Xbox user authentication";
     let user = read(send(client.post("https://user.auth.xboxlive.com/user/authenticate")
         .header("x-xbl-contract-version", "1").json(&json!({
@@ -258,28 +276,52 @@ fn xbox_login(client: Client, client_id: String, access: String, refresh_token: 
         })), stage)?, stage)?;
     let token = field(&user, "Token", stage)?;
 
-    let stage = "Xbox Remote Play authorization";
+    let stage = "Xbox streaming authorization";
     let xsts = read(send(client.post("https://xsts.auth.xboxlive.com/xsts/authorize")
         .header("x-xbl-contract-version", "1").header("Origin", "https://www.xbox.com")
         .header("Referer", "https://www.xbox.com/").header("ms-cv", "0")
         .json(&json!({"Properties":{"SandboxId":"RETAIL","UserTokens":[token]},
             "RelyingParty":"http://gssv.xboxlive.com/","TokenType":"JWT"})), stage)?, stage)?;
-    let token = field(&xsts, "Token", stage)?;
-    let stage = "xHome login";
-    let login: LoginResponse = serde_json::from_value(read(send(client.post("https://xhome.gssv-play-prod.xboxlive.com/v2/login/user")
-        .header("x-gssv-client", "XboxComBrowser").json(&json!({"token":token,"offeringId":"xhome"})), stage)?, stage)?)
-        .map_err(|_| "xHome returned an invalid login response".to_string())?;
-    let region = login.offering_settings.regions.iter().find(|r| r.is_default)
-        .or_else(|| login.offering_settings.regions.first()).ok_or("xHome returned no region")?;
-    Ok(Xbox { client, base: xbox_region(&region.base_uri)?, gs_token: login.gs_token, refresh_token, client_id })
+    let xsts = field(&xsts, "Token", stage)?;
+    Ok(Xbox { client, xsts, cloud_cache_key, refresh_token, client_id, home: Mutex::new(None) })
 }
 
 impl Xbox {
-    fn request(&self, method: Method, path: &str) -> Result<RequestBuilder> {
+    pub fn home(&self) -> Result<Streaming> {
+        let mut cached = self.home.lock().map_err(|_| "Xbox account unavailable")?;
+        if let Some(service) = cached.as_ref() { return Ok(service.clone()); }
+        let stage = "xHome login";
+        let reply = read(send(self.client.post("https://xhome.gssv-play-prod.xboxlive.com/v2/login/user")
+            .header("x-gssv-client", "XboxComBrowser").json(&json!({"token":self.xsts,"offeringId":"xhome"})), stage)?, stage)?;
+        let service = self.streaming(reply, None)?;
+        *cached = Some(service.clone());
+        Ok(service)
+    }
+
+    pub fn consoles(&self) -> Result<Vec<Console>> { self.home()?.consoles() }
+
+    pub(super) fn streaming(&self, value: Value, cloud_route: Option<(String, &'static str)>) -> Result<Streaming> {
+        let login: LoginResponse = serde_json::from_value(value)
+            .map_err(|_| "Xbox returned an invalid streaming login response")?;
+        let region = login.offering_settings.regions.iter().find(|r| r.is_default)
+            .or_else(|| login.offering_settings.regions.first()).ok_or("Xbox returned no streaming region")?;
+        let base = if cloud_route.is_some() { crate::cloud::service_url(&region.base_uri)? } else { xbox_region(&region.base_uri)? };
+        Ok(Streaming { client: self.client.clone(), base, gs_token: login.gs_token, cloud_route,
+            refresh_token: self.refresh_token.clone(), client_id: self.client_id.clone() })
+    }
+}
+
+impl Streaming {
+    pub(super) fn request(&self, method: Method, path: &str) -> Result<RequestBuilder> {
         let url = self.base.join(path).map_err(|_| "Invalid Xbox session path")?;
         if url.origin() != self.base.origin() { return Err("Invalid Xbox session host".into()); }
-        Ok(self.client.request(method, url).bearer_auth(&self.gs_token)
-            .header("x-gssv-client", "XboxComBrowser").header("Content-Type", "application/json"))
+        let request = self.client.request(method, url).bearer_auth(&self.gs_token)
+            .header("Content-Type", "application/json");
+        Ok(match &self.cloud_route {
+            Some((market, routing)) => crate::cloud::headers(request).header("X-GSSV-Routing", *routing)
+                .header("x-xbl-market", market).header("ms-cv", crate::cloud::correlation_vector()),
+            None => request.header("x-gssv-client", "XboxComBrowser"),
+        })
     }
 
     pub fn consoles(&self) -> Result<Vec<Console>> {
@@ -306,22 +348,44 @@ impl Xbox {
                "settings":{"nanoVersion":"V3;WebrtcTransport.dll","enableTextToSpeech":false,"highContrast":0,
                     "locale":"en-US","useIceConnection":false,"timezoneOffsetMinutes":0,"sdkType":"web","osName":"windows"}
             })), stage)?, stage)?;
-        let path = field(&reply, "sessionPath", stage)?;
-        let id = path.trim_start_matches('/').strip_prefix("v5/sessions/home/")
-            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-            .ok_or("Xbox returned an invalid session path")?;
-        Ok(format!("/v5/sessions/home/{id}"))
+        session_path(&reply, "home", stage)
     }
 
-    pub fn provision(&self, path: &str, cancel: &AtomicBool) -> Result<()> {
+    pub fn provision(&mut self, path: &str, cancel: &AtomicBool, status: impl Fn(String)) -> Result<SessionConfig> {
         let mut sent_transfer = false;
         let stage = "Xbox session state";
         let state = format!("{path}/state");
-        for _ in 0..55 {
+        let cloud = self.cloud_route.is_some();
+        let deadline = Instant::now() + Duration::from_secs(if cloud { 900 } else { 42 });
+        let mut previous = None::<String>;
+        let mut wait_status = None;
+        while Instant::now() < deadline {
             if cancel.load(Ordering::Relaxed) { return Err("Stream cancelled".into()); }
-            let json = read(send(self.request(Method::GET, &state)?, stage)?, stage)?;
-            match json.get("state").and_then(Value::as_str) {
-                Some("Provisioned") => return Ok(()),
+            let reply = read(send(self.request(Method::GET, &state)?, stage)?, stage)?;
+            if cloud && let Some(uri) = reply.get("transferUri").and_then(Value::as_str)
+                .filter(|uri| !uri.is_empty()) { self.base = crate::cloud::service_url(uri)?; }
+            let current = reply.get("state").and_then(Value::as_str);
+            if cloud {
+                let public_state = current.filter(|state| matches!(*state,
+                    "WaitingForResources" | "ReadyToConnect" | "Provisioning" | "Provisioned" | "Failed" | "Ended"))
+                    .unwrap_or("Unknown");
+                if previous.as_deref() != Some(public_state) {
+                    journal::record("cloud_session_state", json!({"state":public_state}));
+                    previous = Some(public_state.to_owned());
+                }
+            }
+            match current {
+                Some("Provisioned") if cloud => {
+                    let configuration = read(send(self.request(Method::GET, &format!("{path}/configuration"))?,
+                        "Xbox Cloud configuration")?, "Xbox Cloud configuration")?;
+                    let seconds = configuration.get("keepAlivePulseInSeconds").and_then(Value::as_u64)
+                        .filter(|seconds| (5..=120).contains(seconds)).unwrap_or(30);
+                    let stun = configuration.pointer("/serverDetails/stunServerAddresses")
+                        .and_then(Value::as_array).into_iter().flatten().take(32)
+                        .filter_map(Value::as_str).find_map(crate::cloud::stun_url);
+                    return Ok(SessionConfig { heartbeat: Duration::from_secs(seconds), stun });
+                }
+                Some("Provisioned") => return Ok(SessionConfig { heartbeat: Duration::from_secs(30), stun: None }),
                 Some("Failed" | "Ended" | "Disconnected") => return Err("Xbox could not provision the session".into()),
                 Some("ReadyToConnect") if !sent_transfer => {
                     let stage = "Xbox console transfer";
@@ -333,9 +397,21 @@ impl Xbox {
                     read(send(self.request(Method::POST, &format!("{path}/connect"))?.json(&json!({"userToken":token})), stage)?, stage)?;
                     sent_transfer = true;
                 }
+                Some("WaitingForResources") if cloud => {
+                    let eta = reply.get("estimatedTotalWaitTimeInSeconds").and_then(Value::as_u64);
+                    let message = eta.map(|seconds| format!("Waiting for Xbox Cloud · about {} min", seconds.div_ceil(60).max(1)))
+                        .unwrap_or_else(|| "Waiting for an Xbox Cloud server…".into());
+                    if wait_status.as_ref() != Some(&message) {
+                        status(message.clone());
+                        wait_status = Some(message);
+                    }
+                }
                 _ => {}
             }
-            thread::sleep(Duration::from_millis(750));
+            for _ in 0..if cloud { 12 } else { 5 } {
+                if cancel.load(Ordering::Relaxed) { return Err("Stream cancelled".into()); }
+                thread::sleep(Duration::from_millis(150));
+            }
         }
         Err("Xbox provisioning timed out".into())
     }
@@ -347,6 +423,9 @@ impl Xbox {
             if let Some(data) = reply.get("exchangeResponse").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                 return serde_json::from_str(data).map_err(|_| format!("{stage}: invalid exchange response"));
             }
+            if self.cloud_route.is_some() && let Some(response) = reply.get("exchangeResponse").filter(|v| v.is_object() || v.is_array()) {
+                return Ok(response.clone());
+            }
             thread::sleep(Duration::from_millis(350));
         }
         Err(format!("{stage}: timed out"))
@@ -354,19 +433,31 @@ impl Xbox {
 
     pub fn sdp(&self, path: &str, offer: &str) -> Result<String> {
         let stage = "Xbox SDP exchange";
-        let payload = json!({"messageType":"offer","sdp":offer,"configuration":{
+        let mut payload = json!({"messageType":"offer","sdp":offer,"configuration":{
             "chatConfiguration":{"bytesPerSample":2,"expectedClipDurationMs":20,
                 "format":{"codec":"opus","container":"webm"},"numChannels":1,"sampleFrequencyHz":24000},
             "chat":{"minVersion":1,"maxVersion":1},"control":{"minVersion":1,"maxVersion":3},
             "input":{"minVersion":1,"maxVersion":8},"message":{"minVersion":1,"maxVersion":1}
         }});
-        field(&self.exchange(&format!("{path}/sdp"), payload, stage)?, "sdp", stage)
+        if self.cloud_route.is_some() {
+            payload["requestId"] = json!(1);
+            payload["cv"] = json!(crate::cloud::correlation_vector());
+            let configuration = payload["configuration"].as_object_mut().ok_or("Invalid SDP configuration")?;
+            if let Some(chat) = configuration.remove("chat") {
+                configuration.insert("chatStream".into(), chat);
+            }
+        }
+        let reply = self.exchange(&format!("{path}/sdp"), payload, stage)?;
+        field(&reply, "sdp", stage)
     }
 
     pub fn ice(&self, path: &str, candidates: Value) -> Result<Value> {
-        let mut reply = self.exchange(&format!("{path}/ice"),
-            json!({"messageType":"iceCandidate","candidate":candidates}), "Xbox ICE exchange")?;
+        let cloud = self.cloud_route.is_some();
+        let payload = if cloud { crate::cloud::ice_offer(&candidates)? }
+            else { json!({"messageType":"iceCandidate","candidate":candidates}) };
+        let mut reply = self.exchange(&format!("{path}/ice"), payload, "Xbox ICE exchange")?;
         let list = reply.as_array_mut().ok_or("Xbox ICE response was not a list")?;
+        if cloud { crate::cloud::decode_ice(list)?; }
         let derived: Vec<_> = list.iter().flat_map(teredo_candidates).collect();
         list.extend(derived);
         Ok(reply)
@@ -380,6 +471,16 @@ impl Xbox {
     pub fn stop(&self, path: &str) {
         if let Ok(request) = self.request(Method::DELETE, path) { let _ = request.send(); }
     }
+}
+
+pub(super) fn session_path(reply: &Value, kind: &str, stage: &str) -> Result<String> {
+    let path = field(reply, "sessionPath", stage)?;
+    let prefix = format!("v5/sessions/{kind}/");
+    let id = path.trim_start_matches('/').strip_prefix(&prefix)
+        .filter(|id| !id.is_empty() && id.len() <= 256
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        .ok_or("Xbox returned an invalid session path")?;
+    Ok(format!("/{prefix}{id}"))
 }
 
 fn teredo_candidates(value: &Value) -> Vec<Value> {

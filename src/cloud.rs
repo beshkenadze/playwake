@@ -1,0 +1,295 @@
+use crate::{journal, session_store, xbox::{self, Resolution, Result, Streaming, Xbox}};
+use reqwest::{Method, Url, blocking::RequestBuilder};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, io::Read, sync::Mutex};
+
+const LOGIN_ROUTES: [(&str, &str, &str); 3] = [
+    ("https://xgpuweb.gssv-play-prod.xboxlive.com/v2/login/user", "xgpuweb", "AFD"),
+    ("https://atm.gssv-play-prod.xboxlive.com/v2/login/user", "xgpuweb", "ATM"),
+    ("https://xgpuwebf2p.gssv-play-prod.xboxlive.com/v2/login/user", "xgpuwebf2p", "AFD"),
+];
+const APP_VERSION: &str = "29.19.17";
+const SDK_VERSION: &str = "10.6.57";
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Game {
+    pub id: String,
+    pub name: String,
+}
+
+const CACHED_ACCOUNTS: usize = 4;
+const CACHED_GAMES: usize = 4096;
+const CACHE_BYTES: u64 = 8 * 1024 * 1024;
+static CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Deserialize, Serialize)]
+struct CacheEntry {
+    account: String,
+    games: Vec<Game>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct CatalogCache(VecDeque<CacheEntry>);
+
+impl CatalogCache {
+    fn get(&mut self, account: &str) -> Option<Vec<Game>> {
+        let index = self.0.iter().position(|entry| entry.account == account)?;
+        let entry = self.0.remove(index)?;
+        let games = entry.games.clone();
+        self.0.push_front(entry);
+        Some(games)
+    }
+
+    fn put(&mut self, account: &str, games: Vec<Game>) {
+        self.0.retain(|entry| entry.account != account);
+        self.0.push_front(CacheEntry { account: account.to_owned(), games });
+        self.0.truncate(CACHED_ACCOUNTS);
+    }
+}
+
+fn with_cache<T>(update: impl FnOnce(&mut CatalogCache) -> Option<T>) -> Option<T> {
+    let _guard = CACHE_LOCK.lock().ok()?;
+    let path = session_store::path().ok()?.with_extension("cloud-catalog.json");
+    let mut cache: CatalogCache = fs::File::open(&path).ok()
+        .filter(|file| file.metadata().is_ok_and(|metadata| metadata.len() <= CACHE_BYTES))
+        .and_then(|file| serde_json::from_reader(file.take(CACHE_BYTES)).ok())
+        .unwrap_or_default();
+    cache.0.truncate(CACHED_ACCOUNTS);
+    cache.0.retain(|entry| entry.games.len() <= CACHED_GAMES);
+    let value = update(&mut cache)?;
+    let _ = session_store::write_json(path, &cache);
+    Some(value)
+}
+
+pub fn cached_catalog(account: &Xbox) -> Option<Vec<Game>> {
+    let games = with_cache(|cache| cache.get(&account.cloud_cache_key))?;
+    journal::record("cloud_catalog_cache_hit", json!({"games":games.len()}));
+    Some(games)
+}
+
+pub(super) fn service_url(raw: &str) -> Result<Url> {
+    let value = if raw.contains("://") { raw.to_owned() } else { format!("https://{raw}") };
+    let url = Url::parse(&value).map_err(|_| "Invalid Xbox Cloud server")?;
+    if url.scheme() == "https" && url.host_str().is_some_and(|host| host.ends_with(".xboxlive.com"))
+        && url.username().is_empty() && url.password().is_none() && url.port().is_none()
+        && url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
+        Ok(url)
+    } else {
+        Err("Invalid Xbox Cloud server".into())
+    }
+}
+
+pub(super) fn headers(request: RequestBuilder) -> RequestBuilder {
+    request.header("User-Agent", USER_AGENT).header("Origin", "https://www.xbox.com")
+        .header("Referer", "https://www.xbox.com/play").header("x-gssv-client", "XboxComBrowser")
+        .header("Accept", "application/json")
+}
+
+pub(super) fn correlation_vector() -> String {
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    format!("{}.0", &random[..22])
+}
+
+pub(super) fn stun_url(raw: &str) -> Option<String> {
+    if raw.len() > 256 { return None; }
+    let address = raw.strip_prefix("stun://").or_else(|| raw.strip_prefix("stun:")).unwrap_or(raw);
+    let url = Url::parse(&format!("stun://{address}")).ok()?;
+    (url.has_host() && url.username().is_empty() && url.password().is_none()
+        && url.query().is_none() && url.fragment().is_none() && url.path().is_empty()
+        && url.port() != Some(0)).then(|| url.to_string())
+}
+
+pub(super) fn ice_offer(candidates: &Value) -> Result<Value> {
+    let candidates = candidates.as_array().filter(|list| !list.is_empty() && list.len() <= 64)
+        .ok_or("GStreamer supplied no usable ICE candidates")?;
+    let mut encoded: Vec<_> = candidates.iter().map(Value::to_string).collect();
+    encoded.push("a=end-of-candidates".into());
+    Ok(json!({"candidates":encoded}))
+}
+
+pub(super) fn decode_ice(candidates: &mut [Value]) -> Result<()> {
+    if candidates.len() > 64 { return Err("Xbox Cloud returned too many ICE candidates".into()); }
+    for value in candidates.iter_mut() {
+        if let Some(text) = value.as_str() {
+            *value = if text == "a=end-of-candidates" {
+                json!({"candidate":text})
+            } else {
+                serde_json::from_str(text).map_err(|_| "Invalid Xbox Cloud ICE candidate")?
+            };
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_transfer_and_session_paths_are_bounded() {
+        assert!(service_url("uks.core.gssv-play-prod.xboxlive.com").is_ok());
+        assert!(service_url("https://xboxlive.com.example.org").is_err());
+        assert!(service_url("https://uks.core.gssv-play-prod.xboxlive.com/path").is_err());
+        assert!(stun_url("stun:stun.example.org:3478").is_some());
+        assert!(stun_url("stun:credentials@stun.example.org").is_none());
+        assert!(xbox::session_path(&json!({"sessionPath":"/v5/sessions/home/session"}), "cloud", "test").is_err());
+    }
+
+    #[test]
+    fn cloud_ice_uses_string_candidates_and_accepts_both_reply_shapes() {
+        let candidate = json!({"candidate":"candidate:1","sdpMLineIndex":0});
+        let payload = ice_offer(&json!([candidate])).unwrap();
+        assert_eq!(payload["candidates"][0], candidate.to_string());
+        assert_eq!(payload["candidates"][1], "a=end-of-candidates");
+        let mut reply = [candidate.clone(), json!(candidate.to_string()), json!("a=end-of-candidates")];
+        decode_ice(&mut reply).unwrap();
+        assert_eq!(reply[0], reply[1]);
+        assert_eq!(reply[2]["candidate"], "a=end-of-candidates");
+    }
+
+    #[test]
+    fn catalog_cache_promotes_a_hit_and_evicts_the_oldest_account() {
+        let mut cache = CatalogCache::default();
+        for account in ["a", "b", "c", "d"] {
+            cache.put(account, vec![Game { id: account.into(), name: account.into() }]);
+        }
+        assert_eq!(cache.get("a").unwrap()[0].name, "a");
+        cache.put("e", vec![]);
+        assert!(cache.get("b").is_none());
+        assert_eq!(cache.get("a").unwrap()[0].id, "a");
+        cache.put("a", vec![]);
+        assert_eq!(cache.0.len(), CACHED_ACCOUNTS);
+        assert!(cache.get("a").unwrap().is_empty());
+    }
+}
+
+fn safe_id(value: &Value) -> Option<String> {
+    let id = value.as_str().map(str::to_owned).or_else(|| value.as_u64().map(|n| n.to_string()))?;
+    (id.len() <= 128 && !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).then_some(id)
+}
+
+fn name(value: &Value) -> Option<String> {
+    let title = value.as_str()?.trim();
+    (!title.is_empty() && title.len() <= 300 && !title.chars().any(char::is_control)).then(|| title.to_owned())
+}
+
+pub fn catalog(account: &Xbox) -> Result<Vec<Game>> {
+    let (service, market) = connect(account)?;
+    let games = load_catalog(account, service, &market)?;
+    with_cache(|cache| { cache.put(&account.cloud_cache_key, games.clone()); Some(()) });
+    Ok(games)
+}
+
+pub fn connect(account: &Xbox) -> Result<(Streaming, String)> {
+    let (login, offering, routing) = login(account)?;
+    let market = login.get("market").and_then(Value::as_str)
+        .filter(|value| value.len() == 2 && value.bytes().all(|b| b.is_ascii_alphabetic()))
+        .ok_or("Xbox Cloud did not return a catalog market")?.to_owned();
+    let service = account.streaming(login, Some((market.clone(), routing)))?;
+    journal::record("cloud_login", json!({"success":true,"offering":offering,"routing":routing}));
+    Ok((service, market))
+}
+
+fn login(account: &Xbox) -> Result<(Value, &'static str, &'static str)> {
+    let stage = "Xbox Cloud login";
+    let mut last_error = String::new();
+    for (url, offering, routing) in LOGIN_ROUTES {
+        let request = headers(account.client.post(url)).header("X-GSSV-Routing", routing)
+            .json(&json!({"token":account.xsts,"offeringId":offering}));
+        match xbox::send(request, stage).and_then(|response| xbox::read(response, stage)) {
+            Ok(value) => return Ok((value, offering, routing)),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn load_catalog(account: &Xbox, service: Streaming, market: &str) -> Result<Vec<Game>> {
+    let mut games = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pages = HashSet::new();
+    let mut continuation = None::<String>;
+    let stage = "Xbox Cloud catalog";
+    let mut complete = false;
+    let mut offered = 0;
+    for _ in 0..32 {
+        let mut request = service.request(Method::GET, "/v2/titles")?.query(&[("mr", market)]);
+        if let Some(token) = &continuation { request = request.query(&[("ct", token)]); }
+        let reply = xbox::read(xbox::send(request, stage)?, stage)?;
+        let results = reply.get("results").and_then(Value::as_array).ok_or("Invalid Xbox Cloud catalog")?;
+        offered += results.len();
+        for row in results {
+            let details = &row["details"];
+            if details["hasEntitlement"].as_bool() != Some(true)
+                || details["remainingGameplayTimeInSeconds"].as_f64().is_some_and(|time| time <= 0.0) { continue; }
+            let Some(id) = safe_id(&row["titleId"]).or_else(|| safe_id(&details["titleId"])) else { continue; };
+            let product = safe_id(&details["productId"]).or_else(|| safe_id(&row["productId"]));
+            let title = [&details["name"], &details["title"], &row["name"], &row["title"]]
+                .into_iter().find_map(name);
+            if (title.is_some() || product.is_some()) && seen.insert(id.clone()) {
+                if games.len() >= CACHED_GAMES { return Err("Xbox Cloud catalog is too large".into()); }
+                games.push((id, title, product));
+            }
+        }
+        continuation = ["continuationToken", "continuation", "nextContinuationToken"].into_iter()
+            .find_map(|key| reply[key].as_str().or_else(|| reply[key]["token"].as_str()))
+            .filter(|value| !value.trim().is_empty()).map(str::to_owned);
+        let Some(token) = &continuation else { complete = true; break; };
+        if token.len() > 4096 || !pages.insert(token.clone()) { return Err("Invalid Xbox Cloud catalog pagination".into()); }
+    }
+    let metadata = product_names(account, market, games.iter().filter_map(|(_, title, product)| {
+        title.is_none().then_some(product.as_deref()).flatten()
+    }))?;
+    let mut games: Vec<_> = games.into_iter().filter_map(|(id, name, product)| {
+        let name = name.or_else(|| metadata.get(product.as_deref()?).cloned())?;
+        Some(Game { id, name })
+    }).collect();
+    games.sort_by_cached_key(|game| game.name.to_lowercase());
+    journal::record("cloud_catalog_loaded", json!({"offered":offered,"named_playable":games.len(),"complete":complete}));
+    if !complete { return Err("Xbox Cloud catalog exceeded its page limit".into()); }
+    Ok(games)
+}
+
+fn product_names<'a>(account: &Xbox, market: &str, ids: impl Iterator<Item = &'a str>) -> Result<HashMap<String, String>> {
+    let ids: Vec<_> = ids.collect();
+    let mut names = HashMap::new();
+    for batch in ids.chunks(40) {
+        let request = account.client.get("https://displaycatalog.mp.microsoft.com/v7.0/products")
+            .query(&[("bigIds", batch.join(",").as_str()), ("market", market), ("languages", "en-US")]);
+        let stage = "Xbox Cloud game names";
+        let reply = xbox::read(xbox::send(request, stage)?, stage)?;
+        let products = reply["Products"].as_array().ok_or("Invalid Xbox Cloud game names response")?;
+        for item in products {
+            if let (Some(id), Some(title)) = (safe_id(&item["ProductId"]),
+                    item["LocalizedProperties"].as_array().into_iter().flatten().find_map(|item| name(&item["ProductTitle"]))) {
+                names.insert(id, title);
+            }
+        }
+    }
+    Ok(names)
+}
+
+pub fn reserve(service: &Streaming, game: &Game, resolution: Resolution) -> Result<String> {
+    let (width, height) = resolution.dimensions();
+    let device = json!({
+        "appInfo":{"env":{"clientAppId":"www.xbox.com","clientAppType":"browser","clientAppVersion":APP_VERSION,
+                          "clientSdkVersion":SDK_VERSION,"httpEnvironment":"prod","sdkInstallId":""}},
+        "dev":{"hw":{"make":"Apple","model":"unknown","platformType":"desktop","sdkType":"web"},
+               "os":{"name":"macOS","ver":"10.15.7","platform":"desktop"},
+               "browser":{"browserName":"chrome","browserVersion":"148.0.0.0"},
+               "displayInfo":{"dimensions":{"widthInPixels":width,"heightInPixels":height},"pixelDensity":{"dpiX":1,"dpiY":1}}}
+    });
+    let client_session = uuid::Uuid::new_v4().simple().to_string();
+    let stage = "Start Xbox Cloud Gaming";
+    let request = service.request(Method::POST, "/v5/sessions/cloud/play")?
+        .header("X-MS-Device-Info", device.to_string())
+        .json(&json!({
+            "titleId":game.id,"serverId":"","systemUpdateGroup":"","clientSessionId":&client_session[..22],
+            "fallbackRegionNames":[],
+            "settings":{"nanoVersion":"V3;WebrtcTransport.dll","enableTextToSpeech":false,"highContrast":0,
+                        "locale":"en-US","useIceConnection":false,"timezoneOffsetMinutes":0,"sdkType":"web","osName":"macOS"}
+        }));
+    xbox::session_path(&xbox::read(xbox::send(request, stage)?, stage)?, "cloud", stage)
+}

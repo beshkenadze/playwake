@@ -1,0 +1,128 @@
+name: Linux Flatpak
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-flatpak-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build:
+    name: Build and test x86-64 Flatpak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      # Flatpak runs bubblewrap during packaging and the smoke test.
+      image: registry.fedoraproject.org/fedora:44@sha256:aca68c361f2a89de8a64e8d91a47494f37fad05f88c2f503cdd8a284a74c70ac
+      options: --privileged
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          # Fedora stores libXres's COPYING file in the RPM documentation.
+          dnf -y install --setopt=install_weak_deps=False --setopt=tsflags= \
+            git curl gcc gcc-c++ make pkgconf-pkg-config binutils python3 \
+            fontconfig-devel freetype-devel libxkbcommon-x11-devel libxcb-devel \
+            libX11-devel libXcursor-devel libXi-devel libXrandr-devel \
+            libXinerama-devel libXrender-devel libXfixes-devel libXext-devel \
+            wayland-devel openssl-devel vulkan-headers vulkan-loader-devel alsa-lib-devel \
+            flatpak libXres xprop ffmpeg-free
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check release tag
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Release tag must be v$version to match Cargo.toml."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::Tag a commit on main to publish a release."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: 1.100.0
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: fedora-44-linux-x86_64
+
+      - name: Test and build Playwake
+        run: |
+          cargo test --release --locked
+          cargo build --release --locked
+
+      - name: Install Flatpak SDK and runtime
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive flathub \
+            org.freedesktop.Sdk//26.08 org.freedesktop.Platform//26.08
+
+      - name: Package and smoke-test the Flatpak
+        run: |
+          mkdir -p dist
+          bundle=dist/Playwake-steamos-x86_64.flatpak
+          packaging/flatpak/build-bundle.sh target/release/playwake "$bundle"
+          flatpak install --user --noninteractive "$bundle"
+          flatpak run --command=sh io.github.beshkenadze.Playwake -ec '
+            ldd /app/libexec/playwake/playwake > /tmp/playwake-ldd.txt
+            cat /tmp/playwake-ldd.txt
+            if grep -q "not found" /tmp/playwake-ldd.txt; then exit 1; fi
+            python3 -c "import ctypes, evdev, gi; ctypes.CDLL(\"libXRes.so.1\")"
+            for element in webrtcbin nicesrc vulkansink opusdec; do
+              gst-inspect-1.0 "$element" >/dev/null
+            done
+          '
+          cd dist
+          sha256sum Playwake-steamos-x86_64.flatpak > SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: playwake-linux-x86_64
+          path: |
+            dist/Playwake-steamos-x86_64.flatpak
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: playwake-linux-x86_64
+          path: dist
+
+      - name: Verify release checksum
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            dist/Playwake-steamos-x86_64.flatpak
+            dist/SHA256SUMS

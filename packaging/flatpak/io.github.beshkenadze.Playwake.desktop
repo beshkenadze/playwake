@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Playwake
+Comment=Stream games from Xbox
+Exec=playwake
+Icon=io.github.beshkenadze.Playwake
+Terminal=false
+Type=Application
+Categories=Game;
