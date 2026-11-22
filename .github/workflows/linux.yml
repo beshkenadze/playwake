@@ -29,7 +29,8 @@ jobs:
     steps:
       - name: Install build dependencies
         run: |
-          dnf -y install --setopt=install_weak_deps=False \
+          # Fedora stores libXres's COPYING file in the RPM documentation.
+          dnf -y install --setopt=install_weak_deps=False --setopt=tsflags= \
             git curl gcc gcc-c++ make pkgconf-pkg-config binutils python3 \
             fontconfig-devel freetype-devel libxkbcommon-x11-devel libxcb-devel \
             libX11-devel libXcursor-devel libXi-devel libXrandr-devel \
