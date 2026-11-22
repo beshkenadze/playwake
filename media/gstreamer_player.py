@@ -609,12 +609,27 @@ class Player:
             self.stream_input.open_overlay()
         else:
             self.stream_input.close_overlay(guide)
-        if self.window and self.window.overlay:
-            overlay = self.window.overlay
-            overlay.menu = self.stream_input.overlay
-            if overlay.menu and not was_open:
-                overlay.selection = 0
-            self.sync_hud_timer(overlay)
+        overlay = self.window.overlay if self.window else None
+        if overlay and guide and was_open:
+            # Xbox provides the Guide inside the video. Keep Playwake's
+            # visuals hidden until its menu is explicitly opened again.
+            overlay.guide_handoff = True
+            emit('stream-overlay-handoff', active=True)
+        self.sync_overlay()
+        if overlay and guide and was_open:
+            overlay.update(self.window.size)
+
+    def sync_overlay(self):
+        overlay = self.window.overlay if self.window else None
+        if not overlay:
+            return
+        if self.stream_input.overlay and not overlay.menu:
+            overlay.selection = 0
+            if overlay.guide_handoff:
+                overlay.guide_handoff = False
+                emit('stream-overlay-handoff', active=False)
+        overlay.menu = self.stream_input.overlay
+        self.sync_hud_timer(overlay)
 
     def toggle_overlay(self):
         if self.stream_input.focused:
@@ -629,13 +644,14 @@ class Player:
         self.sync_hud_timer(overlay)
 
     def sync_hud_timer(self, overlay):
-        if (overlay.menu or overlay.diagnostics) and self.hud_timer is None:
+        wants_stats = not overlay.guide_handoff and (overlay.menu or overlay.diagnostics)
+        if wants_stats and self.hud_timer is None:
             self.hud_sample = None
             overlay.compact = '—'
             overlay.metrics = ()
             self.refresh_hud()
             self.hud_timer = GLib.timeout_add_seconds(1, self.refresh_hud)
-        elif not (overlay.menu or overlay.diagnostics) and self.hud_timer is not None:
+        elif not wants_stats and self.hud_timer is not None:
             GLib.source_remove(self.hud_timer)
             self.hud_timer = None
 
@@ -898,9 +914,7 @@ class Player:
                 self.override = None
         axes, buttons, left_trigger, right_trigger = self.stream_input.route(axes, buttons, left_trigger, right_trigger, polled)
         if self.window and self.window.overlay and self.window.overlay.menu != self.stream_input.overlay:
-            self.window.overlay.menu = self.stream_input.overlay
-            self.window.overlay.selection = 0
-            self.sync_hud_timer(self.window.overlay)
+            self.sync_overlay()
         if self.input_audit:
             sample = (buttons, any(axes), bool(left_trigger or right_trigger))
             if self.last_input_sample != sample:
@@ -1369,7 +1383,7 @@ class Player:
             loss = self.hud_loss if self.hud_loss is not None else '—'
             overlay.compact = (f'{self.height}p · {fps:.0f} FPS · {mbps:.1f} Mb/s · {ms(self.hud_rtt)}'
                                f' · {queue_drops + dropped} ' +
-                               ('проп.' if overlay.russian else 'drops'))
+                               ('кадр. отброш.' if overlay.russian else 'frame drops'))
             overlay.metrics = (
                 f'Video {self.width}×{self.height} · {fps:.1f} decoded FPS',
                 f'Viewport {size[0]}×{size[1]} · {self.decoder_name} · LSFG {"on" if self.lsfg else "off"}',

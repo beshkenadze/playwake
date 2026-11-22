@@ -226,6 +226,9 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         "multiplier": 2, "performance_mode": true, "flow_scale": 1.0,
                     })),
                     Some("vulkan-window-embedded") => journal::record("vulkan_window_embedded", json!({})),
+                    Some("stream-overlay-handoff") => journal::record("stream_overlay_handoff", json!({
+                        "active": event.get("active").and_then(Value::as_bool),
+                    })),
                     Some("stream-overlay-hint") => journal::record("stream_overlay_hint", json!({
                         "visible": event.get("visible").and_then(Value::as_bool),
                     })),
