@@ -333,6 +333,7 @@ impl RemotePlay {
                 true
             }
             Action::Bitrate => { self.prefs.bitrate_mbps = (self.prefs.bitrate_mbps as isize + 5 * direction).clamp(5,40) as u32; true }
+            Action::Upscale => { self.prefs.lanczos_upscale = !self.prefs.lanczos_upscale; true }
             Action::Lsfg => {
                 if !self.prefs.lsfg_enabled {
                     if let Err(error) = lsfg::Runtime::discover() {

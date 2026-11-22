@@ -70,6 +70,7 @@ pub enum Action {
     ConfirmSignOut,
     Resolution,
     Bitrate,
+    Upscale,
     Lsfg,
     LsfgPerformance,
     LsfgFlowScale,
@@ -352,10 +353,11 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 Some(Bitrate),
             ),
             Row::new(
-                t.t("Масштабирование", "Scaling"),
-                "",
-                t.t("Вписать", "Fit"),
-                None,
+                t.t("Апскейлинг", "Upscaling"),
+                t.t("Для видео меньше экрана · со следующего подключения",
+                    "For video smaller than the screen · applies on reconnect"),
+                if p.lanczos_upscale { "Lanczos" } else { t.t("Вписать", "Fit") },
+                Some(Upscale),
             ),
             Row::new(
                 t.t("Полноэкранный режим", "Fullscreen"),

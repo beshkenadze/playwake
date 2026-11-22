@@ -44,6 +44,62 @@ def gpu_vulkan_output():
             'video/x-raw(memory:VulkanImage),format=BGRA ! vulkansink')
 
 
+class LanczosUpscale:
+    pipeline = ('videoscale name=upscale method=lanczos n-threads=2 ! '
+                'capsfilter name=upscale_caps caps-change-mode=delayed ! ')
+
+    def __init__(self, branch, viewport):
+        self.viewport = viewport
+        self.source = None
+        self.requested = None
+        self.result = None
+        self.filter = branch.get_by_name('upscale_caps')
+        branch.get_by_name('upscale').get_static_pad('sink').add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM, self.source_caps)
+        self.filter.get_static_pad('src').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.output_caps)
+
+    @staticmethod
+    def fit(source, viewport):
+        width, height = source
+        scale = min(viewport[0] / width, viewport[1] / height)
+        if scale <= 1:
+            return source
+        return int(width * scale) & ~1, int(height * scale) & ~1
+
+    @staticmethod
+    def dimensions(event):
+        structure = event.parse_caps().get_structure(0)
+        return structure.get_value('width'), structure.get_value('height')
+
+    def source_caps(self, _, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.CAPS:
+            self.source = self.dimensions(event)
+            self.update()
+        return Gst.PadProbeReturn.OK
+
+    def update(self):
+        if not self.source:
+            return
+        size = self.fit(self.source, self.viewport())
+        if size != self.requested:
+            self.requested = size
+            self.filter.set_property('caps', Gst.Caps.from_string(
+                f'video/x-raw,width={size[0]},height={size[1]}'))
+
+    def output_caps(self, _, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.CAPS and self.source:
+            width, height = self.dimensions(event)
+            method = 'lanczos' if width > self.source[0] or height > self.source[1] else 'fit'
+            result = (*self.source, width, height, method)
+            if result != self.result:
+                self.result = result
+                emit('video-scaling', method=method, sourceWidth=self.source[0],
+                     sourceHeight=self.source[1], outputWidth=width, outputHeight=height)
+        return Gst.PadProbeReturn.OK
+
+
 def ntp_unix_ms(timestamp):
     seconds, fraction = struct.unpack('>II', timestamp)
     return (seconds - 2_208_988_800 + fraction / 2**32) * 1000
@@ -115,6 +171,7 @@ class X11VideoWindow:
             raise RuntimeError('Native playback requires an X11 display')
         self.parent = parent or self.x11.XDefaultRootWindow(self.display)
         self.on_close = on_close
+        self.on_resize = None
         self.on_key = on_key
         if self.on_key:
             self.x11.XSelectInput.argtypes = [ptr, xid, c.c_long]
@@ -253,6 +310,8 @@ class X11VideoWindow:
         # surface is sized by Gamescope.
         if size != self.size:
             self.size = size
+            if self.on_resize:
+                self.on_resize()
             self.x11.XMoveResizeWindow(self.display, self.xid, 0, 0, *size)
             self.x11.XFlush(self.display)
             emit('video-surface', width=size[0], height=size[1])
@@ -654,6 +713,8 @@ class Player:
         self.video_queue_out = 0
         self.vulkan_conversion = None
         self.lsfg = False
+        self.lanczos = None
+        self.upscale_requested = False
         self.preview_mode = None
         self.motion_in_parallel = False
         self.queue_times = {}
@@ -895,6 +956,7 @@ class Player:
         self.bitrate_limit = int(bitrate) if bitrate is not None else None
         options = options or {}
         self.cloud = options.get('cloud', False)
+        self.upscale_requested = options.get('lanczos_upscale', False)
         if options.get('stun'):
             self.rtc.set_property('stun-server', options['stun'])
         self.audio_volume = max(0, min(100, int(options.get('volume', 100)))) / 100
@@ -1167,6 +1229,7 @@ class Player:
             if not self.decoder_name:
                 emit('error', message='GStreamer H.264 decoder unavailable')
                 return
+            upscale = LanczosUpscale.pipeline if self.upscale_requested and self.window else ''
             if self.renderer == 'vulkan':
                 download = 'vapostproc ! video/x-raw,format=NV12 ! ' if self.decoder_name == 'vah264dec' else ''
                 queue = 'queue name=video_queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! '
@@ -1181,11 +1244,11 @@ class Player:
                     self.vulkan_conversion = 'cpu_bgra'
                     conversion = 'videoconvert ! video/x-raw,format=BGRA ! vulkanupload name=upload ! vulkansink'
                 tap = 'tee name=frame_tap ! ' if self.motion_in_parallel else ''
-                video_output = queue + download + tap + conversion
+                video_output = queue + download + tap + upscale + conversion
                 options = 'sync=false force-aspect-ratio=true'
             elif self.window_id:
                 download = 'vapostproc ! video/x-raw,format=NV12 ! ' if self.decoder_name == 'vah264dec' else ''
-                video_output = download + 'videoconvert ! video/x-raw,format=BGRx ! ximagesink'
+                video_output = download + upscale + 'videoconvert ! video/x-raw,format=BGRx ! ximagesink'
                 options = 'sync=false force-aspect-ratio=true'
             else:
                 video_output = 'videoconvert ! autovideosink'
@@ -1199,6 +1262,9 @@ class Player:
                 f'rtph264depay name=depay ! h264parse name=parser ! {self.decoder_name} name=decoder ! '
                 f'{video_output} name=video_sink {options}{motion_branch}', True)
             self.video_sink = branch.get_by_name('video_sink')
+            if upscale:
+                self.lanczos = LanczosUpscale(branch, lambda: self.window.size)
+                self.window.on_resize = self.lanczos.update
             if self.window_id:
                 GstVideo.VideoOverlay.set_window_handle(self.video_sink, self.window_id)
             branch.get_by_name('depay').get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.receive_rtp)
@@ -1636,12 +1702,19 @@ class Player:
             display_label = 'Экран' if overlay.russian else 'Display'
             present_rate = f'{present_fps:.0f} FPS' if present_fps is not None else '—'
             refresh = f'{display_hz} Hz' if display_hz else '—'
-            overlay.compact_rate = (f'{self.height}p · {decoded_label} {fps:.0f} FPS'
+            size_label = f'{self.height}p'
+            scaling_line = ()
+            if self.lanczos and self.lanczos.result:
+                sw, sh, ow, oh, method = self.lanczos.result
+                size_label = f'{sh}p → {oh}p' if method == 'lanczos' else f'{sh}p'
+                scaling_line = (f'{sw}×{sh} → {ow}×{oh} · {method.title()}',)
+            overlay.compact_rate = (f'{size_label} · {decoded_label} {fps:.0f} FPS'
                                     f' · {present_label} {present_rate} · {display_label} {refresh}')
             overlay.compact = (f'{mbps:.1f} Mb/s · RTT {ms(self.hud_rtt)} · {client_label} {ms(client_ms)}'
                                f' · {client_drops} {queue_drops + dropped}')
             overlay.metrics = (
                 f'Video {self.width}×{self.height} · {fps:.1f} decoded FPS',
+                *scaling_line,
                 f'{present_label} {present_rate} · {display_label} {refresh}',
                 f'Viewport {size[0]}×{size[1]} · {self.decoder_name} · LSFG {"on" if self.lsfg else "off"}',
                 (f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s'
