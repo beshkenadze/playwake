@@ -35,6 +35,11 @@ flatpak build --share=network --filesystem="$packaging:ro" "$build" \
 
 install -Dm755 "$binary" "$build/files/libexec/playwake/playwake"
 strip --strip-debug "$build/files/libexec/playwake/playwake"
+media_binary="$(dirname -- "$binary")/playwake-media"
+if [[ -x "$media_binary" ]]; then
+    install -Dm755 "$media_binary" "$build/files/libexec/playwake/playwake-media"
+    strip --strip-debug "$build/files/libexec/playwake/playwake-media"
+fi
 install -Dm755 "$source/launch-steamos.sh" "$build/files/libexec/playwake/launch-steamos.sh"
 install -Dm644 -t "$build/files/libexec/playwake" "$source/media/"{gstreamer_player,stream_overlay}.py
 install -Dm755 /usr/bin/xprop "$build/files/bin/xprop"

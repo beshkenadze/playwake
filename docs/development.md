@@ -138,3 +138,51 @@ parallel analyzer is timed separately. The probe can run with an external
 lsfg-vk layer. The base sink counts source buffers only. Count generated
 frames after lsfg-vk in the Vulkan layer chain. Vulkan submission and
 physical display scanout are different measurement points.
+
+## Native media worker
+
+The workspace also builds `playwake-media`, a native Rust worker on
+gstreamer-rs that speaks the same JSON-lines stdio protocol as the Python
+worker (including `--menu-input` and `--selftest`). The host prefers the
+sibling `playwake-media` binary and falls back to `gstreamer_player.py` for
+installs that predate the native bundle; `ALLY_MEDIA_WORKER` overrides both
+(a `.py` path selects the Python worker, anything else a native executable).
+
+Build and test it with:
+
+```sh
+cargo build --release --locked --workspace
+cargo test --locked --workspace
+```
+
+It needs the GStreamer and cairo development packages (see
+`packaging/build-deps.txt` and the CI setup action) and is Linux-only.
+`packaging/ab-compare.py` compares native and Python journals per resolution
+and gates latency parity (one-sided tolerance: the native worker may be
+faster, not slower).
+
+### Low-latency decode tuning
+
+`ALLY_DECODER` forces an H.264 decoder and `ALLY_DECODER_OPTS` passes element
+properties to it, filtered to properties the decoder actually has. The
+VA-API decoder pipelines about one frame (~17 ms at 60 fps) and GStreamer
+1.28 exposes no low-latency knob for it. On a low-jitter LAN link,
+single-threaded software decode is synchronous and cuts the client path
+from ~23 ms to ~3 ms; `launch-steamos.sh` ships this as the default and
+falls back to VA-API where gst-libav is missing:
+
+```sh
+ALLY_DECODER=avdec_h264 ALLY_DECODER_OPTS=max-threads=1
+```
+
+The Vulkan Video decoder (`ALLY_DECODER=vulkanh264dec` with
+`ALLY_VIDEO_RENDERER=vulkan`) decodes straight into VulkanImage memory with
+no upload/download round-trip, but libgstvulkan in GStreamer 1.28.5
+segfaults on RADV Phoenix, so it is not a usable default yet.
+`ALLY_JITTER_MS` sets the jitter-buffer target (default 20); in-order LAN
+streams pass through in under 1 ms regardless.
+
+On Xwayland the video window is an override-redirect root child placed at
+the GPUI window geometry: creating a depth-24 child inside the ARGB32 GPUI
+parent fails with BadMatch. In Game Mode the pointer belongs to Gamescope,
+so the stream menu opens with the View+Menu chord, not right-click.

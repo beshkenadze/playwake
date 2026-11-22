@@ -1,2 +1,4 @@
 /target/
+/dist/
 /media/__pycache__/
+/packaging/__pycache__/

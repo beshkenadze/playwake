@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-linux-rust
       - name: Run Rust tests
-        run: cargo test --release --locked
+        run: cargo test --release --locked --workspace
 
   build:
     name: Build x86-64 Flatpak
@@ -70,7 +70,7 @@ jobs:
       - uses: ./.github/actions/setup-linux-rust
 
       - name: Build Playwake
-        run: cargo build --release --locked
+        run: cargo build --release --locked --workspace
 
       - name: Install Flatpak packaging dependencies
         run: |
@@ -95,6 +95,9 @@ jobs:
             cat /tmp/playwake-ldd.txt
             if grep -q "not found" /tmp/playwake-ldd.txt; then exit 1; fi
             python3 -c "import ctypes, evdev, gi; ctypes.CDLL(\"libXRes.so.1\")"
+            ldd /app/libexec/playwake/playwake-media > /tmp/media-ldd.txt
+            if grep -q "not found" /tmp/media-ldd.txt; then exit 1; fi
+            /app/libexec/playwake/playwake-media --selftest
             for element in webrtcbin nicesrc vulkansink opusdec; do
               gst-inspect-1.0 "$element" >/dev/null
             done
