@@ -14,24 +14,20 @@ const TRANSFER_SCOPE: &str = "service::http://Passport.NET/purpose::PURPOSE_XBOX
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Resolution {
     P720,
-    P800,
-    P900,
     #[default]
     P1080,
     P1440,
 }
 
 impl Resolution {
-    pub const CHOICES: [(Self, &'static str); 5] = [
-        (Self::P720, "720p"), (Self::P800, "800p (test)"), (Self::P900, "900p (test)"),
+    pub const CHOICES: [(Self, &'static str); 3] = [
+        (Self::P720, "720p"),
         (Self::P1080, "1080p"), (Self::P1440, "1440p"),
     ];
 
     pub fn dimensions(self) -> (u32, u32) {
         match self {
             Self::P720 => (1280, 720),
-            Self::P800 => (1422, 800),
-            Self::P900 => (1600, 900),
             Self::P1080 => (1920, 1080),
             Self::P1440 => (2560, 1440),
         }

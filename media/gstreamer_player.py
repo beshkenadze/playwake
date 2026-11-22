@@ -296,13 +296,20 @@ class GamescopeInputFocus:
             raise OSError('Gamescope X11 display unavailable')
         self.root = self.x11.XDefaultRootWindow(self.display)
         self.atom = self.x11.XInternAtom(self.display, b'GAMESCOPE_FOCUSED_APP', 1)
+        self.refresh_atom = self.x11.XInternAtom(self.display, b'GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK', 1)
 
     def focused_app(self):
-        if not self.atom:
+        return self.cardinal(self.atom)
+
+    def display_hz(self):
+        return self.cardinal(self.refresh_atom)
+
+    def cardinal(self, atom):
+        if not atom:
             return None
         kind, count, remaining = c.c_ulong(), c.c_ulong(), c.c_ulong()
         fmt, data = c.c_int(), c.c_void_p()
-        status = self.x11.XGetWindowProperty(self.display, self.root, self.atom, 0, 1, 0, 6,
+        status = self.x11.XGetWindowProperty(self.display, self.root, atom, 0, 1, 0, 6,
             c.byref(kind), c.byref(fmt), c.byref(count), c.byref(remaining), c.byref(data))
         try:
             if status == 0 and kind.value == 6 and fmt.value == 32 and count.value == 1 and data:
@@ -315,6 +322,72 @@ class GamescopeInputFocus:
 
     def close(self):
         self.x11.XCloseDisplay(self.display)
+
+
+class PresentComplete(c.Structure):
+    _pack_ = 1
+    _fields_ = [('header', c.c_uint8 * 8), ('type', c.c_uint16),
+                ('kind', c.c_uint8), ('mode', c.c_uint8), ('ids', c.c_uint32 * 3),
+                ('timestamp_us', c.c_uint64)]
+
+
+class X11Presentation:
+    def __init__(self, window):
+        self.xcb = c.CDLL('libxcb.so.1')
+        self.present = c.CDLL('libxcb-present.so.0')
+        self.libc = c.CDLL(None)
+        ptr, u32 = c.c_void_p, c.c_uint32
+        for library, name, result, args in (
+            (self.xcb, 'xcb_connect', ptr, [c.c_char_p, ptr]),
+            (self.xcb, 'xcb_connection_has_error', c.c_int, [ptr]),
+            (self.xcb, 'xcb_disconnect', None, [ptr]),
+            (self.xcb, 'xcb_generate_id', u32, [ptr]),
+            (self.xcb, 'xcb_register_for_special_xge', ptr, [ptr, ptr, u32, ptr]),
+            (self.xcb, 'xcb_poll_for_special_event', ptr, [ptr, ptr]),
+            (self.xcb, 'xcb_request_check', ptr, [ptr, u32]),
+            (self.present, 'xcb_present_select_input_checked', u32, [ptr, u32, u32, u32]),
+            (self.libc, 'free', None, [ptr]),
+        ):
+            function = getattr(library, name)
+            function.restype, function.argtypes = result, args
+        self.connection = self.xcb.xcb_connect(None, None)
+        try:
+            if self.xcb.xcb_connection_has_error(self.connection):
+                raise OSError('X11 Present display unavailable')
+            event_id = self.xcb.xcb_generate_id(self.connection)
+            extension = c.addressof(c.c_char.in_dll(self.present, 'xcb_present_id'))
+            self.stamp = u32()
+            self.events = self.xcb.xcb_register_for_special_xge(self.connection, extension, event_id, c.byref(self.stamp))
+            if not self.events:
+                raise OSError('X11 Present events unavailable')
+            # CompleteNotify mask, pixmap events only in sample().
+            cookie = self.present.xcb_present_select_input_checked(self.connection, event_id, window, 2)
+            error = self.xcb.xcb_request_check(self.connection, cookie)
+            if error:
+                self.libc.free(error)
+                raise OSError('X11 Present selection failed')
+        except OSError:
+            self.close()
+            raise
+        self.last_us = None
+
+    def sample(self):
+        previous, count = self.last_us, 0
+        while event := self.xcb.xcb_poll_for_special_event(self.connection, self.events):
+            sample = PresentComplete.from_address(event)
+            # CompleteNotify=1, Pixmap=0, Skip=2.
+            if sample.type == 1 and sample.kind == 0 and sample.mode != 2:
+                self.last_us = sample.timestamp_us
+                count += 1
+            self.libc.free(event)
+        if not count:
+            self.last_us = None
+        elif previous is not None and self.last_us > previous:
+            return count * 1_000_000 / (self.last_us - previous)
+        return None
+
+    def close(self):
+        self.xcb.xcb_disconnect(self.connection)
 
 
 def find_gamepad():
@@ -574,6 +647,8 @@ class Player:
         self.hud_timer = None
         self.hud_sample = None
         self.hud_video_latency = deque(maxlen=60)
+        self.presentation = None
+        self.presentation_attempted = False
         self.audio_volume = 1.0
         self.transport_pending = False
         self.hud_rtt = None
@@ -654,6 +729,10 @@ class Player:
         elif not wants_stats and self.hud_timer is not None:
             GLib.source_remove(self.hud_timer)
             self.hud_timer = None
+            if self.presentation:
+                self.presentation.close()
+                self.presentation = None
+                self.presentation_attempted = False
 
     def handle(self, command):
         try:
@@ -1436,6 +1515,14 @@ class Player:
     def refresh_hud(self):
         overlay = self.window.overlay
         now = milliseconds()
+        if self.renderer == 'vulkan' and self.window.xid and not self.presentation_attempted:
+            self.presentation_attempted = True
+            try:
+                self.presentation = X11Presentation(self.window.xid)
+            except (OSError, AttributeError, ValueError):
+                pass
+        present_fps = self.presentation.sample() if self.presentation else None
+        display_hz = self.gamescope_focus.display_hz() if self.gamescope_focus else None
         sample = (now, self.decoded_frames, self.encoded_bytes)
         if self.hud_sample and self.width and self.height:
             previous_time, previous_frames, previous_bytes = self.hud_sample
@@ -1456,11 +1543,18 @@ class Player:
             client_ms = statistics.median(recent_latency) if recent_latency else None
             client_label = 'Видео' if overlay.russian else 'Video'
             client_drops = 'Пропуски' if overlay.russian else 'Drops'
-            overlay.compact = (f'{self.height}p · {fps:.0f} FPS · {mbps:.1f} Mb/s'
-                               f' · RTT {ms(self.hud_rtt)} · {client_label} {ms(client_ms)}'
+            decoded_label = 'Декодер' if overlay.russian else 'Decode'
+            present_label = 'Вывод' if overlay.russian else 'Present'
+            display_label = 'Экран' if overlay.russian else 'Display'
+            present_rate = f'{present_fps:.0f} FPS' if present_fps is not None else '—'
+            refresh = f'{display_hz} Hz' if display_hz else '—'
+            overlay.compact_rate = (f'{self.height}p · {decoded_label} {fps:.0f} FPS'
+                                    f' · {present_label} {present_rate} · {display_label} {refresh}')
+            overlay.compact = (f'{mbps:.1f} Mb/s · RTT {ms(self.hud_rtt)} · {client_label} {ms(client_ms)}'
                                f' · {client_drops} {queue_drops + dropped}')
             overlay.metrics = (
                 f'Video {self.width}×{self.height} · {fps:.1f} decoded FPS',
+                f'{present_label} {present_rate} · {display_label} {refresh}',
                 f'Viewport {size[0]}×{size[1]} · {self.decoder_name} · LSFG {"on" if self.lsfg else "off"}',
                 (f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s'
                  if self.bitrate_limit is not None else f'Video {mbps:.1f} Mb/s'),
@@ -1471,6 +1565,7 @@ class Player:
             )
             emit('hud-stats', width=self.width, height=self.height, viewportWidth=size[0], viewportHeight=size[1],
                  decodedFps=round(fps, 2), videoMbps=round(mbps, 2), limitKbps=self.bitrate_limit,
+                 presentFps=round(present_fps, 2) if present_fps is not None else None, displayHz=display_hz,
                  rttMs=self.hud_rtt, jitterMs=self.hud_jitter, rtpLost=self.hud_loss,
                  videoClientMs=round(client_ms, 2) if client_ms is not None else None,
                  queueDepth=depth, queueDrops=queue_drops, sinkDrops=dropped)
@@ -1553,6 +1648,8 @@ class Player:
         finally:
             if self.hud_timer is not None:
                 GLib.source_remove(self.hud_timer)
+            if self.presentation:
+                self.presentation.close()
             if self.window:
                 self.window.vulkan_surface_ready.set()
             self.pipeline.set_state(Gst.State.NULL)

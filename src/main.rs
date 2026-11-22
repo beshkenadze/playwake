@@ -537,7 +537,7 @@ fn run_probe(run: media::Run) {
 }
 
 fn probe(run: media::Run) -> xbox::Result<()> {
-    use xbox::Resolution::{P720, P800, P900, P1080};
+    use xbox::Resolution::{P720, P1080, P1440};
 
     let xbox = Arc::new(xbox::restore_sign_in()?.ok_or("Sign in through the app first")?);
     let consoles = xbox.consoles()?;
@@ -547,7 +547,7 @@ fn probe(run: media::Run) -> xbox::Result<()> {
     let resolutions: &[_] = match run {
         media::Run::Latency => &[P720, P1080],
         media::Run::Transport | media::Run::Vulkan => &[P1080],
-        _ => &[P720, P800, P900],
+        _ => &[P720, P1080, P1440],
     };
     for resolution in resolutions {
         let result = media::play(xbox.clone(), media::Target::Home(console.clone()), *resolution, None,
