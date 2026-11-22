@@ -1,3 +1,4 @@
+mod deck;
 mod input;
 mod journal;
 mod lsfg;
@@ -5,7 +6,8 @@ mod media;
 mod session_store;
 mod xbox;
 
-use gpui_kit::component::{button::{Button, ButtonVariants}, label::Label, switch::Switch};
+use deck::{Action, Key, Menu};
+use session_store::{Language, Preferences};
 use gpui_kit::*;
 use qrcode::{Color, QrCode};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -18,6 +20,8 @@ enum Event {
     SignInEnded(xbox::Result<()>),
     Stream(media::StreamEvent),
     StreamEnded(xbox::Result<()>),
+    Menu(Key),
+    Consoles(Arc<xbox::Xbox>, xbox::Result<Vec<xbox::Console>>),
 }
 
 struct DevicePrompt {
@@ -27,8 +31,7 @@ struct DevicePrompt {
     qr: Option<Arc<QrCode>>,
 }
 
-fn login_qr(qr: Arc<QrCode>) -> impl IntoElement {
-    let module = px(7.);
+fn login_qr(qr: Arc<QrCode>, module: Pixels) -> impl IntoElement {
     let quiet_zone = 4;
     let side = module * (qr.width() + quiet_zone * 2) as f32;
     canvas(|_, _, _| (), move |bounds, (), window, _| {
@@ -55,8 +58,14 @@ struct RemotePlay {
     overlay_open: bool,
     overlay_index: usize,
     restore_windowed: bool,
-    resolution: xbox::Resolution,
-    lsfg_enabled: bool,
+    prefs: Preferences,
+    menu: Menu,
+    menu_player: Option<media::Player>,
+    keyboard_focus: FocusHandle,
+    active_console: Option<xbox::Console>,
+    reconnect: bool,
+    video_ready: bool,
+    refreshing: bool,
     device: Option<DevicePrompt>,
     status: String,
 }
@@ -113,14 +122,19 @@ impl RemotePlay {
         if self.stream.is_some() || self.sign_in.is_some() { return; }
         let Some(account) = self.account.clone() else { return; };
         let native_window = x11_window(window);
+        self.active_console = Some(console.clone());
+        self.video_ready = false;
+        self.menu.settings = false;
         self.restore_windowed = native_window.is_some() && !window.is_fullscreen();
         if self.restore_windowed { window.toggle_fullscreen(); }
         let cancel = Arc::new(AtomicBool::new(false));
         self.stream = Some(cancel.clone());
         self.status = "Connecting to Xbox…".into();
         let tx = self.tx.clone();
-        let resolution = self.resolution;
-        let run = media::Run::Interactive { lsfg: self.lsfg_enabled };
+        let resolution = self.resolution();
+        let mut prefs = self.prefs;
+        if native_window.is_none() { prefs.lsfg_enabled = false; }
+        let run = media::Run::Interactive(prefs);
         let (controls, rx) = mpsc::channel();
         self.stream_commands = Some(controls);
         thread::spawn(move || {
@@ -144,21 +158,206 @@ impl RemotePlay {
             0 => self.control_stream(media::StreamCommand::CloseOverlay),
             1 => self.control_stream(media::StreamCommand::XboxGuide),
             2 => self.control_stream(media::StreamCommand::ToggleDiagnostics),
-            3 => self.stop_stream(),
+            3 => { self.reconnect = true; self.stop_stream(); }
+            4 => self.stop_stream(),
             _ => {}
         }
     }
 
     fn show_account(&mut self, xbox: Arc<xbox::Xbox>, consoles: Vec<xbox::Console>) {
         journal::record("xbox_discovery_completed", json!({"console_count": consoles.len()}));
-        self.status = if consoles.is_empty() { "No Xbox available for Remote Play".into() } else { "Choose an Xbox".into() };
+        self.status = String::new();
         self.account = Some(xbox);
         self.consoles = consoles;
     }
 
-    fn receive(&mut self, event: Event, window: &mut Window) {
+    fn resolution(&self) -> xbox::Resolution {
+        xbox::Resolution::CHOICES.into_iter().map(|(choice, _)| choice)
+            .find(|choice| choice.dimensions().1 == self.prefs.height).unwrap_or_default()
+    }
+
+    fn save(&mut self) {
+        if session_store::save_preferences(self.prefs).is_err() {
+            self.status = deck::Text(self.prefs.russian()).t("Не удалось сохранить настройки", "Could not save settings").into();
+        }
+    }
+
+    fn refresh_consoles(&mut self) {
+        if self.refreshing { return; }
+        let Some(account) = self.account.clone() else { return; };
+        self.refreshing = true;
+        self.status = deck::Text(self.prefs.russian()).t("Обновление консолей…", "Refreshing consoles…").into();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let consoles = account.consoles();
+            let _ = tx.send(Event::Consoles(account, consoles));
+        });
+    }
+
+    fn auto_connect(&mut self, window: &mut Window) {
+        if self.prefs.auto_connect && self.consoles.len() == 1 {
+            let console = self.consoles[0].clone();
+            if ["on", "standby", "connectedstandby"].iter().any(|power| console.power.eq_ignore_ascii_case(power)) {
+                self.start_stream(console, window);
+            }
+        }
+    }
+
+    fn activate(&mut self, action: Action, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        journal::record("deck_action", json!({"action": format!("{action:?}")}));
+        let t = deck::Text(self.prefs.russian());
+        let save = match action {
+            Action::Settings | Action::Home => {
+                self.menu.settings = action == Action::Settings;
+                self.menu.row = None;
+                false
+            }
+            Action::Play(index) => {
+                if let Some(console) = self.consoles.get(index).cloned() {
+                    self.menu.console = index;
+                    self.start_stream(console, window);
+                }
+                false
+            }
+            Action::SignIn => { self.menu.settings = false; self.start_login(); false }
+            Action::Browser => {
+                if let Some(device) = &self.device { cx.open_url(&device.url); }
+                false
+            }
+            Action::Cancel => {
+                if self.menu.confirming_sign_out { self.menu.confirming_sign_out = false; }
+                else if let Some(cancel) = &self.sign_in { cancel.store(true, Ordering::Relaxed); }
+                else if self.stream.is_some() { self.stop_stream(); }
+                false
+            }
+            Action::Section(index) => {
+                self.menu.section = index;
+                self.menu.row = None;
+                false
+            }
+            Action::Refresh => { self.refresh_consoles(); false }
+            Action::SignOut => {
+                self.menu.confirming_sign_out = true;
+                self.menu.browser_cancel = false;
+                false
+            }
+            Action::ConfirmSignOut => {
+                if session_store::clear().is_ok() {
+                    self.account = None;
+                    self.consoles.clear();
+                    self.refreshing = false;
+                    self.menu = Menu::default();
+                    self.status.clear();
+                    journal::record("signed_out", json!({}));
+                } else { self.status = t.t("Не удалось выйти", "Could not sign out").into(); }
+                false
+            }
+            Action::Resolution => {
+                let choices = xbox::Resolution::CHOICES;
+                let current = choices.iter().position(|(r, _)| *r == self.resolution()).unwrap_or(0);
+                self.prefs.height = choices[(current as isize + direction).rem_euclid(choices.len() as isize) as usize].0.dimensions().1;
+                journal::record("resolution_selected", json!({"height": self.prefs.height}));
+                true
+            }
+            Action::Bitrate => { self.prefs.bitrate_mbps = (self.prefs.bitrate_mbps as isize + 5 * direction).clamp(5,40) as u32; true }
+            Action::Lsfg => {
+                if !self.prefs.lsfg_enabled {
+                    if let Err(error) = lsfg::Runtime::discover() {
+                        self.status = error;
+                        return;
+                    }
+                }
+                self.prefs.lsfg_enabled = !self.prefs.lsfg_enabled;
+                self.status.clear();
+                true
+            }
+            Action::Volume => { self.prefs.volume = (self.prefs.volume as isize + 10 * direction).clamp(0,100) as u32; true }
+            Action::Mute => { self.prefs.mute = !self.prefs.mute; true }
+            Action::Compact => { self.prefs.compact_stats = !self.prefs.compact_stats; true }
+            Action::AutoConnect => { self.prefs.auto_connect = !self.prefs.auto_connect; true }
+            Action::Palette => { self.prefs.xbox_palette = !self.prefs.xbox_palette; true }
+            Action::Language => {
+                let choices = [Language::System, Language::English, Language::Russian];
+                self.prefs.language = choices[(self.prefs.language as isize + direction).rem_euclid(3) as usize];
+                true
+            }
+        };
+        if save { self.save(); }
+    }
+
+    fn menu_key(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
+        if self.stream.is_some() {
+            if !self.video_ready && key == Key::Back { self.stop_stream(); }
+            return;
+        }
+        let nav = match key { Key::Up | Key::Left => -1, Key::Down | Key::Right => 1, _ => 0 };
+        let step = |index: usize, count: usize| -> usize {
+            if count == 0 { 0 } else { (index as isize + nav).rem_euclid(count as isize) as usize }
+        };
+        if self.menu.confirming_sign_out || self.device.is_some() || self.sign_in.is_some() {
+            match key {
+                Key::Back => self.activate(Action::Cancel, 1, window, cx),
+                Key::Accept => {
+                    let order = deck::order(self);
+                    self.activate(order[usize::from(self.menu.browser_cancel).min(order.len() - 1)], 1, window, cx);
+                }
+                _ if nav != 0 => self.menu.browser_cancel = !self.menu.browser_cancel,
+                _ => {}
+            }
+        } else if key == Key::Settings {
+            self.activate(if self.menu.settings { Action::Home } else { Action::Settings }, 1, window, cx);
+        } else if key == Key::Refresh {
+            self.refresh_consoles();
+        } else if self.menu.settings {
+            let actions = deck::setting_actions(self);
+            if let Some(row) = self.menu.row.filter(|row| *row < actions.len()) {
+                match key {
+                    Key::Back => self.menu.row = None,
+                    Key::Up | Key::Down => self.menu.row = Some(step(row, actions.len())),
+                    Key::Accept => self.activate(actions[row], 1, window, cx),
+                    Key::Left | Key::Right => if matches!(actions[row], Action::Resolution | Action::Bitrate | Action::Volume | Action::Language | Action::Palette) {
+                        self.activate(actions[row], nav, window, cx);
+                    },
+                    _ => {}
+                }
+            } else {
+                match key {
+                    Key::Back | Key::Left => self.activate(Action::Home, 1, window, cx),
+                    Key::Up | Key::Down => self.menu.section = step(self.menu.section, deck::section_labels(&deck::Text(false)).len()),
+                    Key::Right | Key::Accept if !actions.is_empty() => self.menu.row = Some(0),
+                    _ => {}
+                }
+            }
+        } else if key == Key::Accept {
+            let order = deck::order(self);
+            self.activate(order[self.menu.console.min(order.len() - 1)], 1, window, cx);
+        } else if nav != 0 {
+            self.menu.console = step(self.menu.console, self.consoles.len());
+        }
+    }
+
+    fn receive(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
+            Event::Menu(key) => {
+                let managed = std::env::var_os("ALLY_GAMESCOPE_CONTROL_DISPLAY").is_some();
+                if managed || window.is_window_active() { self.menu_key(key, window, cx); }
+            }
+            Event::Consoles(account, result) => {
+                if self.account.as_ref().is_some_and(|current| Arc::ptr_eq(current, &account)) {
+                    self.refreshing = false;
+                    match result {
+                        Ok(consoles) => {
+                            self.consoles = consoles;
+                            self.menu.console = self.menu.console.min(self.consoles.len().saturating_sub(1));
+                            self.status.clear();
+                            journal::record("consoles_refreshed", json!({"count": self.consoles.len()}));
+                        }
+                        Err(error) => self.status = error,
+                    }
+                }
+            }
             Event::Device(prompt) => {
+                self.menu.browser_cancel = false;
                 self.status = "Waiting for Microsoft confirmation".into();
                 self.device = Some(prompt);
             }
@@ -167,24 +366,29 @@ impl RemotePlay {
                 journal::record("sign_in_ended", json!({"success": result.is_ok()}));
                 self.sign_in = None;
                 self.device = None;
-                if let Err(error) = result { self.status = error; }
+                match result { Ok(()) => self.auto_connect(window), Err(error) => self.status = error }
             }
+            Event::Stream(media::StreamEvent::VideoReady) => self.video_ready = true,
             Event::Stream(media::StreamEvent::Status(status)) => self.status = status,
             Event::Stream(media::StreamEvent::Overlay(open)) => {
                 self.overlay_open = open;
                 self.overlay_index = 0;
             }
             Event::Stream(media::StreamEvent::OverlayKey(key)) if self.overlay_open => {
-                let count = if x11_window(window).is_some() { 4 } else { 3 };
+                let native = x11_window(window).is_some();
+                let count = if native { 5 } else { 4 };
                 match key {
                     media::OverlayKey::Left => self.overlay_index = (self.overlay_index + count - 1) % count,
                     media::OverlayKey::Right => self.overlay_index = (self.overlay_index + 1) % count,
                     media::OverlayKey::Activate => self.use_overlay_action(
-                        if count == 3 && self.overlay_index == 2 { 3 } else { self.overlay_index }),
+                        if !native && self.overlay_index >= 2 { self.overlay_index + 1 } else { self.overlay_index }),
                     media::OverlayKey::Back => self.control_stream(media::StreamCommand::CloseOverlay),
                     media::OverlayKey::Select(index) => self.use_overlay_action(index),
                 }
-                self.control_stream(media::StreamCommand::OverlaySelection(self.overlay_index));
+                if matches!(key, media::OverlayKey::Left | media::OverlayKey::Right) {
+                    journal::record("stream_overlay_focus", json!({"index":self.overlay_index}));
+                    self.control_stream(media::StreamCommand::OverlaySelection(self.overlay_index));
+                }
             }
             Event::Stream(media::StreamEvent::OverlayKey(_)) => {}
             Event::StreamEnded(result) => {
@@ -192,6 +396,16 @@ impl RemotePlay {
                 self.stream = None;
                 self.stream_commands = None;
                 self.overlay_open = false;
+                self.video_ready = false;
+                if std::mem::take(&mut self.reconnect) {
+                    if let Some(console) = self.active_console.take() {
+                        let was_windowed = self.restore_windowed;
+                        self.start_stream(console, window);
+                        self.restore_windowed = was_windowed;
+                        return;
+                    }
+                }
+                self.active_console = None;
                 if std::mem::take(&mut self.restore_windowed) && window.is_fullscreen() {
                     window.toggle_fullscreen();
                 }
@@ -203,111 +417,7 @@ impl RemotePlay {
 
 impl Render for RemotePlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let native_video = self.stream.is_some() && x11_window(window).is_some();
-        let sign_button = Button::new("sign-in").primary().label("Sign in with Microsoft")
-            .on_click(cx.listener(|view, _, _, cx| { view.start_login(); cx.notify(); }));
-        let mut header = div().h(px(58.)).px_4().flex().items_center().justify_between()
-            .child(Label::new(self.status.clone()));
-        if native_video {
-            header = header.justify_center();
-        }
-        else if self.stream.is_some() && self.overlay_open {
-            let mut actions = div().flex().gap_2();
-            for (index, label) in ["Resume", "Xbox Guide", "Stop stream"].into_iter().enumerate() {
-                let mut button = Button::new(("overlay-action", index)).label(label);
-                if index == self.overlay_index { button = button.primary(); }
-                actions = actions.child(button.on_click(cx.listener(move |view, _, _, cx| {
-                    view.use_overlay_action(if index == 2 { 3 } else { index });
-                    cx.notify();
-                })));
-            }
-            header = header.child(actions);
-        }
-        else if self.stream.is_some() {
-            header = header.child(Button::new("open-stream-overlay").label("Stream menu")
-                .on_click(cx.listener(|view, _, _, _| view.control_stream(media::StreamCommand::OpenOverlay))));
-        }
-        else if self.account.is_some() {
-            header = header.child(Button::new("sign-out").label("Sign out")
-                .on_click(cx.listener(|view, _, _, cx| {
-                    if session_store::clear().is_ok() {
-                        view.account = None;
-                        view.consoles.clear();
-                        view.status = "Signed out".into();
-                        journal::record("signed_out", json!({}));
-                    } else {
-                        view.status = "Could not remove saved sign-in".into();
-                    }
-                    cx.notify();
-                })));
-        } else if self.sign_in.is_none() { header = header.child(sign_button); }
-        let mut content = div().flex_1().p_4().flex().flex_col().gap_3().bg(rgb(0x13161a)).text_color(rgb(0xf5f5f5));
-        if let Some(prompt) = &self.device {
-            let url = prompt.url.clone();
-            if let Some(qr) = &prompt.qr {
-                let instructions = if prompt.prefilled { "Scan with your phone or tablet to confirm sign-in." }
-                    else { "Scan with your phone or tablet, then enter the code below." };
-                content = content.child(div().child(instructions)).child(login_qr(qr.clone()));
-            }
-            content = content
-                .child(div().text_xl().child(format!("Code: {}", prompt.code)))
-                .child(Button::new("open-microsoft").primary().label("Open Microsoft")
-                    .on_click(move |_, _, cx| cx.open_url(&url)))
-                .child(Button::new("cancel-login").label("Cancel")
-                    .on_click(cx.listener(|view, _, _, _| { if let Some(cancel) = &view.sign_in { cancel.store(true, Ordering::Relaxed); } })));
-        }
-        if self.stream.is_none() {
-            if cfg!(target_os = "linux") && x11_window(window).is_some() {
-                content = content.child(Switch::new("lsfg")
-                    .label("LSFG 2× Performance · Flow Scale 1.0")
-                    .checked(self.lsfg_enabled)
-                    .on_change(cx.listener(|view, enabled: &bool, _, cx| {
-                        if *enabled {
-                            if let Err(error) = lsfg::Runtime::discover() {
-                                view.status = error;
-                                cx.notify();
-                                return;
-                            }
-                        }
-                        view.lsfg_enabled = *enabled;
-                        if let Err(error) = session_store::save_lsfg(*enabled) {
-                            view.status = "Could not save the LSFG setting".into();
-                            journal::record("lsfg_setting_save_failed", json!({"kind": format!("{:?}", error.kind())}));
-                        }
-                        journal::record("lsfg_setting_changed", json!({"enabled": enabled}));
-                        cx.notify();
-                    })));
-            }
-            if !self.consoles.is_empty() {
-                let mut choices = div().flex().items_center().gap_2().child("Requested resolution");
-                for (index, (resolution, label)) in xbox::Resolution::CHOICES.into_iter().enumerate() {
-                    let mut button = Button::new(("resolution", index)).label(label);
-                    if self.resolution == resolution { button = button.primary(); }
-                    choices = choices.child(button.on_click(cx.listener(move |view, _, _, cx| {
-                        view.resolution = resolution;
-                        let (width, height) = resolution.dimensions();
-                        journal::record("resolution_selected", json!({"width": width, "height": height}));
-                        cx.notify();
-                    })));
-                }
-                content = content.child(choices);
-            }
-            for (index, console) in self.consoles.iter().enumerate() {
-                let name = if console.name.is_empty() { console.model.clone() } else { console.name.clone() };
-                let label = format!("{name} · {} · {}", console.power, console.id);
-                let selected = console.clone();
-                content = content.child(Button::new(("console", index)).label(label)
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.start_stream(selected.clone(), window);
-                        cx.notify();
-                    })));
-            }
-        }
-        if native_video {
-            div().size_full().bg(rgb(0x000000)).flex().items_center().justify_center().child(header)
-        } else {
-            div().size_full().flex().flex_col().child(header).child(content)
-        }
+        deck::render(self, window, cx)
     }
 }
 
@@ -325,7 +435,7 @@ fn main() {
         let consoles = xbox.consoles()?;
         Ok((Arc::new(xbox), consoles))
     }).transpose());
-    application().with_assets(assets::Assets).run(move |cx| {
+    application().with_assets(deck::Branding).run(move |cx| {
         init(cx);
         let bounds = Bounds::centered(None, size(px(1120.), px(690.)), cx);
         open_window(WindowOptions {
@@ -341,16 +451,22 @@ fn main() {
                 cx.spawn_in(window, async move |view, cx| loop {
                     cx.background_executor().timer(Duration::from_millis(40)).await;
                     while let Ok(event) = rx.try_recv() {
-                        if view.update_in(cx, |view: &mut RemotePlay, window, cx| { view.receive(event, window); cx.notify(); }).is_err() { return; }
+                        if view.update_in(cx, |view: &mut RemotePlay, window, cx| { view.receive(event, window, cx); cx.notify(); }).is_err() { return; }
                     }
                 }).detach();
                 let mut view = RemotePlay { tx, account: None, consoles: Vec::new(), sign_in: None,
                     stream: None, stream_commands: None, overlay_open: false, overlay_index: 0, restore_windowed: false,
-                    resolution: xbox::Resolution::default(), device: None,
-                    lsfg_enabled: session_store::load_lsfg(),
-                    status: if media::runtime_available() { "Playwake".into() } else { "GStreamer worker missing".into() } };
+                    prefs: session_store::load_preferences(), device: None, menu: Menu::default(),
+                    menu_player: None, keyboard_focus: cx.focus_handle(), active_console: None,
+                    reconnect: false, video_ready: false, refreshing: false,
+                    status: if media::runtime_available() { String::new() } else { "GStreamer worker missing".into() } };
+                window.focus(&view.keyboard_focus, cx);
+                if cfg!(target_os = "linux") {
+                    let input_events = view.tx.clone();
+                    view.menu_player = media::menu_input(move |key| { let _ = input_events.send(Event::Menu(key)); }).ok();
+                }
                 match saved_account {
-                    Ok(Some((xbox, consoles))) => view.show_account(xbox, consoles),
+                    Ok(Some((xbox, consoles))) => { view.show_account(xbox, consoles); view.auto_connect(window); }
                     Ok(None) => {}
                     Err(error) => {
                         journal::record("session_restore_failed", json!({}));

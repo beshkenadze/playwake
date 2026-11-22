@@ -48,20 +48,60 @@ pub fn save(client_id: &str, refresh_token: &str) -> io::Result<()> {
     write_json(path()?, &Session { client_id: client_id.into(), refresh_token: refresh_token.into() })
 }
 
-#[derive(Default, Deserialize, Serialize)]
-struct Preferences {
-    #[serde(default)]
-    lsfg_enabled: bool,
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Language {
+    #[default]
+    System,
+    English,
+    Russian,
 }
 
-pub fn load_lsfg() -> bool {
-    path().ok().and_then(|path| fs::File::open(path.with_extension("preferences.json")).ok())
-        .and_then(|file| serde_json::from_reader::<_, Preferences>(file).ok())
-        .unwrap_or_default().lsfg_enabled
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Preferences {
+    pub lsfg_enabled: bool,
+    pub height: u32,
+    pub bitrate_mbps: u32,
+    pub compact_stats: bool,
+    pub auto_connect: bool,
+    pub xbox_palette: bool,
+    pub language: Language,
+    pub volume: u32,
+    pub mute: bool,
 }
 
-pub fn save_lsfg(lsfg_enabled: bool) -> io::Result<()> {
-    write_json(path()?.with_extension("preferences.json"), &Preferences { lsfg_enabled })
+impl Default for Preferences {
+    fn default() -> Self {
+        Self { lsfg_enabled: false, height: 1080, bitrate_mbps: 20, compact_stats: false,
+            auto_connect: false, xbox_palette: false, language: Language::System, volume: 100, mute: false }
+    }
+}
+
+impl Preferences {
+    pub fn russian(self) -> bool {
+        match self.language {
+            Language::Russian => true,
+            Language::English => false,
+            Language::System => ["LC_ALL", "LC_MESSAGES", "LANG"].iter()
+                .find_map(|var| env::var(var).ok().filter(|value| !value.is_empty()))
+                .is_some_and(|value| value.starts_with("ru")),
+        }
+    }
+}
+
+pub fn load_preferences() -> Preferences {
+    let mut prefs: Preferences = path().ok()
+        .and_then(|path| fs::File::open(path.with_extension("preferences.json")).ok())
+        .and_then(|file| serde_json::from_reader(file).ok())
+        .unwrap_or_default();
+    prefs.bitrate_mbps = prefs.bitrate_mbps.clamp(5, 40);
+    prefs.volume = prefs.volume.min(100);
+    prefs
+}
+
+pub fn save_preferences(prefs: Preferences) -> io::Result<()> {
+    write_json(path()?.with_extension("preferences.json"), &prefs)
 }
 
 fn write_json(path: PathBuf, data: &impl Serialize) -> io::Result<()> {
@@ -82,5 +122,21 @@ pub fn clear() -> io::Result<()> {
     match fs::remove_file(path()?) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_existing_lsfg_only_preferences() {
+        let prefs: Preferences = serde_json::from_str(r#"{"lsfg_enabled":true}"#).unwrap();
+        assert!(prefs.lsfg_enabled);
+        assert_eq!(prefs.height, 1080);
+        assert_eq!(prefs.bitrate_mbps, 20);
+        assert_eq!(prefs.volume, 100);
+        assert!(!prefs.auto_connect);
     }
 }

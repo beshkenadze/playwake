@@ -36,6 +36,7 @@ class StreamOverlay:
             ('cairo_create', ptr, [ptr]),
             ('cairo_destroy', None, [ptr]),
             ('cairo_set_source_rgb', None, [ptr, d, d, d]),
+            ('cairo_arc', None, [ptr, d, d, d, d, d]),
             ('cairo_rectangle', None, [ptr, d, d, d, d]),
             ('cairo_fill', None, [ptr]),
             ('cairo_scale', None, [ptr, d, d]),
@@ -55,6 +56,10 @@ class StreamOverlay:
         self.diagnostics = False
         self.selection = 0
         self.metrics = ()
+        self.compact = '—'
+        self.russian = False
+        self.xbox_palette = False
+        self.console_name = 'Xbox'
         self.rendered = None
         self.geometry = None
         self.scale = 1.0
@@ -69,8 +74,8 @@ class StreamOverlay:
             self.toggle()
         elif entry.button == 1 and entry.window == self.xid and self.menu:
             x, y = entry.x / self.scale, entry.y / self.scale
-            index = int((y - 58) // 42)
-            if 18 <= x <= 342 and 58 <= y < 226:
+            index = int((y - 152) // 58)
+            if 22 <= x <= 418 and 152 <= y < 442 and (y - 152) % 58 < 52:
                 self.select(index)
 
     def update(self, video_size):
@@ -83,11 +88,11 @@ class StreamOverlay:
             return
 
         width, height = video_size
-        self.scale = min(1.5, width / 400, height / 290, max(0.8, height / 800))
-        logical_width, logical_height = (360, 256) if self.menu else (356, 140)
+        self.scale = min(2.0, width / 1280, height / 545)
+        logical_width, logical_height = (440, height / self.scale) if self.menu else (340, 31)
         w, h = (max(1, round(value * self.scale)) for value in (logical_width, logical_height))
         if self.menu:
-            x, y = (width - w) // 2, (height - h) // 2
+            x, y = width - w, 0
         else:
             x = y = round(12 * self.scale)
         layout = (mode, x, y, w, h)
@@ -101,7 +106,7 @@ class StreamOverlay:
             self.x11.XMapRaised(self.display, self.xid)
             self.geometry = layout
 
-        frame = (layout, self.selection, self.diagnostics, self.metrics if not self.menu else ())
+        frame = (layout, self.selection, self.diagnostics, self.compact, self.metrics if self.menu and self.diagnostics else ())
         if self.rendered != frame:
             self.draw(w, h, logical_width, logical_height)
             self.rendered = frame
@@ -121,26 +126,46 @@ class StreamOverlay:
 
             def text(x, y, value, size, bold=False, color=(0.93, 0.95, 0.99)):
                 lib.cairo_set_source_rgb(ctx, *color)
-                lib.cairo_select_font_face(ctx, b'sans-serif', 0, int(bold))
+                lib.cairo_select_font_face(ctx, b'DejaVu Sans', 0, int(bold))
                 lib.cairo_set_font_size(ctx, size)
                 lib.cairo_move_to(ctx, x, y)
                 lib.cairo_show_text(ctx, value.encode())
 
-            rect(0, 0, width, height, (0.065, 0.079, 0.112))
+            muted = (0.63, 0.63, 0.65)
+            accent = (0.42, 0.75, 0.29) if self.xbox_palette else (0.55, 0.86, 0.70)
+
+            def label(ru, en):
+                return ru if self.russian else en
+
             if self.menu:
-                text(18, 35, 'Stream menu', 21, True)
-                diagnostics = 'Hide diagnostics' if self.diagnostics else 'Show diagnostics'
-                for index, label in enumerate(('Resume', 'Xbox Guide', diagnostics, 'Stop stream')):
-                    y = 58 + 42 * index
+                rect(0, 0, width, height, (0.12, 0.12, 0.13))
+                rect(0, 0, 1, height, (0.28, 0.28, 0.29))
+                text(32, 53, self.console_name[:26], 26, True)
+                lib.cairo_set_source_rgb(ctx, *accent)
+                lib.cairo_arc(ctx, 36, 79, 4, 0, 6.284)
+                lib.cairo_fill(ctx)
+                text(48, 85, label('Стрим идёт', 'Streaming'), 16, color=accent)
+                text(32, 117, self.compact, 14, color=muted)
+                diagnostics = label('Скрыть статистику', 'Hide statistics') if self.diagnostics else label('Статистика', 'Statistics')
+                names = (label('Продолжить', 'Resume'), 'Xbox Guide', diagnostics,
+                         label('Переподключить', 'Reconnect'), label('Завершить стрим', 'End stream'))
+                for index, name in enumerate(names):
+                    y = 152 + 58 * index
                     selected = index == self.selection
-                    color = (0.19, 0.42, 0.65) if selected else (0.11, 0.14, 0.19)
-                    rect(18, y, width - 36, 36, color)
-                    text(28, y + 24, label, 16, selected)
-                text(18, 242, 'D-pad · A Select · B Resume', 13, color=(0.67, 0.73, 0.81))
+                    if selected:
+                        rect(20, y - 2, width - 40, 56, accent)
+                        rect(23, y + 1, width - 46, 50, (0.24, 0.27, 0.26))
+                    color = (0.99, 0.53, 0.51) if index == 4 else (0.93, 0.93, 0.93)
+                    text(40, y + 33, name, 18, selected, color)
+                if self.diagnostics and height > 645:
+                    for index, line in enumerate(self.metrics[1:]):
+                        text(32, 467 + 19 * index, line, 13, color=muted)
+                text(32, height - 73, label('Ввод на Xbox приостановлен', 'Xbox input paused'), 15, color=muted)
+                rect(0, height - 56, width, 1, (0.28, 0.28, 0.29))
+                text(120, height - 22, label('A  Выбрать     B  В игру', 'A  Select     B  Back to game'), 15, True)
             else:
-                text(12, 23, 'Stream diagnostics', 16, True)
-                for index, line in enumerate(self.metrics or ('Collecting samples…',)):
-                    text(12, 46 + 18 * index, line, 13)
+                rect(0, 0, width, height, (0.08, 0.09, 0.09))
+                text(10, 21, self.compact, 14)
         finally:
             lib.cairo_destroy(ctx)
             lib.cairo_surface_destroy(surface)

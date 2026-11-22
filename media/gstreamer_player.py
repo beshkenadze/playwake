@@ -315,6 +315,94 @@ class GamescopeInputFocus:
         self.x11.XCloseDisplay(self.display)
 
 
+def find_gamepad():
+    try:
+        import evdev
+    except ImportError:
+        return None
+    preferred = os.getenv('GREENLIGHT_GAMEPAD')
+    for path in (preferred,) if preferred else evdev.list_devices():
+        try:
+            device = evdev.InputDevice(path)
+            codes = device.capabilities(absinfo=False)
+        except OSError:
+            continue
+        if 304 in codes.get(1, []) and 3 in codes.get(3, []):
+            return device
+        device.close()
+    return None
+
+
+def watch_menu_gamepad():
+    loop = GLib.MainLoop()
+    device = None
+    active = False
+    axes = {}
+    next_probe = 0
+    focus = None
+    target = os.getenv('SteamAppId', '0')
+    if (display := os.getenv('ALLY_GAMESCOPE_CONTROL_DISPLAY')) and target.isdecimal() and int(target):
+        try:
+            focus = GamescopeInputFocus(display)
+        except OSError:
+            pass
+
+    def poll():
+        nonlocal device, active, next_probe
+        now = milliseconds()
+        if not device:
+            if now < next_probe:
+                return GLib.SOURCE_CONTINUE
+            next_probe = now + 1000
+            device = find_gamepad()
+            if not device:
+                return GLib.SOURCE_CONTINUE
+            axes.clear()
+            active = False
+        previous = active
+        app = focus.focused_app() if focus else None
+        active = app is None or app == int(target)
+        try:
+            events = list(device.read())
+        except BlockingIOError:
+            return GLib.SOURCE_CONTINUE
+        except OSError:
+            device.close()
+            device = None
+            return GLib.SOURCE_CONTINUE
+        for event in events:
+            key = None
+            if event.type == 1 and event.value == 1:
+                key = {304:'accept', 305:'back', 308:'refresh', 315:'settings',
+                       544:'up', 545:'down', 546:'left', 547:'right'}.get(event.code)
+            elif event.type == 3 and event.code in (0, 1, 16, 17):
+                if event.code < 2:
+                    value = -1 if event.value < -18000 else 1 if event.value > 18000 else 0
+                else:
+                    value = event.value
+                if value != axes.get(event.code, 0):
+                    keys = ('left', 'right') if event.code % 2 == 0 else ('up', 'down')
+                    key = {-1:keys[0], 1:keys[1]}.get(value)
+                    axes[event.code] = value
+            if key and previous and active:
+                print(key, flush=True)
+        return GLib.SOURCE_CONTINUE
+
+    def stop():
+        sys.stdin.readline()
+        GLib.idle_add(loop.quit)
+
+    threading.Thread(target=stop, daemon=True).start()
+    GLib.timeout_add(16, poll)
+    try:
+        loop.run()
+    finally:
+        if device:
+            device.close()
+        if focus:
+            focus.close()
+
+
 class StreamInput:
     def __init__(self):
         self.overlay = False
@@ -486,6 +574,7 @@ class Player:
         self.window = None
         self.hud_timer = None
         self.hud_sample = None
+        self.audio_volume = 1.0
         self.transport_pending = False
         self.hud_rtt = None
         self.hud_jitter = None
@@ -494,19 +583,10 @@ class Player:
         self.external_pad = None
 
     def connect_gamepad(self):
-        try:
-            import evdev
-        except ImportError:
-            return
-        preferred = os.getenv('GREENLIGHT_GAMEPAD')
-        for path in ([preferred] if preferred else evdev.list_devices()):
-            device = evdev.InputDevice(path)
-            codes = device.capabilities(absinfo=False)
-            if 304 in codes.get(1, []) and 3 in codes.get(3, []):
-                self.input_device = device
-                self.axis_info = {axis: device.absinfo(axis) for axis in codes[3]}
-                break
-            device.close()
+        self.input_device = find_gamepad()
+        if self.input_device:
+            codes = self.input_device.capabilities(absinfo=False)
+            self.axis_info = {axis: self.input_device.absinfo(axis) for axis in codes[3]}
 
     def update_input_focus(self):
         focused_app = self.gamescope_focus.focused_app() if self.gamescope_focus else None
@@ -533,6 +613,7 @@ class Player:
             overlay.menu = self.stream_input.overlay
             if overlay.menu and not was_open:
                 overlay.selection = 0
+            self.sync_hud_timer(overlay)
 
     def toggle_overlay(self):
         if self.stream_input.focused:
@@ -544,12 +625,16 @@ class Player:
             return
         overlay.diagnostics = not overlay.diagnostics
         emit('stream-diagnostics', enabled=overlay.diagnostics)
-        if overlay.diagnostics:
+        self.sync_hud_timer(overlay)
+
+    def sync_hud_timer(self, overlay):
+        if (overlay.menu or overlay.diagnostics) and self.hud_timer is None:
             self.hud_sample = None
+            overlay.compact = '—'
             overlay.metrics = ()
             self.refresh_hud()
             self.hud_timer = GLib.timeout_add_seconds(1, self.refresh_hud)
-        elif self.hud_timer is not None:
+        elif not (overlay.menu or overlay.diagnostics) and self.hud_timer is not None:
             GLib.source_remove(self.hud_timer)
             self.hud_timer = None
 
@@ -560,7 +645,7 @@ class Player:
                     self.start(command['bitrate'], command.get('width', 1920), command.get('height', 1080),
                                command.get('benchmark', False), command.get('capture_diagnostics', False),
                                command.get('renderer', 'auto'), command.get('lsfg', False),
-                               command.get('interactive', False))
+                               command.get('interactive', False), command)
                 case 'answer':
                     if self.capture_diagnostics:
                         self.inspect_timestamps(command['sdp'])
@@ -614,9 +699,11 @@ class Player:
         return GLib.SOURCE_REMOVE
 
     def start(self, bitrate, width, height, benchmark=False, capture_diagnostics=False, renderer='auto',
-              lsfg=False, interactive=False):
+              lsfg=False, interactive=False, options=None):
         self.target_width, self.target_height = int(width), int(height)
         self.bitrate_limit = int(bitrate)
+        options = options or {}
+        self.audio_volume = max(0, min(100, int(options.get('volume', 100)))) / 100
         self.benchmark = benchmark
         self.capture_diagnostics = capture_diagnostics
         self.renderer = renderer
@@ -654,6 +741,12 @@ class Player:
                 self.window = X11VideoWindow(parent, self.loop.quit, adopt_vulkan=renderer == 'vulkan',
                                              overlay_actions=actions if interactive else None)
                 self.window_id = self.window.xid
+                if overlay := self.window.overlay:
+                    overlay.russian = options.get('russian', False)
+                    overlay.xbox_palette = options.get('xbox_palette', False)
+                    overlay.console_name = options.get('console_name') or 'Xbox'
+                    if options.get('compact_stats'):
+                        self.set_diagnostics()
         direction = GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY
         for caps in (
             'application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=111,encoding-params=(string)2',
@@ -799,6 +892,7 @@ class Player:
         if self.window and self.window.overlay and self.window.overlay.menu != self.stream_input.overlay:
             self.window.overlay.menu = self.stream_input.overlay
             self.window.overlay.selection = 0
+            self.sync_hud_timer(self.window.overlay)
         if self.input_audit:
             sample = (buttons, any(axes), bool(left_trigger or right_trigger))
             if self.last_input_sample != sample:
@@ -893,7 +987,7 @@ class Player:
         elif media == 'audio':
             audio_sink = 'pulsesink' if sys.platform.startswith('linux') and Gst.ElementFactory.find('pulsesink') else 'autoaudiosink'
             branch = Gst.parse_bin_from_description(
-                f'rtpopusdepay ! opusdec ! audioconvert ! audioresample ! {audio_sink} sync=true', True)
+                f'rtpopusdepay ! opusdec ! audioconvert ! audioresample ! volume volume={self.audio_volume} ! {audio_sink} sync=true', True)
         else:
             return
         self.tracks.add(media)
@@ -1260,21 +1354,27 @@ class Player:
             depth = self.video_queue.get_property('current-level-buffers') if self.video_queue else 0
             queue_drops = max(0, self.video_queue_in - self.video_queue_out - depth)
             size = self.window.size
-            ms = lambda value: f'{value:.0f} ms' if value is not None else '—'
+            def ms(value):
+                if value is None:
+                    return '—'
+                return f'{value:.2f} ms' if value < 1 else f'{value:.0f} ms'
             loss = self.hud_loss if self.hud_loss is not None else '—'
+            overlay.compact = (f'{self.height}p · {fps:.0f} FPS · {mbps:.1f} Mb/s · {ms(self.hud_rtt)}'
+                               f' · {queue_drops + dropped} ' +
+                               ('проп.' if overlay.russian else 'drops'))
             overlay.metrics = (
                 f'Video {self.width}×{self.height} · {fps:.1f} decoded FPS',
                 f'Viewport {size[0]}×{size[1]} · {self.decoder_name} · LSFG {"on" if self.lsfg else "off"}',
                 f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s',
                 f'RTT {ms(self.hud_rtt)} · jitter {ms(self.hud_jitter)} · RTP lost {loss}',
-                f'Queue {depth} · queue drops ≈{queue_drops} · sink drops {dropped}',
+                f'Queue {depth} · queue drops ~{queue_drops} · sink drops {dropped}',
             )
             emit('hud-stats', width=self.width, height=self.height, viewportWidth=size[0], viewportHeight=size[1],
                  decodedFps=round(fps, 2), videoMbps=round(mbps, 2), limitKbps=self.bitrate_limit,
                  rttMs=self.hud_rtt, jitterMs=self.hud_jitter, rtpLost=self.hud_loss,
                  queueDepth=depth, queueDrops=queue_drops, sinkDrops=dropped)
         self.hud_sample = sample
-        if not self.transport_pending:
+        if self.width and self.height and not self.transport_pending:
             self.transport_pending = True
             promise = Gst.Promise.new_with_change_func(self.hud_transport_reply, None)
             self.rtc.emit('get-stats', None, promise)
@@ -1366,7 +1466,10 @@ class Player:
 
 if __name__ == '__main__':
     try:
-        Player().run()
+        if sys.argv[1:] == ["--menu-input"]:
+            watch_menu_gamepad()
+        else:
+            Player().run()
     except (RuntimeError, GLib.Error) as error:
         emit('error', message=str(error))
         sys.exit(1)

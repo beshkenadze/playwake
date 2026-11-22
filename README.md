@@ -28,20 +28,28 @@ The resolution picker also offers 720p, 1440p, and experimental 800p and
 900p requests. Xbox controls the transmitted size. The app and the journal
 report the actual decoder dimensions separately from the requested size.
 
+### Deck controls
+
+On Linux with Python evdev, use the D-pad or left stick to pick a console
+and **A** to play. **Menu** opens settings and **Y** refreshes the console list.
+In settings, move up and down through sections, enter a section with **A**
+or the right direction, and use left and right to adjust a focused value.
+**B** goes back. Arrow keys, Enter and Escape also work in the desktop menu.
+
 ### Stream controls
 
 On SteamOS, the stream fills the fullscreen window and preserves the video's
 aspect ratio. Hold **View + Menu** together for half a second or right-click
-the video to open the stream menu above it. Use the D-pad and **A** to select
-**Resume**, **Xbox Guide**, **Show diagnostics**, or **Stop stream**. Press
+the video to open the right-hand panel above it. Use the D-pad and **A** to select
+**Resume**, **Xbox Guide**, **Statistics**, **Reconnect**, or **End stream**. Press
 **B** to resume. The menu pauses controller input to the Xbox and waits for
 the controls to return to neutral before resuming.
 
-The diagnostics HUD shows the incoming resolution, viewport size, decoded
-FPS, measured video bitrate, requested bitrate limit, decoder, LSFG state,
-available WebRTC RTT and jitter, and video queue and sink drops. Decoded FPS
-counts source frames. The HUD leaves gameplay input active when the menu is
-closed.
+The compact HUD shows the incoming resolution, decoded FPS, measured
+video bitrate, available RTT, and frame drops. Turn on statistics and
+open the panel for viewport size, decoder, LSFG state, jitter, and separate
+queue and sink counters. Decoded FPS counts source frames. The HUD leaves
+gameplay input active when the panel is closed.
 
 To play from Steam Gaming Mode, run `cargo build --release --locked` and
 place the resulting `playwake` binary, both Python files in `media/`, and
