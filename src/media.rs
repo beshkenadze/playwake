@@ -226,6 +226,9 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         "multiplier": 2, "performance_mode": true, "flow_scale": 1.0,
                     })),
                     Some("vulkan-window-embedded") => journal::record("vulkan_window_embedded", json!({})),
+                    Some("stream-overlay-hint") => journal::record("stream_overlay_hint", json!({
+                        "visible": event.get("visible").and_then(Value::as_bool),
+                    })),
                     Some("stream-overlay") => {
                         if let Some(open) = event.get("open").and_then(Value::as_bool) {
                             journal::record("stream_overlay", json!({"open":open}));
@@ -279,7 +282,12 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         "trigger_active":event.get("triggerActive").and_then(Value::as_bool),
                     })),
                     Some("video") => {
-                        if first_video.is_none() { notify(StreamEvent::VideoReady); }
+                        if first_video.is_none() {
+                            notify(StreamEvent::VideoReady);
+                            if interactive && window.is_some() {
+                                command(&mut player, json!({"action":"overlay-hint"}))?;
+                            }
+                        }
                         first_video.get_or_insert_with(Instant::now);
                         let width = event.get("width").and_then(Value::as_u64).unwrap_or_default();
                         let height = event.get("height").and_then(Value::as_u64).unwrap_or_default();

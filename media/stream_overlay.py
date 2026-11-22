@@ -1,5 +1,6 @@
 """X11 stream controls and diagnostics, composited above the video child."""
 import ctypes as c
+import time
 
 
 class ButtonEvent(c.Structure):
@@ -11,9 +12,12 @@ class ButtonEvent(c.Structure):
 
 
 class StreamOverlay:
-    def __init__(self, x11, display, parent, create_child, toggle, select):
+    def __init__(self, x11, display, parent, create_child, toggle, select, hint_visibility):
         self.x11, self.display, self.parent = x11, display, parent
         self.toggle, self.select = toggle, select
+        self.hint_visibility = hint_visibility
+        self.hint_pending = False
+        self.hint_until = 0.0
         ptr, xid, i, u, d = c.c_void_p, c.c_ulong, c.c_int, c.c_uint, c.c_double
 
         def bind(library, *definitions):
@@ -78,8 +82,22 @@ class StreamOverlay:
             if 22 <= x <= 418 and 152 <= y < 442 and (y - 152) % 58 < 52:
                 self.select(index)
 
+    def show_startup_hint(self):
+        self.hint_pending = not self.menu
+
     def update(self, video_size):
-        mode = 'menu' if self.menu else 'hud' if self.diagnostics else None
+        now = time.monotonic()
+        if self.menu:
+            self.hint_pending = False
+            self.hint_until = 0.0
+        elif self.hint_pending:
+            self.hint_pending = False
+            self.hint_until = now + 4.0
+        hint = now < self.hint_until
+        mode = 'menu' if self.menu else 'hint' if hint else 'hud' if self.diagnostics else None
+        was_hint = self.geometry is not None and self.geometry[0] == 'hint'
+        if hint != was_hint:
+            self.hint_visibility(hint)
         if mode is None:
             if self.geometry is not None:
                 self.x11.XUnmapWindow(self.display, self.xid)
@@ -89,10 +107,15 @@ class StreamOverlay:
 
         width, height = video_size
         self.scale = min(2.0, width / 1280, height / 545)
-        logical_width, logical_height = (440, height / self.scale) if self.menu else (340, 31)
+        if self.menu:
+            logical_width, logical_height = 440, height / self.scale
+        else:
+            logical_width, logical_height = (570, 62) if hint else (340, 31)
         w, h = (max(1, round(value * self.scale)) for value in (logical_width, logical_height))
         if self.menu:
             x, y = width - w, 0
+        elif hint:
+            x, y = (width - w) // 2, round(24 * self.scale)
         else:
             x = y = round(12 * self.scale)
         layout = (mode, x, y, w, h)
@@ -108,10 +131,10 @@ class StreamOverlay:
 
         frame = (layout, self.selection, self.diagnostics, self.compact, self.metrics if self.menu and self.diagnostics else ())
         if self.rendered != frame:
-            self.draw(w, h, logical_width, logical_height)
+            self.draw(w, h, logical_width, logical_height, mode)
             self.rendered = frame
 
-    def draw(self, pixel_width, pixel_height, width, height):
+    def draw(self, pixel_width, pixel_height, width, height, mode):
         lib = self.cairo
         surface = lib.cairo_xlib_surface_create(self.display, self.xid, self.visual,
                                                 pixel_width, pixel_height)
@@ -163,6 +186,11 @@ class StreamOverlay:
                 text(32, height - 73, label('Ввод на Xbox приостановлен', 'Xbox input paused'), 15, color=muted)
                 rect(0, height - 56, width, 1, (0.28, 0.28, 0.29))
                 text(120, height - 22, label('A  Выбрать     B  В игру', 'A  Select     B  Back to game'), 15, True)
+            elif mode == 'hint':
+                rect(0, 0, width, height, (0.12, 0.12, 0.13))
+                rect(0, 0, 4, height, accent)
+                text(19, 25, label('Меню Playwake', 'Playwake stream menu'), 15, True, accent)
+                text(19, 47, label('Удерживайте View + Menu 0,5 с', 'Hold View + Menu for 0.5 s'), 17)
             else:
                 rect(0, 0, width, height, (0.08, 0.09, 0.09))
                 text(10, 21, self.compact, 14)

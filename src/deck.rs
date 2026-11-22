@@ -31,6 +31,8 @@ pub enum Key {
     Back,
     Settings,
     Refresh,
+    PreviousTab,
+    NextTab,
 }
 
 impl Key {
@@ -44,6 +46,8 @@ impl Key {
             "back" | "escape" => Self::Back,
             "settings" => Self::Settings,
             "refresh" => Self::Refresh,
+            "previous-tab" => Self::PreviousTab,
+            "next-tab" => Self::NextTab,
             _ => return None,
         })
     }
@@ -72,14 +76,137 @@ pub enum Action {
     Mute,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    Xbox,
+    Settings,
+}
+
+impl Tab {
+    fn action(self) -> Action {
+        match self {
+            Self::Xbox => Action::Home,
+            Self::Settings => Action::Settings,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Menu {
-    pub settings: bool,
+    pub tab: Tab,
+    pub focused_tab: Option<Tab>,
     pub section: usize,
     pub row: Option<usize>,
+    pub editing_value: bool,
     pub console: usize,
     pub browser_cancel: bool,
     pub confirming_sign_out: bool,
+}
+
+impl Menu {
+    pub fn select_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.focused_tab = None;
+        self.row = None;
+        self.editing_value = false;
+    }
+
+    pub fn select_section(&mut self, index: usize) {
+        self.section = index;
+        self.focused_tab = None;
+        self.row = None;
+        self.editing_value = false;
+    }
+
+    pub fn navigate(
+        &mut self,
+        key: Key,
+        actions: &[Action],
+        consoles: &[Action],
+    ) -> Option<(Action, isize)> {
+        use Key::*;
+        let run = |action| Some((action, 1));
+        let other_tab = if self.tab == Tab::Xbox {
+            Tab::Settings
+        } else {
+            Tab::Xbox
+        };
+        match key {
+            PreviousTab => return run(Tab::Xbox.action()),
+            NextTab => return run(Tab::Settings.action()),
+            Settings => return run(other_tab.action()),
+            Refresh => return run(Action::Refresh),
+            _ => {}
+        }
+
+        if let Some(tab) = self.focused_tab {
+            match key {
+                Left => self.focused_tab = Some(Tab::Xbox),
+                Right => self.focused_tab = Some(Tab::Settings),
+                Accept => return run(tab.action()),
+                Down | Back => self.focused_tab = None,
+                _ => {}
+            }
+            return None;
+        }
+
+        if self.tab == Tab::Xbox {
+            let last = consoles.len().saturating_sub(1);
+            match key {
+                Up => self.focused_tab = Some(self.tab),
+                Left => self.console = self.console.saturating_sub(1),
+                Right => self.console = self.console.saturating_add(1).min(last),
+                Accept => return consoles.get(self.console.min(last)).copied().and_then(run),
+                _ => {}
+            }
+            return None;
+        }
+
+        if let Some(row) = self.row.filter(|row| *row < actions.len()) {
+            let action = actions[row];
+            if self.editing_value {
+                match key {
+                    Left => return Some((action, -1)),
+                    Right => return run(action),
+                    Accept | Back => {
+                        self.editing_value = false;
+                        return None;
+                    }
+                    Up | Down => self.editing_value = false,
+                    _ => {}
+                }
+            }
+            match key {
+                Left | Back => self.row = None,
+                Up if row == 0 => self.focused_tab = Some(self.tab),
+                Up => self.row = Some(row - 1),
+                Down if row + 1 < actions.len() => self.row = Some(row + 1),
+                Accept if action.adjustable() => self.editing_value = true,
+                Accept => return run(action),
+                _ => {}
+            }
+        } else {
+            match key {
+                Back => return run(Action::Home),
+                Up if self.section == 0 => self.focused_tab = Some(self.tab),
+                Up => self.section -= 1,
+                Down if self.section + 1 < section_labels(&Text(false)).len() => self.section += 1,
+                Right | Accept if !actions.is_empty() => self.row = Some(0),
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+impl Action {
+    fn adjustable(self) -> bool {
+        matches!(
+            self,
+            Self::Resolution | Self::Bitrate | Self::Volume | Self::Language | Self::Palette
+        )
+    }
 }
 
 pub struct Text(pub bool);
@@ -367,36 +494,39 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
     if native_stream && v.video_ready {
         return div().size_full().bg(rgb(0)).into_any_element();
     }
-    let tab = |label: &'static str, active: bool| {
-        div()
+    let tabs_available = v.stream.is_none()
+        && v.sign_in.is_none()
+        && v.device.is_none()
+        && !v.menu.confirming_sign_out;
+    let mut tab = |label: &'static str, target: Tab, index: usize| {
+        let selected = v.menu.tab == target;
+        let focused = v.menu.focused_tab == Some(target);
+        let face = div()
             .flex()
             .items_center()
             .px(s(16.))
             .h(s(38.))
-            .bg(rgb(if active { CARD } else { PANEL }))
-            .child(label)
+            .rounded(s(9.))
+            .bg(rgb(if selected { accent } else { PANEL }))
+            .text_color(rgb(if selected { CANVAS } else { TEXT }))
+            .font_weight(if selected {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::NORMAL
+            })
+            .child(label);
+        action(
+            ("nav", index),
+            face,
+            target.action(),
+            focused,
+            if selected { TEXT } else { accent },
+            unit,
+            cx,
+        )
     };
-    let settings = action(
-        ("nav", 0),
-        tab(
-            t.t("Настройки", "Settings"),
-            v.menu.settings && !native_stream,
-        ),
-        Action::Settings,
-        false,
-        accent,
-        unit,
-        cx,
-    );
-    let home = action(
-        ("nav", 1),
-        tab("Xbox", !v.menu.settings || native_stream),
-        Action::Home,
-        false,
-        accent,
-        unit,
-        cx,
-    );
+    let home = tab("Xbox", Tab::Xbox, 0);
+    let settings = tab(t.t("Настройки", "Settings"), Tab::Settings, 1);
     let top = div()
         .h(s(72.))
         .flex_none()
@@ -415,7 +545,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                 .mr(s(16.))
                 .child("Playwake"),
         )
-        .when(!native_stream, |bar| bar.child(home).child(settings))
+        .when(tabs_available, |bar| bar.child(home).child(settings))
         .child(div().flex_1())
         .when(v.account.is_none(), |bar| {
             bar.child(
@@ -429,15 +559,30 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         ("A", t.t("Выбрать", "Select")),
         ("B", t.t("Назад", "Back")),
     ];
-    if !v.menu.settings && v.account.is_some() && v.stream.is_none() {
+    if v.menu.editing_value {
+        hints = vec![
+            ("◀▶", t.t("Изменить значение", "Adjust value")),
+            ("A", t.t("Готово", "Done")),
+            ("LB/RB", t.t("Вкладки", "Tabs")),
+        ];
+    } else if v.menu.focused_tab.is_some() {
+        hints = vec![
+            ("◀▶", t.t("Выбор вкладки", "Choose tab")),
+            ("A", t.t("Открыть", "Open")),
+            ("↓", t.t("К содержимому", "Back to content")),
+            ("LB/RB", t.t("Вкладки", "Tabs")),
+        ];
+    } else if v.menu.tab == Tab::Xbox && v.account.is_some() && v.stream.is_none() {
         hints = vec![
             ("◀▶", t.t("Выбор", "Move")),
             ("A", t.t("Играть", "Play")),
             ("Y", t.t("Обновить", "Refresh")),
-            ("≡", t.t("Настройки", "Settings")),
+            ("LB/RB", t.t("Вкладки", "Tabs")),
         ];
     } else if native_stream {
         hints = vec![("B", t.t("Отмена", "Cancel"))];
+    } else if v.menu.tab == Tab::Settings {
+        hints.push(("LB/RB", t.t("Вкладки", "Tabs")));
     }
     let footer = div()
         .flex_none()
@@ -635,7 +780,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                 .children(qr.iter().map(|qr| login_qr(qr.clone(), s(5.5))))
                 .child(info),
         );
-    } else if v.menu.settings {
+    } else if v.menu.tab == Tab::Settings {
         let current_rows = rows(
             v.prefs,
             &t,
@@ -664,13 +809,13 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                         .bg(rgb(if v.menu.section == i { CARD } else { CANVAS }))
                         .child(name),
                     Action::Section(i),
-                    v.menu.section == i && v.menu.row.is_none(),
+                    v.menu.section == i && v.menu.row.is_none() && v.menu.focused_tab.is_none(),
                     accent,
                     unit,
                     cx,
                 )
                 .border_color(rgb(
-                    if v.menu.section == i && v.menu.row.is_none() {
+                    if v.menu.section == i && v.menu.row.is_none() && v.menu.focused_tab.is_none() {
                         accent
                     } else {
                         CANVAS
@@ -721,10 +866,22 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                             .child(row.value),
                     );
                 if let Some(command) = row.action {
-                    let selected = v.menu.row == Some(active_index);
+                    let selected = v.menu.row == Some(active_index) && v.menu.focused_tab.is_none();
                     active_index += 1;
-                    action(("setting", i), inner, command, selected, accent, unit, cx)
-                        .into_any_element()
+                    action(
+                        ("setting", i),
+                        inner,
+                        command,
+                        selected,
+                        if selected && v.menu.editing_value {
+                            TEXT
+                        } else {
+                            accent
+                        },
+                        unit,
+                        cx,
+                    )
+                    .into_any_element()
                 } else {
                     inner.into_any_element()
                 }
@@ -891,7 +1048,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                         ("console-card", i),
                         card,
                         Action::Play(i),
-                        v.menu.console == i,
+                        v.menu.console == i && v.menu.focused_tab.is_none(),
                         accent,
                         unit,
                         cx,
@@ -915,7 +1072,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                                 .p(s(12.))
                                 .child(t.t("Обновить список", "Refresh consoles")),
                             Action::Refresh,
-                            true,
+                            v.menu.focused_tab.is_none(),
                             accent,
                             unit,
                             cx,
@@ -985,4 +1142,65 @@ fn hero(body: Div, unit: f32) -> Div {
         linear_color_stop(rgba(0x0d1b191c), 1.0),
     )))
     .min_h(px(200. * unit))
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::{Action, Key, Menu, Tab};
+
+    #[test]
+    fn focus_and_active_tab_are_independent() {
+        let mut menu = Menu::default();
+        let consoles = [Action::Play(0)];
+        assert_eq!(menu.navigate(Key::Up, &[], &consoles), None);
+        assert_eq!(menu.focused_tab, Some(Tab::Xbox));
+        assert_eq!(menu.navigate(Key::Right, &[], &consoles), None);
+        assert_eq!(menu.focused_tab, Some(Tab::Settings));
+        assert_eq!(menu.tab, Tab::Xbox);
+        assert_eq!(
+            menu.navigate(Key::Accept, &[], &consoles),
+            Some((Action::Settings, 1))
+        );
+    }
+
+    #[test]
+    fn leaves_a_settings_row_without_back_and_switches_tabs_with_bumpers() {
+        let mut menu = Menu::default();
+        menu.select_tab(Tab::Settings);
+        menu.select_section(1);
+        let rows = [Action::Resolution, Action::Bitrate];
+        menu.navigate(Key::Right, &rows, &[]);
+        assert_eq!(menu.row, Some(0));
+        menu.navigate(Key::Left, &rows, &[]);
+        assert_eq!(menu.row, None);
+        menu.navigate(Key::Right, &rows, &[]);
+        menu.navigate(Key::Up, &rows, &[]);
+        assert_eq!(menu.focused_tab, Some(Tab::Settings));
+        assert_eq!(
+            menu.navigate(Key::PreviousTab, &rows, &[]),
+            Some((Action::Home, 1))
+        );
+        menu.select_tab(Tab::Xbox);
+        assert_eq!(
+            menu.navigate(Key::NextTab, &[], &[]),
+            Some((Action::Settings, 1))
+        );
+    }
+
+    #[test]
+    fn edits_only_when_the_value_is_activated() {
+        let mut menu = Menu::default();
+        menu.select_tab(Tab::Settings);
+        let rows = [Action::Resolution];
+        menu.navigate(Key::Right, &rows, &[]);
+        assert_eq!(menu.navigate(Key::Accept, &rows, &[]), None);
+        assert!(menu.editing_value);
+        assert_eq!(
+            menu.navigate(Key::Left, &rows, &[]),
+            Some((Action::Resolution, -1))
+        );
+        menu.navigate(Key::Up, &rows, &[]);
+        assert!(!menu.editing_value);
+        assert_eq!(menu.focused_tab, Some(Tab::Settings));
+    }
 }
