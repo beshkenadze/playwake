@@ -49,6 +49,7 @@ class StreamOverlay:
             ('cairo_fill', None, [ptr]),
             ('cairo_scale', None, [ptr, d, d]),
             ('cairo_move_to', None, [ptr, d, d]),
+            ('cairo_line_to', None, [ptr, d, d]),
             ('cairo_select_font_face', None, [ptr, c.c_char_p, i, i]),
             ('cairo_set_font_size', None, [ptr, d]),
             ('cairo_show_text', None, [ptr, c.c_char_p]))
@@ -70,6 +71,8 @@ class StreamOverlay:
         self.russian = False
         self.xbox_palette = False
         self.console_name = 'Xbox'
+        self.control_layout = 'gamepad'
+        self.control_device = 'Gamepad'
         self.rendered = None
         self.geometry = None
         self.scale = 1.0
@@ -116,7 +119,7 @@ class StreamOverlay:
         if self.menu:
             logical_width, logical_height = 440, height / self.scale
         else:
-            logical_width, logical_height = (570, 62) if hint else (390, 31)
+            logical_width, logical_height = (570, 119) if hint else (430, 31)
         w, h = (max(1, round(value * self.scale)) for value in (logical_width, logical_height))
         if self.menu:
             x, y = width - w, 0
@@ -206,10 +209,71 @@ class StreamOverlay:
                 rect(0, 0, width, height, (0.12, 0.12, 0.13))
                 rect(0, 0, 4, height, accent)
                 text(19, 25, label('Меню Playwake', 'Playwake stream menu'), 15, True, accent)
-                text(19, 47, label('Удерживайте View + Menu 0,5 с', 'Hold View + Menu for 0.5 s'), 17)
+                text(19, 54, 'View + Menu', 24, True)
+                text(19, 78, label('Нажмите одновременно', 'Tap both buttons together'), 15)
+                device = label('Геймпад', 'Gamepad') if self.control_layout == 'gamepad' else self.control_device
+                text(19, 102, device, 13, color=muted)
+                self.draw_control_layout(ctx, rect, text, accent)
             else:
                 rect(0, 0, width, height, (0.08, 0.09, 0.09))
                 text(10, 21, self.compact, 14)
         finally:
             lib.cairo_destroy(ctx)
             lib.cairo_surface_destroy(surface)
+
+    def draw_control_layout(self, ctx, rect, text, accent):
+        lib = self.cairo
+        shell = (0.31, 0.32, 0.35)
+        inset = (0.16, 0.17, 0.19)
+        mark = (0.55, 0.58, 0.61)
+
+        def dot(x, y, radius, color):
+            lib.cairo_set_source_rgb(ctx, *color)
+            lib.cairo_arc(ctx, x, y, radius, 0, 6.284)
+            lib.cairo_fill(ctx)
+
+        if self.control_layout == 'gamepad':
+            rect(337, 45, 168, 41, shell)
+            dot(345, 72, 26, shell)
+            dot(497, 72, 26, shell)
+            dot(355, 57, 8, inset)
+            dot(456, 77, 8, inset)
+            buttons = ((401, 56), (441, 56))
+        else:
+            deck = self.control_layout == 'deck'
+            rect(300, 44, 248, 63, shell)
+            rect(358, 49, 132, 53, inset)
+            dot(338 if deck else 328, 64 if deck else 62, 8, inset)
+            dot(510 if deck else 520, 64 if deck else 84, 8, inset)
+            dx, dy = (315, 62) if deck else (329, 83)
+            rect(dx - 6, dy - 2, 12, 4, mark)
+            rect(dx - 2, dy - 6, 4, 12, mark)
+            for x, y in ((520, 62), (514, 68), (526, 68), (520, 74)) if not deck else (
+                    (533, 56), (527, 62), (539, 62), (533, 68)):
+                dot(x, y, 2, mark)
+            if deck:
+                rect(321, 79, 21, 15, inset)
+                rect(505, 79, 21, 15, inset)
+                buttons = ((328, 53), (520, 53))
+            else:
+                other_button_y = 73 if self.control_layout == 'ally' else 51
+                button_y = 61 if self.control_layout == 'ally' else 62
+                dot(348, other_button_y, 4, mark)
+                dot(500, other_button_y, 4, mark)
+                buttons = ((348, button_y), (500, button_y))
+
+        for (x, y), name in zip(buttons, ('View', 'Menu'), strict=True):
+            text(x - 16, 25, name, 12, True, accent)
+            rect(x - 1, 29, 2, y - 36, accent)
+            lib.cairo_set_source_rgb(ctx, *accent)
+            lib.cairo_move_to(ctx, x - 4, y - 10)
+            lib.cairo_line_to(ctx, x + 4, y - 10)
+            lib.cairo_line_to(ctx, x, y - 5)
+            lib.cairo_fill(ctx)
+            dot(x, y, 5, accent)
+            if name == 'View':
+                rect(x - 3, y - 2, 4, 3, inset)
+                rect(x - 1, y, 4, 3, inset)
+            else:
+                for offset in (-2, 0, 2):
+                    rect(x - 2, y + offset, 4, 1, inset)

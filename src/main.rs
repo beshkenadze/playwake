@@ -1,4 +1,5 @@
 mod deck;
+mod device;
 mod input;
 mod journal;
 mod lsfg;
@@ -401,6 +402,8 @@ impl Render for RemotePlay {
 
 fn main() {
     journal::record("app_started", json!({"version": env!("CARGO_PKG_VERSION")}));
+    let device = device::current();
+    journal::record("control_layout_detected", json!({"layout":device.id,"device":device.name}));
     match std::env::args().nth(1).as_deref() {
         Some("--probe-resolutions") => return run_probe(media::Run::Timed(Duration::from_secs(16))),
         Some("--probe-latency") => return run_probe(media::Run::Latency),

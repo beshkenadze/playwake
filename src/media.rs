@@ -153,6 +153,7 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
             "height":requested_height,"benchmark":benchmark,"capture_diagnostics":matches!(run, Run::Transport),
             "renderer":renderer,"lsfg":enable_lsfg,"interactive":interactive,
             "russian":prefs.russian(),"xbox_palette":prefs.xbox_palette,"compact_stats":prefs.compact_stats,
+            "control_layout": crate::device::current().id, "control_device": crate::device::current().name,
             "volume": if prefs.mute { 0 } else { prefs.volume },
             "console_name": if console.name.is_empty() { &console.model } else { &console.name }}))?;
         status("Negotiating the GStreamer connection…".into());
@@ -262,6 +263,7 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         "video_mbps": event.get("videoMbps").and_then(Value::as_f64),
                         "limit_kbps": event.get("limitKbps").and_then(Value::as_u64),
                         "rtt_ms": event.get("rttMs").and_then(Value::as_f64),
+                        "video_client_ms": event.get("videoClientMs").and_then(Value::as_f64),
                         "jitter_ms": event.get("jitterMs").and_then(Value::as_f64),
                         "rtp_lost": event.get("rtpLost").and_then(Value::as_i64),
                         "queue_depth": event.get("queueDepth").and_then(Value::as_u64),
