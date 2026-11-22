@@ -3,9 +3,7 @@ name: Linux Flatpak
 on:
   pull_request:
   push:
-    branches: [main]
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,8 +13,29 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
+  test:
+    name: Test Playwake
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: registry.fedoraproject.org/fedora:44@sha256:aca68c361f2a89de8a64e8d91a47494f37fad05f88c2f503cdd8a284a74c70ac
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Git
+        run: dnf -y install git
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-linux-rust
+      - name: Run Rust tests
+        run: cargo test --release --locked
+
   build:
-    name: Build and test x86-64 Flatpak
+    name: Build x86-64 Flatpak
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
@@ -27,16 +46,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Install build dependencies
-        run: |
-          # Fedora stores libXres's COPYING file in the RPM documentation.
-          dnf -y install --setopt=install_weak_deps=False --setopt=tsflags= \
-            git curl gcc gcc-c++ make pkgconf-pkg-config binutils python3 \
-            fontconfig-devel freetype-devel libxkbcommon-x11-devel libxcb-devel \
-            libX11-devel libXcursor-devel libXi-devel libXrandr-devel \
-            libXinerama-devel libXrender-devel libXfixes-devel libXext-devel \
-            wayland-devel openssl-devel vulkan-headers vulkan-loader-devel alsa-lib-devel \
-            flatpak libXres xprop ffmpeg-free
+      - name: Install Git and Python
+        run: dnf -y install git python3
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -44,7 +55,6 @@ jobs:
           persist-credentials: false
 
       - name: Check release tag
-        if: github.ref_type == 'tag'
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$GITHUB_REF_NAME" != "v$version" ]]; then
@@ -57,18 +67,16 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
-        with:
-          toolchain: 1.100.0
+      - uses: ./.github/actions/setup-linux-rust
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: fedora-44-linux-x86_64
+      - name: Build Playwake
+        run: cargo build --release --locked
 
-      - name: Test and build Playwake
+      - name: Install Flatpak packaging dependencies
         run: |
-          cargo test --release --locked
-          cargo build --release --locked
+          # Fedora stores libXres's COPYING file in the RPM documentation.
+          dnf -y install --setopt=install_weak_deps=False --setopt=tsflags= \
+            flatpak libXres xprop ffmpeg-free
 
       - name: Install Flatpak SDK and runtime
         run: |

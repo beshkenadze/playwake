@@ -1,0 +1,23 @@
+name: Set up Linux Rust build
+description: Install Fedora build dependencies, Rust, and the shared release cache.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust build dependencies
+      shell: bash
+      run: |
+        dnf -y install --setopt=install_weak_deps=False \
+          curl gcc gcc-c++ make pkgconf-pkg-config binutils \
+          fontconfig-devel freetype-devel libxkbcommon-x11-devel libxcb-devel \
+          libX11-devel libXcursor-devel libXi-devel libXrandr-devel \
+          libXinerama-devel libXrender-devel libXfixes-devel libXext-devel \
+          wayland-devel openssl-devel vulkan-headers vulkan-loader-devel alsa-lib-devel
+
+    - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+      with:
+        toolchain: 1.100.0
+
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        shared-key: fedora-44-linux-x86_64-release

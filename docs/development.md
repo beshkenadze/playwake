@@ -29,7 +29,7 @@ report the actual decoder dimensions separately from the requested size.
 
 On x86-64 SteamOS or Fedora 44, install Flatpak, the Freedesktop 26.08 SDK from
 Flathub, FFmpeg, binutils, libXRes and xprop, plus the Rust build dependencies
-listed in the [Linux workflow](../.github/workflows/linux.yml).
+listed in the [Linux setup action](../.github/actions/setup-linux-rust/action.yml).
 
 ```sh
 cargo test --release --locked
@@ -39,9 +39,9 @@ packaging/flatpak/build-bundle.sh target/release/playwake Playwake-steamos-x86_6
 
 ## Publish a release
 
-Pull requests and pushes to `main` run the Rust tests, build and smoke-test
-the Flatpak, and keep the bundle and its SHA-256 checksum as workflow artifacts.
-You can also run **Linux Flatpak** manually from the repository's Actions tab.
+Pull requests run the Rust tests. Pushing a version tag runs the tests, then
+builds and smoke-tests the Flatpak in a separate job. The publish job takes
+the bundle and SHA-256 checksum from the build job.
 
 To publish, update the package version in `Cargo.toml` and `Cargo.lock` and add
 the matching AppStream release entry in `packaging/flatpak/`. On `main`, tag
