@@ -6,7 +6,7 @@ mod media;
 mod session_store;
 mod xbox;
 
-use deck::{Action, Key, Menu};
+use deck::{Action, Key, Menu, Tab};
 use session_store::{Language, Preferences};
 use gpui_kit::*;
 use qrcode::{Color, QrCode};
@@ -124,7 +124,7 @@ impl RemotePlay {
         let native_window = x11_window(window);
         self.active_console = Some(console.clone());
         self.video_ready = false;
-        self.menu.settings = false;
+        self.menu.select_tab(Tab::Xbox);
         self.restore_windowed = native_window.is_some() && !window.is_fullscreen();
         if self.restore_windowed { window.toggle_fullscreen(); }
         let cancel = Arc::new(AtomicBool::new(false));
@@ -208,8 +208,7 @@ impl RemotePlay {
         let t = deck::Text(self.prefs.russian());
         let save = match action {
             Action::Settings | Action::Home => {
-                self.menu.settings = action == Action::Settings;
-                self.menu.row = None;
+                self.menu.select_tab(if action == Action::Settings { Tab::Settings } else { Tab::Xbox });
                 false
             }
             Action::Play(index) => {
@@ -219,7 +218,7 @@ impl RemotePlay {
                 }
                 false
             }
-            Action::SignIn => { self.menu.settings = false; self.start_login(); false }
+            Action::SignIn => { self.menu.select_tab(Tab::Xbox); self.start_login(); false }
             Action::Browser => {
                 if let Some(device) = &self.device { cx.open_url(&device.url); }
                 false
@@ -231,8 +230,7 @@ impl RemotePlay {
                 false
             }
             Action::Section(index) => {
-                self.menu.section = index;
-                self.menu.row = None;
+                self.menu.select_section(index);
                 false
             }
             Action::Refresh => { self.refresh_consoles(); false }
@@ -290,10 +288,6 @@ impl RemotePlay {
             if !self.video_ready && key == Key::Back { self.stop_stream(); }
             return;
         }
-        let nav = match key { Key::Up | Key::Left => -1, Key::Down | Key::Right => 1, _ => 0 };
-        let step = |index: usize, count: usize| -> usize {
-            if count == 0 { 0 } else { (index as isize + nav).rem_euclid(count as isize) as usize }
-        };
         if self.menu.confirming_sign_out || self.device.is_some() || self.sign_in.is_some() {
             match key {
                 Key::Back => self.activate(Action::Cancel, 1, window, cx),
@@ -301,38 +295,15 @@ impl RemotePlay {
                     let order = deck::order(self);
                     self.activate(order[usize::from(self.menu.browser_cancel).min(order.len() - 1)], 1, window, cx);
                 }
-                _ if nav != 0 => self.menu.browser_cancel = !self.menu.browser_cancel,
+                Key::Up | Key::Down | Key::Left | Key::Right => self.menu.browser_cancel = !self.menu.browser_cancel,
                 _ => {}
             }
-        } else if key == Key::Settings {
-            self.activate(if self.menu.settings { Action::Home } else { Action::Settings }, 1, window, cx);
-        } else if key == Key::Refresh {
-            self.refresh_consoles();
-        } else if self.menu.settings {
-            let actions = deck::setting_actions(self);
-            if let Some(row) = self.menu.row.filter(|row| *row < actions.len()) {
-                match key {
-                    Key::Back => self.menu.row = None,
-                    Key::Up | Key::Down => self.menu.row = Some(step(row, actions.len())),
-                    Key::Accept => self.activate(actions[row], 1, window, cx),
-                    Key::Left | Key::Right => if matches!(actions[row], Action::Resolution | Action::Bitrate | Action::Volume | Action::Language | Action::Palette) {
-                        self.activate(actions[row], nav, window, cx);
-                    },
-                    _ => {}
-                }
-            } else {
-                match key {
-                    Key::Back | Key::Left => self.activate(Action::Home, 1, window, cx),
-                    Key::Up | Key::Down => self.menu.section = step(self.menu.section, deck::section_labels(&deck::Text(false)).len()),
-                    Key::Right | Key::Accept if !actions.is_empty() => self.menu.row = Some(0),
-                    _ => {}
-                }
-            }
-        } else if key == Key::Accept {
-            let order = deck::order(self);
-            self.activate(order[self.menu.console.min(order.len() - 1)], 1, window, cx);
-        } else if nav != 0 {
-            self.menu.console = step(self.menu.console, self.consoles.len());
+            return;
+        }
+        let actions = deck::setting_actions(self);
+        let order = deck::order(self);
+        if let Some((action, direction)) = self.menu.navigate(key, &actions, &order) {
+            self.activate(action, direction, window, cx);
         }
     }
 

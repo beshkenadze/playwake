@@ -31,16 +31,20 @@ report the actual decoder dimensions separately from the requested size.
 ### Deck controls
 
 On Linux with Python evdev, use the D-pad or left stick to pick a console
-and **A** to play. **Menu** opens settings and **Y** refreshes the console list.
-In settings, move up and down through sections, enter a section with **A**
-or the right direction, and use left and right to adjust a focused value.
-**B** goes back. Arrow keys, Enter and Escape also work in the desktop menu.
+and **A** to play. **LB** opens Xbox, **RB** opens Settings, and **Y** refreshes
+the console list. Press up from the top of a content column to focus the
+tabs. Use left and right to choose a tab, **A** to open it, or down to return
+to the content. In Settings, right enters the section and left returns to
+the section list. Select an adjustable value with **A**, use left and right
+to change it, and press **A** again to finish. **B** also goes back. Arrow keys,
+Enter and Escape work in the desktop menu.
 
 ### Stream controls
 
 On SteamOS, the stream fills the fullscreen window and preserves the video's
-aspect ratio. Hold **View + Menu** together for half a second or right-click
-the video to open the right-hand panel above it. Use the D-pad and **A** to select
+aspect ratio. When video starts, a four-second prompt shows how to open the
+Playwake panel. Hold **View + Menu** together for half a second or right-click
+the video to open it. Use the D-pad and **A** to select
 **Resume**, **Xbox Guide**, **Statistics**, **Reconnect**, or **End stream**. Press
 **B** to resume. The menu pauses controller input to the Xbox and waits for
 the controls to return to neutral before resuming.

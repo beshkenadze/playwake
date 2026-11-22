@@ -373,7 +373,8 @@ def watch_menu_gamepad():
         for event in events:
             key = None
             if event.type == 1 and event.value == 1:
-                key = {304:'accept', 305:'back', 308:'refresh', 315:'settings',
+                key = {304:'accept', 305:'back', 308:'refresh', 310:'previous-tab',
+                       311:'next-tab', 315:'settings',
                        544:'up', 545:'down', 546:'left', 547:'right'}.get(event.code)
             elif event.type == 3 and event.code in (0, 1, 16, 17):
                 if event.code < 2:
@@ -675,6 +676,9 @@ class Player:
                                              int(command.get('buttons', 0)) & 0xffff,
                                              max(0, min(65535, int(command.get('lt', 0)))),
                                              max(0, min(65535, int(command.get('rt', 0)))))
+                case 'overlay-hint':
+                    if self.window and self.window.overlay:
+                        self.window.overlay.show_startup_hint()
                 case 'overlay-open':
                     self.set_overlay(True)
                 case 'overlay-close':
@@ -737,7 +741,11 @@ class Player:
         if not self.window_id and sys.platform.startswith('linux') and os.getenv('DISPLAY'):
             parent = int(os.getenv('GREENLIGHT_VIDEO_PARENT_XID', '0'), 0)
             if renderer != 'vulkan' or parent:
-                actions = (self.toggle_overlay, lambda index: emit('stream-overlay-key', key='select', index=index))
+                actions = (
+                    self.toggle_overlay,
+                    lambda index: emit('stream-overlay-key', key='select', index=index),
+                    lambda visible: emit('stream-overlay-hint', visible=visible),
+                )
                 self.window = X11VideoWindow(parent, self.loop.quit, adopt_vulkan=renderer == 'vulkan',
                                              overlay_actions=actions if interactive else None)
                 self.window_id = self.window.xid
