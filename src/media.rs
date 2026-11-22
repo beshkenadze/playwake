@@ -29,37 +29,97 @@ impl Drop for Player {
     }
 }
 
-fn player_script() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("ALLY_MEDIA_WORKER") { return Ok(path.into()); }
-    let exe = env::current_exe().map_err(|_| "Cannot locate the application")?;
-    let sibling = exe.parent().ok_or("Cannot locate media files")?.join("gstreamer_player.py");
-    if sibling.is_file() { return Ok(sibling); }
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("media/gstreamer_player.py");
-    if source.is_file() { Ok(source) } else { Err("GStreamer worker file is missing".into()) }
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Worker {
+    Python(PathBuf),
+    Native(PathBuf),
 }
 
-fn worker_command() -> Result<Command> {
-    let python = env::var_os("ALLY_GST_PYTHON")
-        .unwrap_or_else(|| if cfg!(target_os="windows") { "python.exe".into() } else { "python3".into() });
-    let mut cmd = Command::new(python);
-    cmd.arg(player_script()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+fn classify(path: PathBuf) -> Result<Worker> {
+    if path.extension().is_some_and(|ext| ext == "py") { return Ok(Worker::Python(path)); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(&path)
+            .map_err(|_| format!("Media worker is missing: {}", path.display()))?;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!("Media worker is not executable: {}", path.display()).into());
+        }
+    }
+    Ok(Worker::Native(path))
+}
+
+fn resolve_worker(override_path: Option<PathBuf>, sibling: Option<PathBuf>, source: PathBuf) -> Result<Worker> {
+    if let Some(path) = override_path { return classify(path); }
+    // Native worker first; the Python worker stays as a one-release fallback
+    // for installs that predate the native bundle.
+    if let Some(dir) = sibling.as_ref().and_then(|path| path.parent()) {
+        let native = dir.join("playwake-media");
+        if native.is_file() { return classify(native); }
+    }
+    if let Some(sibling) = sibling.filter(|path| path.is_file()) { return Ok(Worker::Python(sibling)); }
+    if source.is_file() { Ok(Worker::Python(source)) } else { Err("GStreamer worker file is missing".into()) }
+}
+
+fn worker() -> Result<Worker> {
+    if let Some(path) = env::var_os("ALLY_MEDIA_WORKER") { return classify(path.into()); }
+    let exe = env::current_exe().map_err(|_| "Cannot locate the application")?;
+    let sibling = exe.parent().map(|dir| dir.join("gstreamer_player.py"));
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("media/gstreamer_player.py");
+    resolve_worker(None, sibling, source)
+}
+
+fn runtime_env(root: &std::path::Path, plugin_path: Option<std::ffi::OsString>, lib_path: Option<std::ffi::OsString>)
+    -> Result<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut plugins = vec![root.join("gstreamer-1.0")];
+    if let Some(value) = plugin_path { plugins.extend(env::split_paths(&value)); }
+    let mut libs = vec![root.to_path_buf()];
+    if let Some(value) = lib_path { libs.extend(env::split_paths(&value)); }
+    Ok((env::join_paths(plugins).map_err(|_| "Invalid GStreamer plugin path")?,
+        env::join_paths(libs).map_err(|_| "Invalid GStreamer library path")?))
+}
+
+fn apply_runtime_env(cmd: &mut Command) -> Result<()> {
     if let Some(root) = env::var_os("ALLY_GST_RUNTIME") {
         let root = PathBuf::from(root);
         if !root.is_dir() { return Err("GStreamer runtime directory is missing".into()); }
-        let mut plugins = vec![root.join("gstreamer-1.0")];
-        if let Some(value) = env::var_os("GST_PLUGIN_PATH") { plugins.extend(env::split_paths(&value)); }
-        cmd.env("GST_PLUGIN_PATH", env::join_paths(plugins).map_err(|_| "Invalid GStreamer plugin path")?);
         let variable = if cfg!(target_os="windows") { "PATH" }
             else if cfg!(target_os="macos") { "DYLD_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
-        let mut libs = vec![root];
-        if let Some(value) = env::var_os(variable) { libs.extend(env::split_paths(&value)); }
-        cmd.env(variable, env::join_paths(libs).map_err(|_| "Invalid GStreamer library path")?);
+        let (plugins, libs) = runtime_env(&root, env::var_os("GST_PLUGIN_PATH"), env::var_os(variable))?;
+        cmd.env("GST_PLUGIN_PATH", plugins).env(variable, libs);
     }
+    Ok(())
+}
+
+fn python_command(script: &std::path::Path) -> Result<Command> {
+    let python = env::var_os("ALLY_GST_PYTHON")
+        .unwrap_or_else(|| if cfg!(target_os="windows") { "python.exe".into() } else { "python3".into() });
+    let mut cmd = Command::new(python);
+    cmd.arg(script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    apply_runtime_env(&mut cmd)?;
     Ok(cmd)
 }
 
+fn native_command(path: &std::path::Path) -> Result<Command> {
+    let mut cmd = Command::new(path);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    apply_runtime_env(&mut cmd)?;
+    Ok(cmd)
+}
+
+fn worker_command() -> Result<Command> {
+    match worker()? {
+        Worker::Python(script) => python_command(&script),
+        Worker::Native(path) => native_command(&path),
+    }
+}
+
 pub fn menu_input(send: impl Fn(crate::deck::Key) + Send + 'static) -> Result<Player> {
-    let mut child = worker_command()?.arg("--menu-input").spawn().map(Player)
+    let mut cmd = match worker()? {
+        Worker::Python(script) => python_command(&script)?,
+        Worker::Native(path) => native_command(&path)?,
+    };
+    let mut child = cmd.arg("--menu-input").spawn().map(Player)
         .map_err(|_| "Could not start menu controller".to_string())?;
     let output = child.0.stdout.take().ok_or("Missing menu controller output")?;
     thread::spawn(move || {
@@ -80,7 +140,7 @@ fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, prefs: Pref
     if let Some(window) = window {
         cmd.env("GREENLIGHT_VIDEO_PARENT_XID", window.xid.to_string());
     }
-    cmd.spawn().map(Player).map_err(|_| "Could not launch Python/GStreamer. Check the runtime installation.".into())
+    cmd.spawn().map(Player).map_err(|_| "Could not launch the media worker. Check the runtime installation.".into())
 }
 
 fn command(player: &mut Player, message: Value) -> Result<()> {
@@ -506,7 +566,9 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
                         journal::record("latency_sample_rejected", json!({"requested_height": requested_height, "reason": reason}));
                     }
                     Some("error") => {
-                        journal::record("gstreamer_error", json!({}));
+                        journal::record("gstreamer_error", json!({
+                            "message": event.get("message").and_then(Value::as_str).unwrap_or("GStreamer playback failed"),
+                        }));
                         return Err(event.get("message").and_then(Value::as_str)
                             .unwrap_or("GStreamer playback failed").to_owned());
                     }
@@ -574,5 +636,92 @@ pub fn focus_gamescope(xid: u64) {
 }
 
 pub fn runtime_available() -> bool {
-    player_script().is_ok_and(|path| fs::metadata(path).is_ok_and(|metadata| metadata.is_file()))
+    match worker() {
+        Ok(Worker::Python(path)) => path.is_file(),
+        Ok(Worker::Native(_)) => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp dir")
+    }
+
+    #[test]
+    fn override_py_is_python_even_when_missing() {
+        let dir = temp_dir();
+        let script = dir.path().join("worker.py");
+        assert_eq!(resolve_worker(Some(script.clone()), None, dir.path().join("none.py")).unwrap(),
+            Worker::Python(script));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn override_native_requires_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let bin = dir.path().join("playwake-media");
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = resolve_worker(Some(bin.clone()), None, dir.path().join("none.py")).unwrap_err();
+        assert!(error.contains("not executable"), "{error}");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_worker(Some(bin.clone()), None, dir.path().join("none.py")).unwrap(),
+            Worker::Native(bin));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn override_native_missing_file_errors() {
+        let dir = temp_dir();
+        let error = resolve_worker(Some(dir.path().join("absent")), None, dir.path().join("none.py")).unwrap_err();
+        assert!(error.contains("missing"), "{error}");
+    }
+
+    #[test]
+    fn sibling_python_wins_over_source() {
+        let dir = temp_dir();
+        let sibling = dir.path().join("gstreamer_player.py");
+        let source = dir.path().join("source.py");
+        fs::write(&sibling, b"").unwrap();
+        fs::write(&source, b"").unwrap();
+        assert_eq!(resolve_worker(None, Some(sibling.clone()), source).unwrap(), Worker::Python(sibling));
+    }
+
+    #[test]
+    fn source_python_used_without_sibling() {
+        let dir = temp_dir();
+        let source = dir.path().join("source.py");
+        fs::write(&source, b"").unwrap();
+        assert_eq!(resolve_worker(None, Some(dir.path().join("absent.py")), source.clone()).unwrap(),
+            Worker::Python(source));
+    }
+
+    #[test]
+    fn missing_everything_errors() {
+        let dir = temp_dir();
+        assert!(resolve_worker(None, Some(dir.path().join("absent.py")), dir.path().join("none.py")).is_err());
+    }
+
+    #[test]
+    fn runtime_env_prepends_and_preserves() {
+        let dir = temp_dir();
+        let root = dir.path().join("runtime");
+        fs::create_dir(&root).unwrap();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let existing = std::ffi::OsString::from(format!("/old/plugins{sep}/more"));
+        let (plugins, libs) = runtime_env(&root, Some(existing.clone()), Some(existing)).unwrap();
+        let plugins = plugins.to_string_lossy().into_owned();
+        let libs = libs.to_string_lossy().into_owned();
+        assert!(plugins.starts_with(&root.join("gstreamer-1.0").to_string_lossy().into_owned()), "{plugins}");
+        assert!(plugins.contains("/old/plugins"), "{plugins}");
+        assert!(plugins.ends_with("/more"), "{plugins}");
+        assert!(libs.starts_with(&root.to_string_lossy().into_owned()), "{libs}");
+        assert!(libs.ends_with("/more"), "{libs}");
+    }
 }

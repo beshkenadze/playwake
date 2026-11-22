@@ -3,6 +3,10 @@ name = "playwake"
 version = "0.1.1"
 edition = "2024"
 
+[workspace]
+members = ["media-worker"]
+default-members = ["."]
+
 [dependencies]
 gpui-kit = "=0.10.0"
 qrcode = { version = "0.14", default-features = false }

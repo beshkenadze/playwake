@@ -677,7 +677,7 @@ class Player:
         if self.rtc is None:
             raise RuntimeError('GStreamer webrtcbin is unavailable')
         self.rtc.set_property('bundle-policy', GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
-        self.rtc.set_property('latency', 20)
+        self.rtc.set_property('latency', int(os.getenv('ALLY_JITTER_MS', '20')))
         self.pipeline.add(self.rtc)
         self.rtc.connect('on-ice-candidate', self.candidate)
         self.rtc.connect('pad-added', self.link_track)
@@ -1246,6 +1246,9 @@ class Player:
                 choices = ('vtdec_hw', 'vtdec', 'avdec_h264')
             else:
                 choices = ('vah264dec', 'avdec_h264')
+            override = os.getenv('ALLY_DECODER')
+            if override:
+                choices = (override,) + tuple(c for c in choices if c != override)
             self.decoder_name = next((name for name in choices if Gst.ElementFactory.find(name)), None)
             if not self.decoder_name:
                 emit('error', message='GStreamer H.264 decoder unavailable')
@@ -1253,12 +1256,18 @@ class Player:
             upscale = LanczosUpscale.pipeline if self.upscale_requested and self.window else ''
             if self.renderer == 'vulkan':
                 download = 'vapostproc ! video/x-raw,format=NV12 ! ' if self.decoder_name == 'vah264dec' else ''
+                if self.decoder_name == 'vulkanh264dec':
+                    download = ''
                 queue = 'queue name=video_queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! '
                 self.motion_in_parallel = (self.benchmark and self.decoder_name == 'vah264dec'
                                            and os.getenv('ALLY_VULKAN_MOTION_PROBE') != 'inline')
                 convert_on_gpu = (self.decoder_name == 'vah264dec' and os.getenv('ALLY_VULKAN_CONVERSION') != 'cpu'
                                   and Gst.ElementFactory.find('vulkancolorconvert') is not None)
-                if convert_on_gpu:
+                if self.decoder_name == 'vulkanh264dec':
+                    self.vulkan_conversion = 'vk_zero_copy'
+                    conversion = ('vulkancolorconvert ! '
+                                  'video/x-raw(memory:VulkanImage),format=BGRA ! vulkansink')
+                elif convert_on_gpu:
                     self.vulkan_conversion = 'gpu_nv12'
                     conversion = gpu_vulkan_output()
                 else:
@@ -1269,6 +1278,8 @@ class Player:
                 options = 'sync=false force-aspect-ratio=true'
             elif self.window_id:
                 download = 'vapostproc ! video/x-raw,format=NV12 ! ' if self.decoder_name == 'vah264dec' else ''
+                if self.decoder_name == 'vulkanh264dec':
+                    download = 'vulkandownload ! '
                 video_output = download + upscale + 'videoconvert ! video/x-raw,format=BGRx ! ximagesink'
                 options = 'sync=false force-aspect-ratio=true'
             else:
@@ -1279,8 +1290,13 @@ class Player:
                 '! videoscale method=0 ! video/x-raw,format=NV12,width=640,height=360 '
                 '! fakesink name=motion_sink sync=false async=false'
             ) if self.motion_in_parallel else ''
+            decoder_opts = os.getenv('ALLY_DECODER_OPTS', '')
+            if decoder_opts:
+                factory = Gst.ElementFactory.find(self.decoder_name)
+                decoder_opts = ' '.join(part for part in decoder_opts.split()
+                                        if factory is not None and factory.find_property(part.split('=')[0]))
             branch = Gst.parse_bin_from_description(
-                f'rtph264depay name=depay ! h264parse name=parser ! {self.decoder_name} name=decoder ! '
+                f'rtph264depay name=depay ! h264parse name=parser ! {self.decoder_name} {decoder_opts} name=decoder ! '
                 f'{video_output} name=video_sink {options}{motion_branch}', True)
             self.video_sink = branch.get_by_name('video_sink')
             if upscale:
@@ -1302,7 +1318,9 @@ class Player:
                 self.video_queue.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.queue_input)
                 self.video_queue.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, self.queue_output)
             if self.renderer == 'vulkan' and self.benchmark:
-                branch.get_by_name('upload').get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.before_vulkan_upload)
+                upload = branch.get_by_name('upload')
+                if upload is not None:
+                    upload.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.before_vulkan_upload)
                 sink_pad.add_probe(Gst.PadProbeType.BUFFER, self.vulkan_frame)
                 if self.motion_in_parallel:
                     branch.get_by_name('motion_queue').get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.motion_gate)
