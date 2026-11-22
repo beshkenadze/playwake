@@ -209,6 +209,14 @@ class X11VideoWindow:
             self.xres.XResGetClientPid.restype = int_
             self.xres.XResClientIdsDestroy.argtypes = [c.c_long, pointer(XResClientIdValue)]
             self.xres.XResClientIdsDestroy.restype = None
+            # XRes reports PIDs in the X server's namespace, which can differ
+            # from the worker's PID namespace in a Flatpak.
+            reference = self.x11.XCreateSimpleWindow(self.display, self.parent, 0, 0, 1, 1, 0, 0, 0)
+            try:
+                self.x11.XSync(self.display, False)
+                self.x11_pid = self.window_client_pid(reference)
+            finally:
+                self.x11.XDestroyWindow(self.display, reference)
             self.previous_windows = self.root_windows()
             self.timer = GLib.timeout_add(80, self.update)
             return
@@ -255,21 +263,25 @@ class X11VideoWindow:
             if children:
                 self.x11.XFree(children)
 
-    def owns_window(self, xid):
+    def window_client_pid(self, xid):
         spec = XResClientIdSpec(xid, 2)  # XRES_CLIENT_ID_PID_MASK
         count = c.c_long()
         values = c.POINTER(XResClientIdValue)()
         self.xres.XResQueryClientIds(self.display, 1, c.byref(spec), c.byref(count), c.byref(values))
         try:
-            return any(self.xres.XResGetClientPid(c.byref(values[i])) == os.getpid()
-                       for i in range(count.value)) if values else False
+            if values:
+                for index in range(count.value):
+                    pid = self.xres.XResGetClientPid(c.byref(values[index]))
+                    if pid > 0:
+                        return pid
+            return None
         finally:
             if values:
                 self.xres.XResClientIdsDestroy(count, values)
 
     def embed_vulkan_window(self):
         for xid in self.root_windows() - self.previous_windows:
-            if self.owns_window(xid):
+            if self.x11_pid is not None and self.window_client_pid(xid) == self.x11_pid:
                 self.xid = xid
                 self.size = self.dimensions()
                 self.x11.XReparentWindow(self.display, xid, self.parent, 0, 0)

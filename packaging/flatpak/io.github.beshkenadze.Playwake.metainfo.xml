@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.beshkenadze.Playwake</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Playwake</name>
+  <summary>Stream games from an Xbox console or Xbox Cloud Gaming</summary>
+  <description>
+    <p>Playwake supports Xbox Remote Play and Xbox Cloud Gaming with a handheld-friendly interface, gamepad controls and live stream diagnostics.</p>
+  </description>
+  <launchable type="desktop-id">io.github.beshkenadze.Playwake.desktop</launchable>
+  <url type="homepage">https://github.com/beshkenadze/playwake</url>
+  <url type="bugtracker">https://github.com/beshkenadze/playwake/issues</url>
+  <developer id="io.github.beshkenadze">
+    <name>beshkenadze</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-22"/>
+  </releases>
+</component>
