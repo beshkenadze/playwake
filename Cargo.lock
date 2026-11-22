@@ -5038,11 +5038,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "playwake"
-<<<<<<< HEAD
-version = "0.1.1"
-=======
-version = "0.1.0"
->>>>>>> 7ad6659 (Add native Rust media worker (playwake-media) on gstreamer-rs)
+version = "0.1.2"
 dependencies = [
  "gilrs",
  "gpui-kit",
@@ -5053,14 +5049,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "url",
-<<<<<<< HEAD
  "uuid",
-=======
 ]
 
 [[package]]
 name = "playwake-media"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "cairo-rs",
  "evdev",
@@ -5075,7 +5069,6 @@ dependencies = [
  "uuid",
  "x11-dl",
  "x11rb",
->>>>>>> 7ad6659 (Add native Rust media worker (playwake-media) on gstreamer-rs)
 ]
 
 [[package]]
