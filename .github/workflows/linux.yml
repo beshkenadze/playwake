@@ -51,7 +51,8 @@ jobs:
             echo "::error::Release tag must be v$version to match Cargo.toml."
             exit 1
           fi
-          if ! git merge-base --is-ancestor HEAD origin/main; then
+          # The container user differs from the owner of the runner workspace.
+          if ! git -c safe.directory="$GITHUB_WORKSPACE" merge-base --is-ancestor HEAD origin/main; then
             echo "::error::Tag a commit on main to publish a release."
             exit 1
           fi
