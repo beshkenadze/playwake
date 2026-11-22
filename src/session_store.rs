@@ -98,9 +98,19 @@ pub fn load_preferences() -> Preferences {
         .and_then(|path| fs::File::open(path.with_extension("preferences.json")).ok())
         .and_then(|file| serde_json::from_reader(file).ok())
         .unwrap_or_default();
+    prefs.height = supported_stream_height(prefs.height);
     prefs.bitrate_mbps = prefs.bitrate_mbps.clamp(5, 40);
     prefs.volume = prefs.volume.min(100);
     prefs
+}
+
+fn supported_stream_height(saved: u32) -> u32 {
+    // The retired 800p and 900p aliases could leave Xbox at 1440p.
+    match saved {
+        720 | 800 | 900 => 720,
+        1440 => 1440,
+        _ => 1080,
+    }
 }
 
 pub fn save_preferences(prefs: Preferences) -> io::Result<()> {
@@ -141,5 +151,15 @@ mod tests {
         assert_eq!(prefs.bitrate_mbps, 20);
         assert_eq!(prefs.volume, 100);
         assert!(!prefs.auto_connect);
+    }
+
+    #[test]
+    fn old_custom_resolutions_use_the_lower_supported_xbox_preset() {
+        for saved in [800, 900] {
+            assert_eq!(supported_stream_height(saved), 720);
+        }
+        for supported in [720, 1080, 1440] {
+            assert_eq!(supported_stream_height(supported), supported);
+        }
     }
 }

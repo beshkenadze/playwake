@@ -314,6 +314,8 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
                         "viewport_width": event.get("viewportWidth").and_then(Value::as_u64),
                         "viewport_height": event.get("viewportHeight").and_then(Value::as_u64),
                         "decoded_fps": event.get("decodedFps").and_then(Value::as_f64),
+                        "present_fps": event.get("presentFps").and_then(Value::as_f64),
+                        "display_hz": event.get("displayHz").and_then(Value::as_u64),
                         "video_mbps": event.get("videoMbps").and_then(Value::as_f64),
                         "limit_kbps": event.get("limitKbps").and_then(Value::as_u64),
                         "rtt_ms": event.get("rttMs").and_then(Value::as_f64),

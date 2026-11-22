@@ -74,6 +74,7 @@ class StreamOverlay:
         self.selection = 0
         self.metrics = ()
         self.compact = '—'
+        self.compact_rate = '—'
         self.russian = False
         self.xbox_palette = False
         self.console_name = 'Xbox'
@@ -125,7 +126,7 @@ class StreamOverlay:
         if self.menu:
             logical_width, logical_height = 440, height / self.scale
         else:
-            logical_width, logical_height = (570, 119) if hint else (430, 31)
+            logical_width, logical_height = (570, 119) if hint else (490, 49)
         w, h = (max(1, round(value * self.scale)) for value in (logical_width, logical_height))
         if self.menu:
             x, y = width - w, 0
@@ -134,7 +135,7 @@ class StreamOverlay:
         else:
             x = y = round(12 * self.scale)
         layout = (mode, x, y, w, h)
-        frame = (layout, self.selection, self.diagnostics, self.compact,
+        frame = (layout, self.selection, self.diagnostics, self.compact, self.compact_rate,
                  self.metrics if self.menu and self.diagnostics else ())
         if self.rendered == frame:
             return
@@ -203,7 +204,8 @@ class StreamOverlay:
                 lib.cairo_arc(ctx, 36, 79, 4, 0, 6.284)
                 lib.cairo_fill(ctx)
                 text(48, 85, label('Стрим идёт', 'Streaming'), 16, color=accent)
-                text(32, 117, self.compact, 13, color=muted, max_width=width - 64)
+                text(32, 111, self.compact_rate, 13, color=muted, max_width=width - 64)
+                text(32, 131, self.compact, 13, color=muted, max_width=width - 64)
                 diagnostics = label('Скрыть статистику', 'Hide statistics') if self.diagnostics else label('Статистика', 'Statistics')
                 names = (label('Продолжить', 'Resume'), 'Xbox Guide', diagnostics,
                          label('Переподключить', 'Reconnect'), label('Завершить стрим', 'End stream'))
@@ -232,7 +234,8 @@ class StreamOverlay:
                 self.draw_control_layout(ctx, rect, text, accent)
             else:
                 rect(0, 0, width, height, (0.08, 0.09, 0.09))
-                text(10, 21, self.compact, 13, max_width=width - 20)
+                text(10, 19, self.compact_rate, 13, max_width=width - 20)
+                text(10, 37, self.compact, 13, max_width=width - 20)
         finally:
             lib.cairo_destroy(ctx)
             lib.cairo_surface_destroy(surface)
