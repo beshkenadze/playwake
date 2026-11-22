@@ -1,4 +1,4 @@
-use crate::{journal, lsfg, session_store::Preferences};
+use crate::{cloud, journal, lsfg, session_store::Preferences};
 use crate::xbox::{Console, Resolution, Result, Xbox};
 use serde_json::{Value, json};
 use std::{
@@ -70,10 +70,10 @@ pub fn menu_input(send: impl Fn(crate::deck::Key) + Send + 'static) -> Result<Pl
     Ok(child)
 }
 
-fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, interactive: bool) -> Result<Player> {
+fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, prefs: Preferences, interactive: bool) -> Result<Player> {
     let mut cmd = worker_command()?;
     if let Some(lsfg) = lsfg {
-        lsfg.configure(&mut cmd)?;
+        lsfg.configure(&mut cmd, prefs)?;
     } else if interactive {
         cmd.env("DISABLE_LSFGVK", "1").env("DISABLE_LSFG", "1");
     }
@@ -115,7 +115,56 @@ pub enum StreamEvent {
 
 pub enum OverlayKey { Left, Right, Activate, Back, Select(usize) }
 
-pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: Option<VideoWindow>,
+pub fn preview(window: VideoWindow, resolution: Resolution, prefs: Preferences, cancel: Arc<AtomicBool>,
+               notify: impl Fn(PreviewEvent)) -> Result<()> {
+    let runtime = prefs.lsfg_enabled.then(lsfg::Runtime::discover).transpose()?;
+    let mut player = launch(Some(window), runtime.as_ref(), prefs, true)?;
+    let output = player.0.stdout.take().ok_or("Missing GStreamer output pipe")?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(std::result::Result::ok) {
+            if let Ok(event) = serde_json::from_str::<Value>(&line)
+                && tx.send(event).is_err() { break; }
+        }
+    });
+    let (width, height) = resolution.dimensions();
+    command(&mut player, json!({"action":"preview","width":width,"height":height,"lsfg":prefs.lsfg_enabled,
+        "performance":prefs.lsfg_performance,"flow_scale":prefs.lsfg_flow_scale(),"russian":prefs.russian(),
+        "xbox_palette":prefs.xbox_palette}))?;
+    journal::record("lsfg_preview_started", json!({"width":width,"height":height,"lsfg":prefs.lsfg_enabled,
+        "performance":prefs.lsfg_performance,"flow_scale":prefs.lsfg_flow_scale()}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while !cancel.load(Ordering::Relaxed) {
+        if !ready && Instant::now() >= deadline { return Err("The LSFG preview did not start".into()); }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(event) => match event["event"].as_str() {
+                Some("video") if !ready => { ready = true; notify(PreviewEvent::Ready); }
+                Some("preview-toggle") => notify(PreviewEvent::Toggle),
+                Some("preview-back") => notify(PreviewEvent::Back),
+                Some("preview-stats") => journal::record("lsfg_preview_sample", json!({
+                    "lsfg":prefs.lsfg_enabled,"source_fps":event["sourceFps"].as_f64(),
+                    "present_fps":event["presentFps"].as_f64(),"display_hz":event["displayHz"].as_u64(),
+                })),
+                Some("error") => return Err(event["message"].as_str().unwrap_or("The LSFG preview failed").into()),
+                _ => {},
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("The LSFG preview closed".into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {},
+        }
+    }
+    Ok(())
+}
+
+pub enum PreviewEvent { Ready, Toggle, Back }
+
+#[derive(Clone)]
+pub enum Target {
+    Home(Console),
+    Cloud(cloud::Game),
+}
+
+pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: Option<VideoWindow>,
             cancel: Arc<AtomicBool>, run: Run, controls: Option<mpsc::Receiver<StreamCommand>>,
             notify: impl Fn(StreamEvent)) -> Result<()> {
     let status = |message| notify(StreamEvent::Status(message));
@@ -131,15 +180,29 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
     } else { None };
     let vulkan = enable_lsfg || matches!(run, Run::Vulkan) || env::var("ALLY_VIDEO_RENDERER").as_deref() == Ok("vulkan");
     let renderer = if vulkan { "vulkan" } else { "auto" };
-    let bitrate = if interactive { prefs.bitrate_mbps * 1000 } else if benchmark { 20000 } else { 20480 };
-    journal::record("stream_requested", json!({"bitrate_limit_kbps": bitrate, "width": requested_width, "height": requested_height,
+    let is_cloud = matches!(&target, Target::Cloud(..));
+    let bitrate = (!is_cloud).then_some(if interactive { prefs.bitrate_mbps * 1000 } else if benchmark { 20000 } else { 20480 });
+    let provider = if is_cloud { "cloud" } else { "remote_play" };
+    journal::record("stream_requested", json!({"provider":provider,"bitrate_limit_kbps": bitrate, "width": requested_width, "height": requested_height,
         "renderer": renderer, "lsfg_requested": enable_lsfg || (!interactive && vulkan
             && env::var("LSFGVK_ENV").as_deref() == Ok("1") && env::var("DISABLE_LSFGVK").as_deref() != Ok("1"))}));
-    let path = xbox.reserve(&console, resolution)?;
+    let (mut xbox, path, title) = match target {
+        Target::Home(console) => {
+            let xbox = account.home()?;
+            let path = xbox.reserve(&console, resolution)?;
+            let title = if console.name.is_empty() { console.model } else { console.name };
+            (xbox, path, title)
+        }
+        Target::Cloud(game) => {
+            let (xbox, _) = cloud::connect(&account)?;
+            let path = cloud::reserve(&xbox, &game, resolution)?;
+            (xbox, path, game.name)
+        }
+    };
     let result = (|| {
-        xbox.provision(&path, &cancel)?;
-        journal::record("stream_provisioned", json!({}));
-        let mut player = launch(window, lsfg.as_ref(), interactive)?;
+        let config = xbox.provision(&path, &cancel, &status)?;
+        journal::record("stream_provisioned", json!({"provider":provider,"stun_configured":config.stun.is_some()}));
+        let mut player = launch(window, lsfg.as_ref(), prefs, interactive)?;
         let output = player.0.stdout.take().ok_or("Missing GStreamer output pipe")?;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -151,10 +214,12 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
         });
         command(&mut player, json!({"action":"start","bitrate":bitrate,"width":requested_width,
             "height":requested_height,"benchmark":benchmark,"capture_diagnostics":matches!(run, Run::Transport),
-            "renderer":renderer,"lsfg":enable_lsfg,"interactive":interactive,
+            "renderer":renderer,"lsfg":enable_lsfg,"interactive":interactive,"cloud":is_cloud,"stun":config.stun,
+            "lanczos_upscale":interactive && window.is_some() && prefs.lanczos_upscale,
             "russian":prefs.russian(),"xbox_palette":prefs.xbox_palette,"compact_stats":prefs.compact_stats,
+            "control_layout": crate::device::current().id, "control_device": crate::device::current().name,
             "volume": if prefs.mute { 0 } else { prefs.volume },
-            "console_name": if console.name.is_empty() { &console.model } else { &console.name }}))?;
+            "console_name":title}))?;
         status("Negotiating the GStreamer connection…".into());
         let start = Instant::now();
         let mut keepalive = Instant::now();
@@ -203,7 +268,7 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                 journal::record("first_video_timeout", json!({}));
                 return Err("GStreamer did not receive video before the timeout".into());
             }
-            if keepalive.elapsed() >= Duration::from_secs(30) {
+            if keepalive.elapsed() >= config.heartbeat {
                 xbox.keepalive(&path)?;
                 keepalive = Instant::now();
             }
@@ -220,12 +285,50 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         let answer = xbox.sdp(&path, offer)?;
                         command(&mut player, json!({"action":"answer","sdp":answer}))?;
                     }
-                    Some("answer-set") => answer_set = true,
+                    Some("answer-set") => {
+                        answer_set = true;
+                        if is_cloud { journal::record("cloud_sdp_accepted", json!({})); }
+                    }
+                    Some("connection") if is_cloud => {
+                        let state = event.get("state").and_then(Value::as_str)
+                            .filter(|state| matches!(*state, "new" | "connecting" | "connected" | "disconnected" | "failed" | "closed"));
+                        journal::record("cloud_peer_state", json!({"state":state}));
+                    }
+                    Some("ice-connection" | "cloud-ice-applied" | "cloud-answer-info") if is_cloud => {
+                        let state = event.get("state").and_then(Value::as_str)
+                            .filter(|state| matches!(*state, "new" | "checking" | "connected" | "completed" | "disconnected" | "failed" | "closed"));
+                        journal::record("cloud_webrtc_stage", json!({
+                            "kind": event.get("event"), "state":state, "applied":event.get("count").and_then(Value::as_u64),
+                            "video":event.get("video").and_then(Value::as_u64),
+                            "inactive":event.get("inactive").and_then(Value::as_u64),
+                            "sendonly":event.get("sendonly").and_then(Value::as_u64),
+                            "bundle":event.get("bundle").and_then(Value::as_bool),
+                            "embedded_candidates":event.get("embeddedCandidates").and_then(Value::as_u64),
+                            "ice_lite":event.get("iceLite").and_then(Value::as_bool),
+                            "audio_port_open":event.get("audioPortOpen").and_then(Value::as_bool),
+                            "video_port_open":event.get("videoPortOpen").and_then(Value::as_bool),
+                            "data_port_open":event.get("dataPortOpen").and_then(Value::as_bool),
+                        }));
+                    }
+                    Some("cloud-ice-rejected") if is_cloud => journal::record("cloud_ice_rejected", json!({
+                        "reason":event.get("reason").and_then(Value::as_str)
+                            .filter(|reason| matches!(*reason, "unknown_mline" | "address_format" | "candidate_syntax" | "other")),
+                        "address_family":event.get("addressFamily").and_then(Value::as_u64),
+                        "media_line":event.get("mediaLine").and_then(Value::as_u64),
+                        "field_count":event.get("fieldCount").and_then(Value::as_u64),
+                        "candidate_type":event.get("candidateType").and_then(Value::as_str)
+                            .filter(|kind| matches!(*kind, "host" | "srflx" | "prflx" | "relay")),
+                    })),
+                    Some("input-ready") if is_cloud => journal::record("cloud_input_ready", json!({})),
                     Some("candidates") => candidates = event.get("candidates").cloned(),
                     Some("lsfg-ready") => journal::record("lsfg_layer_loaded", json!({
-                        "multiplier": 2, "performance_mode": true, "flow_scale": 1.0,
+                        "multiplier": 2, "performance_mode": prefs.lsfg_performance,
+                        "flow_scale": if prefs.lsfg_flow_percent == 75 { 0.75 } else { 1.0 },
                     })),
                     Some("vulkan-window-embedded") => journal::record("vulkan_window_embedded", json!({})),
+                    Some("stream-overlay-handoff") => journal::record("stream_overlay_handoff", json!({
+                        "active": event.get("active").and_then(Value::as_bool),
+                    })),
                     Some("stream-overlay-hint") => journal::record("stream_overlay_hint", json!({
                         "visible": event.get("visible").and_then(Value::as_bool),
                     })),
@@ -256,9 +359,12 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         "viewport_width": event.get("viewportWidth").and_then(Value::as_u64),
                         "viewport_height": event.get("viewportHeight").and_then(Value::as_u64),
                         "decoded_fps": event.get("decodedFps").and_then(Value::as_f64),
+                        "present_fps": event.get("presentFps").and_then(Value::as_f64),
+                        "display_hz": event.get("displayHz").and_then(Value::as_u64),
                         "video_mbps": event.get("videoMbps").and_then(Value::as_f64),
                         "limit_kbps": event.get("limitKbps").and_then(Value::as_u64),
                         "rtt_ms": event.get("rttMs").and_then(Value::as_f64),
+                        "video_client_ms": event.get("videoClientMs").and_then(Value::as_f64),
                         "jitter_ms": event.get("jitterMs").and_then(Value::as_f64),
                         "rtp_lost": event.get("rtpLost").and_then(Value::as_i64),
                         "queue_depth": event.get("queueDepth").and_then(Value::as_u64),
@@ -269,6 +375,14 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         "width": event.get("width").and_then(Value::as_u64),
                         "height": event.get("height").and_then(Value::as_u64),
                     })),
+                    Some("video-scaling") => {
+                        let scaling = event.get("method").and_then(Value::as_str)
+                            .filter(|method| matches!(*method, "lanczos" | "fit"));
+                        journal::record("video_scaling", json!({"method":scaling,
+                            "source_width":event["sourceWidth"].as_u64(),"source_height":event["sourceHeight"].as_u64(),
+                            "output_width":event["outputWidth"].as_u64(),"output_height":event["outputHeight"].as_u64(),
+                        }));
+                    }
                     Some("stream-input-focus") => journal::record("stream_input_focus", json!({
                         "active":event.get("active").and_then(Value::as_bool),
                     })),
@@ -306,7 +420,7 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                             Some(name @ ("cpu_bgra" | "gpu_nv12")) => Some(name),
                             _ => None,
                         };
-                        journal::record("video_active", json!({"width": width, "height": height, "decoder": decoder,
+                        journal::record("video_active", json!({"provider":provider,"width": width, "height": height, "decoder": decoder,
                             "requested_width": requested_width, "requested_height": requested_height, "renderer":sink,
                             "conversion":conversion,
                             "motion_probe": event.get("motionProbe").and_then(Value::as_str).filter(|value| matches!(*value, "inline" | "parallel"))}));
@@ -403,6 +517,7 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
             }
             if answer_set && candidates.is_some() {
                 let remote = xbox.ice(&path, candidates.take().unwrap_or_default())?;
+                if is_cloud { journal::record("cloud_ice_accepted", json!({"candidate_count":remote.as_array().map(Vec::len)})); }
                 command(&mut player, json!({"action":"ice","candidates":remote}))?;
             }
         }

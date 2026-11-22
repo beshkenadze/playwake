@@ -156,21 +156,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "playwake"
-version = "0.1.0"
-dependencies = [
- "gilrs",
- "gpui-kit",
- "qrcode",
- "raw-window-handle",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "url",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4741,6 +4726,22 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "playwake"
+version = "0.1.0"
+dependencies = [
+ "gilrs",
+ "gpui-kit",
+ "qrcode",
+ "raw-window-handle",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "png"

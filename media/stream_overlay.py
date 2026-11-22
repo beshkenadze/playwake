@@ -11,6 +11,11 @@ class ButtonEvent(c.Structure):
                 ('state', c.c_uint), ('button', c.c_uint)]
 
 
+class TextExtents(c.Structure):
+    _fields_ = [(name, c.c_double) for name in
+                ('x_bearing', 'y_bearing', 'width', 'height', 'x_advance', 'y_advance')]
+
+
 class StreamOverlay:
     def __init__(self, x11, display, parent, create_child, toggle, select, hint_visibility):
         self.x11, self.display, self.parent = x11, display, parent
@@ -28,6 +33,10 @@ class StreamOverlay:
         bind(x11,
             ('XSelectInput', i, [ptr, xid, c.c_long]),
             ('XUnmapWindow', i, [ptr, xid]),
+            ('XCreatePixmap', xid, [ptr, xid, u, u, u]),
+            ('XSetWindowBackgroundPixmap', i, [ptr, xid, xid]),
+            ('XClearWindow', i, [ptr, xid]),
+            ('XFreePixmap', i, [ptr, xid]),
             ('XGrabButton', i, [ptr, u, u, xid, i, u, i, i, xid, xid]))
         self.shape = c.CDLL('libXext.so.6')
         bind(self.shape,
@@ -45,37 +54,47 @@ class StreamOverlay:
             ('cairo_fill', None, [ptr]),
             ('cairo_scale', None, [ptr, d, d]),
             ('cairo_move_to', None, [ptr, d, d]),
+            ('cairo_line_to', None, [ptr, d, d]),
             ('cairo_select_font_face', None, [ptr, c.c_char_p, i, i]),
             ('cairo_set_font_size', None, [ptr, d]),
+            ('cairo_text_extents', None, [ptr, c.c_char_p, c.POINTER(TextExtents)]),
             ('cairo_show_text', None, [ptr, c.c_char_p]))
 
         self.xid = create_child(1, 1)
         screen = x11.XDefaultScreen(display)
         self.visual = x11.XDefaultVisual(display, screen)
+        self.depth = x11.XDefaultDepth(display, screen)
         x11.XStoreName(display, self.xid, b'Playwake stream overlay')
-        x11.XSelectInput(display, self.xid, (1 << 15) | (1 << 2))  # ExposureMask | ButtonPressMask
+        x11.XSelectInput(display, self.xid, 1 << 2)  # ButtonPressMask
         # Right click opens the menu from the video or its parent, with no visible toolbar.
         x11.XGrabButton(display, 3, 1 << 15, parent, 0, (1 << 2) | (1 << 3), 1, 1, 0, 0)
         self.menu = False
         self.diagnostics = False
+        self.guide_handoff = False
         self.selection = 0
         self.metrics = ()
         self.compact = '—'
+        self.compact_rate = '—'
+        self.preview_controls = ()
+        self.preview_back = None
         self.russian = False
         self.xbox_palette = False
         self.console_name = 'Xbox'
+        self.control_layout = 'gamepad'
+        self.control_device = 'Gamepad'
         self.rendered = None
         self.geometry = None
         self.scale = 1.0
 
     def handle(self, event):
         entry = c.cast(event, c.POINTER(ButtonEvent)).contents
-        if entry.type == 12 and entry.window == self.xid:  # Expose
-            self.rendered = None
         if entry.type != 4:  # ButtonPress
             return
         if entry.button == 3 and entry.window in (self.parent, self.xid):
             self.toggle()
+        elif entry.button == 1 and entry.window == self.xid and self.preview_back:
+            if entry.y / self.scale >= 44:
+                (self.toggle if entry.x / self.scale < 205 else self.preview_back)()
         elif entry.button == 1 and entry.window == self.xid and self.menu:
             x, y = entry.x / self.scale, entry.y / self.scale
             index = int((y - 152) // 58)
@@ -83,18 +102,20 @@ class StreamOverlay:
                 self.select(index)
 
     def show_startup_hint(self):
-        self.hint_pending = not self.menu
+        self.hint_pending = not (self.menu or self.guide_handoff)
 
     def update(self, video_size):
         now = time.monotonic()
-        if self.menu:
+        if self.menu or self.guide_handoff:
             self.hint_pending = False
             self.hint_until = 0.0
         elif self.hint_pending:
             self.hint_pending = False
             self.hint_until = now + 4.0
         hint = now < self.hint_until
-        mode = 'menu' if self.menu else 'hint' if hint else 'hud' if self.diagnostics else None
+        mode = None
+        if not self.guide_handoff:
+            mode = 'menu' if self.menu else 'hint' if hint else 'hud' if self.diagnostics else None
         was_hint = self.geometry is not None and self.geometry[0] == 'hint'
         if hint != was_hint:
             self.hint_visibility(hint)
@@ -110,7 +131,7 @@ class StreamOverlay:
         if self.menu:
             logical_width, logical_height = 440, height / self.scale
         else:
-            logical_width, logical_height = (570, 62) if hint else (340, 31)
+            logical_width, logical_height = (570, 119) if hint else (490, 70 if self.preview_controls else 49)
         w, h = (max(1, round(value * self.scale)) for value in (logical_width, logical_height))
         if self.menu:
             x, y = width - w, 0
@@ -119,25 +140,35 @@ class StreamOverlay:
         else:
             x = y = round(12 * self.scale)
         layout = (mode, x, y, w, h)
-        if layout != self.geometry:
-            self.x11.XMoveResizeWindow(self.display, self.xid, x, y, w, h)
-            # HUD is click-through. The open menu receives pointer events.
-            if self.menu:
-                self.shape.XShapeCombineMask(self.display, self.xid, 2, 0, 0, 0, 0)
-            else:
-                self.shape.XShapeCombineRectangles(self.display, self.xid, 2, 0, 0, None, 0, 0, 0)
-            self.x11.XMapRaised(self.display, self.xid)
-            self.geometry = layout
+        frame = (layout, self.selection, self.diagnostics, self.compact, self.compact_rate, self.preview_controls,
+                 self.metrics if self.menu and self.diagnostics else ())
+        if self.rendered == frame:
+            return
 
-        frame = (layout, self.selection, self.diagnostics, self.compact, self.metrics if self.menu and self.diagnostics else ())
-        if self.rendered != frame:
-            self.draw(w, h, logical_width, logical_height, mode)
+        # Compose off screen. Posting each Cairo operation to the mapped
+        # window lets the compositor sample a partially drawn panel.
+        pixmap = self.x11.XCreatePixmap(self.display, self.xid, w, h, self.depth)
+        try:
+            self.draw(pixmap, w, h, logical_width, logical_height, mode)
+            self.x11.XSetWindowBackgroundPixmap(self.display, self.xid, pixmap)
+            if layout != self.geometry:
+                self.x11.XMoveResizeWindow(self.display, self.xid, x, y, w, h)
+                if self.menu or self.preview_controls:
+                    self.shape.XShapeCombineMask(self.display, self.xid, 2, 0, 0, 0, 0)
+                else:
+                    self.shape.XShapeCombineRectangles(self.display, self.xid, 2, 0, 0, None, 0, 0, 0)
+                self.x11.XMapRaised(self.display, self.xid)
+                self.geometry = layout
+            self.x11.XClearWindow(self.display, self.xid)
             self.rendered = frame
+        finally:
+            # X11 holds its own reference while the pixmap is the background.
+            self.x11.XFreePixmap(self.display, pixmap)
+            self.x11.XFlush(self.display)
 
-    def draw(self, pixel_width, pixel_height, width, height, mode):
+    def draw(self, pixmap, pixel_width, pixel_height, width, height, mode):
         lib = self.cairo
-        surface = lib.cairo_xlib_surface_create(self.display, self.xid, self.visual,
-                                                pixel_width, pixel_height)
+        surface = lib.cairo_xlib_surface_create(self.display, pixmap, self.visual, pixel_width, pixel_height)
         ctx = lib.cairo_create(surface)
         try:
             lib.cairo_scale(ctx, pixel_width / width, pixel_height / height)
@@ -147,10 +178,20 @@ class StreamOverlay:
                 lib.cairo_rectangle(ctx, x, y, w, h)
                 lib.cairo_fill(ctx)
 
-            def text(x, y, value, size, bold=False, color=(0.93, 0.95, 0.99)):
+            def text(x, y, value, size, bold=False, color=(0.93, 0.95, 0.99), max_width=None):
                 lib.cairo_set_source_rgb(ctx, *color)
                 lib.cairo_select_font_face(ctx, b'DejaVu Sans', 0, int(bold))
                 lib.cairo_set_font_size(ctx, size)
+                if max_width is not None:
+                    extents = TextExtents()
+                    lib.cairo_text_extents(ctx, value.encode(), c.byref(extents))
+                    if extents.x_advance > max_width:
+                        for length in range(len(value) - 1, 0, -1):
+                            shortened = value[:length].rstrip() + '…'
+                            lib.cairo_text_extents(ctx, shortened.encode(), c.byref(extents))
+                            if extents.x_advance <= max_width:
+                                value = shortened
+                                break
                 lib.cairo_move_to(ctx, x, y)
                 lib.cairo_show_text(ctx, value.encode())
 
@@ -163,12 +204,13 @@ class StreamOverlay:
             if self.menu:
                 rect(0, 0, width, height, (0.12, 0.12, 0.13))
                 rect(0, 0, 1, height, (0.28, 0.28, 0.29))
-                text(32, 53, self.console_name[:26], 26, True)
+                text(32, 53, self.console_name[:100], 26, True, max_width=width - 64)
                 lib.cairo_set_source_rgb(ctx, *accent)
                 lib.cairo_arc(ctx, 36, 79, 4, 0, 6.284)
                 lib.cairo_fill(ctx)
                 text(48, 85, label('Стрим идёт', 'Streaming'), 16, color=accent)
-                text(32, 117, self.compact, 14, color=muted)
+                text(32, 111, self.compact_rate, 13, color=muted, max_width=width - 64)
+                text(32, 131, self.compact, 13, color=muted, max_width=width - 64)
                 diagnostics = label('Скрыть статистику', 'Hide statistics') if self.diagnostics else label('Статистика', 'Statistics')
                 names = (label('Продолжить', 'Resume'), 'Xbox Guide', diagnostics,
                          label('Переподключить', 'Reconnect'), label('Завершить стрим', 'End stream'))
@@ -190,11 +232,76 @@ class StreamOverlay:
                 rect(0, 0, width, height, (0.12, 0.12, 0.13))
                 rect(0, 0, 4, height, accent)
                 text(19, 25, label('Меню Playwake', 'Playwake stream menu'), 15, True, accent)
-                text(19, 47, label('Удерживайте View + Menu 0,5 с', 'Hold View + Menu for 0.5 s'), 17)
+                text(19, 54, 'View + Menu', 24, True)
+                text(19, 78, label('Нажмите одновременно', 'Tap both buttons together'), 15)
+                device = label('Геймпад', 'Gamepad') if self.control_layout == 'gamepad' else self.control_device
+                text(19, 102, device, 13, color=muted)
+                self.draw_control_layout(ctx, rect, text, accent)
             else:
                 rect(0, 0, width, height, (0.08, 0.09, 0.09))
-                text(10, 21, self.compact, 14)
+                text(10, 19, self.compact_rate, 13, max_width=width - 20)
+                text(10, 37, self.compact, 13, max_width=width - 20)
+                if self.preview_controls:
+                    compare, back = self.preview_controls
+                    text(10, 57, compare, 13, color=accent, max_width=185)
+                    text(215, 57, back, 13, color=accent, max_width=width - 225)
         finally:
             lib.cairo_destroy(ctx)
             lib.cairo_surface_destroy(surface)
-            self.x11.XFlush(self.display)
+
+    def draw_control_layout(self, ctx, rect, text, accent):
+        lib = self.cairo
+        shell = (0.31, 0.32, 0.35)
+        inset = (0.16, 0.17, 0.19)
+        mark = (0.55, 0.58, 0.61)
+
+        def dot(x, y, radius, color):
+            lib.cairo_set_source_rgb(ctx, *color)
+            lib.cairo_arc(ctx, x, y, radius, 0, 6.284)
+            lib.cairo_fill(ctx)
+
+        if self.control_layout == 'gamepad':
+            rect(337, 45, 168, 41, shell)
+            dot(345, 72, 26, shell)
+            dot(497, 72, 26, shell)
+            dot(355, 57, 8, inset)
+            dot(456, 77, 8, inset)
+            buttons = ((401, 56), (441, 56))
+        else:
+            deck = self.control_layout == 'deck'
+            rect(300, 44, 248, 63, shell)
+            rect(358, 49, 132, 53, inset)
+            dot(338 if deck else 328, 64 if deck else 62, 8, inset)
+            dot(510 if deck else 520, 64 if deck else 84, 8, inset)
+            dx, dy = (315, 62) if deck else (329, 83)
+            rect(dx - 6, dy - 2, 12, 4, mark)
+            rect(dx - 2, dy - 6, 4, 12, mark)
+            for x, y in ((520, 62), (514, 68), (526, 68), (520, 74)) if not deck else (
+                    (533, 56), (527, 62), (539, 62), (533, 68)):
+                dot(x, y, 2, mark)
+            if deck:
+                rect(321, 79, 21, 15, inset)
+                rect(505, 79, 21, 15, inset)
+                buttons = ((328, 53), (520, 53))
+            else:
+                other_button_y = 73 if self.control_layout == 'ally' else 51
+                button_y = 61 if self.control_layout == 'ally' else 62
+                dot(348, other_button_y, 4, mark)
+                dot(500, other_button_y, 4, mark)
+                buttons = ((348, button_y), (500, button_y))
+
+        for (x, y), name in zip(buttons, ('View', 'Menu'), strict=True):
+            text(x - 16, 25, name, 12, True, accent)
+            rect(x - 1, 29, 2, y - 36, accent)
+            lib.cairo_set_source_rgb(ctx, *accent)
+            lib.cairo_move_to(ctx, x - 4, y - 10)
+            lib.cairo_line_to(ctx, x + 4, y - 10)
+            lib.cairo_line_to(ctx, x, y - 5)
+            lib.cairo_fill(ctx)
+            dot(x, y, 5, accent)
+            if name == 'View':
+                rect(x - 3, y - 2, 4, 3, inset)
+                rect(x - 1, y, 4, 3, inset)
+            else:
+                for offset in (-2, 0, 2):
+                    rect(x - 2, y + offset, 4, 1, inset)

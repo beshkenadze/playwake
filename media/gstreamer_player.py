@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 
 import gi
 for namespace in ('Gst', 'GstSdp', 'GstWebRTC', 'GstVideo'):
@@ -26,6 +27,7 @@ BUTTONS = {304: 16, 305: 32, 307: 64, 308: 128, 310: 4096, 311: 8192,
            314: 8, 315: 4, 317: 16384, 318: 32768}
 AXES = (0, 1, 3, 4)
 VIEW_MENU = 8 | 4
+VIEW_MENU_WINDOW_MS = 90
 GUIDE = 2
 
 
@@ -35,6 +37,76 @@ def emit(event, **values):
 
 def milliseconds():
     return time.monotonic_ns() / 1_000_000
+
+
+def gpu_vulkan_output():
+    return ('vulkanupload name=upload ! vulkancolorconvert ! '
+            'video/x-raw(memory:VulkanImage),format=BGRA ! vulkansink')
+
+
+class LanczosUpscale:
+    pipeline = ('capsfilter name=upscale_input caps-change-mode=delayed ! '
+                'videoscale method=lanczos n-threads=2 ! '
+                'capsfilter name=upscale_caps caps-change-mode=delayed ! ')
+
+    def __init__(self, branch, source_pad, viewport):
+        self.viewport = viewport
+        self.source = None
+        self.requested = None
+        self.result = None
+        self.input_filter = branch.get_by_name('upscale_input')
+        self.filter = branch.get_by_name('upscale_caps')
+        source_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.source_caps)
+        self.filter.get_static_pad('src').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.output_caps)
+
+    @staticmethod
+    def fit(source, viewport):
+        width, height = source
+        scale = min(viewport[0] / width, viewport[1] / height)
+        if scale <= 1:
+            return source
+        return int(width * scale) & ~1, int(height * scale) & ~1
+
+    @staticmethod
+    def dimensions(event):
+        structure = event.parse_caps().get_structure(0)
+        return structure.get_value('width'), structure.get_value('height')
+
+    def source_caps(self, _, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.CAPS:
+            source = self.dimensions(event)
+            if self.source != source:
+                self.source = source
+                self.update()
+                # VA-API postprocessing must only download/convert here. Letting
+                # it negotiate the destination size can hide a source change.
+                self.input_filter.set_property('caps', self.size_caps(source))
+        return Gst.PadProbeReturn.OK
+
+    @staticmethod
+    def size_caps(size):
+        return Gst.Caps.from_string(f'video/x-raw,width={size[0]},height={size[1]}')
+
+    def update(self):
+        if not self.source:
+            return
+        size = self.fit(self.source, self.viewport())
+        if size != self.requested:
+            self.requested = size
+            self.filter.set_property('caps', self.size_caps(size))
+
+    def output_caps(self, _, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.CAPS and self.source:
+            width, height = self.dimensions(event)
+            method = 'lanczos' if width > self.source[0] or height > self.source[1] else 'fit'
+            result = (*self.source, width, height, method)
+            if result != self.result:
+                self.result = result
+                emit('video-scaling', method=method, sourceWidth=self.source[0],
+                     sourceHeight=self.source[1], outputWidth=width, outputHeight=height)
+        return Gst.PadProbeReturn.OK
 
 
 def ntp_unix_ms(timestamp):
@@ -70,7 +142,7 @@ class XResClientIdValue(c.Structure):
 
 
 class X11VideoWindow:
-    def __init__(self, parent, on_close, adopt_vulkan=False, overlay_actions=None):
+    def __init__(self, parent, on_close, adopt_vulkan=False, overlay_actions=None, on_key=None):
         self.x11 = c.CDLL('libX11.so.6')
         ptr, xid, int_, uint = c.c_void_p, c.c_ulong, c.c_int, c.c_uint
         pointer = c.POINTER
@@ -108,6 +180,13 @@ class X11VideoWindow:
             raise RuntimeError('Native playback requires an X11 display')
         self.parent = parent or self.x11.XDefaultRootWindow(self.display)
         self.on_close = on_close
+        self.on_resize = None
+        self.on_key = on_key
+        if self.on_key:
+            self.x11.XSelectInput.argtypes = [ptr, xid, c.c_long]
+            self.x11.XLookupKeysym.argtypes = [ptr, int_]
+            self.x11.XLookupKeysym.restype = xid
+            self.x11.XSelectInput(self.display, self.parent, 1)  # KeyPressMask
         self.size = self.dimensions()
         self.overlay = (StreamOverlay(self.x11, self.display, self.parent, self.create_child, *overlay_actions)
                         if parent and overlay_actions else None)
@@ -130,6 +209,14 @@ class X11VideoWindow:
             self.xres.XResGetClientPid.restype = int_
             self.xres.XResClientIdsDestroy.argtypes = [c.c_long, pointer(XResClientIdValue)]
             self.xres.XResClientIdsDestroy.restype = None
+            # XRes reports PIDs in the X server's namespace, which can differ
+            # from the worker's PID namespace in a Flatpak.
+            reference = self.x11.XCreateSimpleWindow(self.display, self.parent, 0, 0, 1, 1, 0, 0, 0)
+            try:
+                self.x11.XSync(self.display, False)
+                self.x11_pid = self.window_client_pid(reference)
+            finally:
+                self.x11.XDestroyWindow(self.display, reference)
             self.previous_windows = self.root_windows()
             self.timer = GLib.timeout_add(80, self.update)
             return
@@ -176,24 +263,30 @@ class X11VideoWindow:
             if children:
                 self.x11.XFree(children)
 
-    def owns_window(self, xid):
+    def window_client_pid(self, xid):
         spec = XResClientIdSpec(xid, 2)  # XRES_CLIENT_ID_PID_MASK
         count = c.c_long()
         values = c.POINTER(XResClientIdValue)()
         self.xres.XResQueryClientIds(self.display, 1, c.byref(spec), c.byref(count), c.byref(values))
         try:
-            return any(self.xres.XResGetClientPid(c.byref(values[i])) == os.getpid()
-                       for i in range(count.value)) if values else False
+            if values:
+                for index in range(count.value):
+                    pid = self.xres.XResGetClientPid(c.byref(values[index]))
+                    if pid > 0:
+                        return pid
+            return None
         finally:
             if values:
                 self.xres.XResClientIdsDestroy(count, values)
 
     def embed_vulkan_window(self):
         for xid in self.root_windows() - self.previous_windows:
-            if self.owns_window(xid):
+            if self.x11_pid is not None and self.window_client_pid(xid) == self.x11_pid:
                 self.xid = xid
                 self.size = self.dimensions()
                 self.x11.XReparentWindow(self.display, xid, self.parent, 0, 0)
+                if self.on_key:
+                    self.x11.XSelectInput(self.display, xid, 1)  # KeyPressMask
                 self.x11.XMoveResizeWindow(self.display, xid, 0, 0, *self.size)
                 self.x11.XMapRaised(self.display, xid)
                 self.x11.XSync(self.display, False)
@@ -225,9 +318,12 @@ class X11VideoWindow:
         while self.x11.XPending(self.display):
             event = (c.c_long * 24)()
             self.x11.XNextEvent(self.display, c.byref(event))
+            event_type = c.cast(event, c.POINTER(c.c_int))[0]
+            if self.on_key and event_type == 2:  # KeyPress
+                self.on_key(self.x11.XLookupKeysym(c.byref(event), 0))
             if self.overlay:
                 self.overlay.handle(event)
-            if c.cast(event, c.POINTER(c.c_int))[0] == 33:  # WM_DELETE_WINDOW client message
+            if event_type == 33:  # WM_DELETE_WINDOW client message
                 self.on_close()
                 return GLib.SOURCE_CONTINUE
         size = self.dimensions()
@@ -235,6 +331,8 @@ class X11VideoWindow:
         # surface is sized by Gamescope.
         if size != self.size:
             self.size = size
+            if self.on_resize:
+                self.on_resize()
             self.x11.XMoveResizeWindow(self.display, self.xid, 0, 0, *size)
             self.x11.XFlush(self.display)
             emit('video-surface', width=size[0], height=size[1])
@@ -294,13 +392,20 @@ class GamescopeInputFocus:
             raise OSError('Gamescope X11 display unavailable')
         self.root = self.x11.XDefaultRootWindow(self.display)
         self.atom = self.x11.XInternAtom(self.display, b'GAMESCOPE_FOCUSED_APP', 1)
+        self.refresh_atom = self.x11.XInternAtom(self.display, b'GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK', 1)
 
     def focused_app(self):
-        if not self.atom:
+        return self.cardinal(self.atom)
+
+    def display_hz(self):
+        return self.cardinal(self.refresh_atom)
+
+    def cardinal(self, atom):
+        if not atom:
             return None
         kind, count, remaining = c.c_ulong(), c.c_ulong(), c.c_ulong()
         fmt, data = c.c_int(), c.c_void_p()
-        status = self.x11.XGetWindowProperty(self.display, self.root, self.atom, 0, 1, 0, 6,
+        status = self.x11.XGetWindowProperty(self.display, self.root, atom, 0, 1, 0, 6,
             c.byref(kind), c.byref(fmt), c.byref(count), c.byref(remaining), c.byref(data))
         try:
             if status == 0 and kind.value == 6 and fmt.value == 32 and count.value == 1 and data:
@@ -313,6 +418,72 @@ class GamescopeInputFocus:
 
     def close(self):
         self.x11.XCloseDisplay(self.display)
+
+
+class PresentComplete(c.Structure):
+    _pack_ = 1
+    _fields_ = [('header', c.c_uint8 * 8), ('type', c.c_uint16),
+                ('kind', c.c_uint8), ('mode', c.c_uint8), ('ids', c.c_uint32 * 3),
+                ('timestamp_us', c.c_uint64)]
+
+
+class X11Presentation:
+    def __init__(self, window):
+        self.xcb = c.CDLL('libxcb.so.1')
+        self.present = c.CDLL('libxcb-present.so.0')
+        self.libc = c.CDLL(None)
+        ptr, u32 = c.c_void_p, c.c_uint32
+        for library, name, result, args in (
+            (self.xcb, 'xcb_connect', ptr, [c.c_char_p, ptr]),
+            (self.xcb, 'xcb_connection_has_error', c.c_int, [ptr]),
+            (self.xcb, 'xcb_disconnect', None, [ptr]),
+            (self.xcb, 'xcb_generate_id', u32, [ptr]),
+            (self.xcb, 'xcb_register_for_special_xge', ptr, [ptr, ptr, u32, ptr]),
+            (self.xcb, 'xcb_poll_for_special_event', ptr, [ptr, ptr]),
+            (self.xcb, 'xcb_request_check', ptr, [ptr, u32]),
+            (self.present, 'xcb_present_select_input_checked', u32, [ptr, u32, u32, u32]),
+            (self.libc, 'free', None, [ptr]),
+        ):
+            function = getattr(library, name)
+            function.restype, function.argtypes = result, args
+        self.connection = self.xcb.xcb_connect(None, None)
+        try:
+            if self.xcb.xcb_connection_has_error(self.connection):
+                raise OSError('X11 Present display unavailable')
+            event_id = self.xcb.xcb_generate_id(self.connection)
+            extension = c.addressof(c.c_char.in_dll(self.present, 'xcb_present_id'))
+            self.stamp = u32()
+            self.events = self.xcb.xcb_register_for_special_xge(self.connection, extension, event_id, c.byref(self.stamp))
+            if not self.events:
+                raise OSError('X11 Present events unavailable')
+            # CompleteNotify mask, pixmap events only in sample().
+            cookie = self.present.xcb_present_select_input_checked(self.connection, event_id, window, 2)
+            error = self.xcb.xcb_request_check(self.connection, cookie)
+            if error:
+                self.libc.free(error)
+                raise OSError('X11 Present selection failed')
+        except OSError:
+            self.close()
+            raise
+        self.last_us = None
+
+    def sample(self):
+        previous, count = self.last_us, 0
+        while event := self.xcb.xcb_poll_for_special_event(self.connection, self.events):
+            sample = PresentComplete.from_address(event)
+            # CompleteNotify=1, Pixmap=0, Skip=2.
+            if sample.type == 1 and sample.kind == 0 and sample.mode != 2:
+                self.last_us = sample.timestamp_us
+                count += 1
+            self.libc.free(event)
+        if not count:
+            self.last_us = None
+        elif previous is not None and self.last_us > previous:
+            return count * 1_000_000 / (self.last_us - previous)
+        return None
+
+    def close(self):
+        self.xcb.xcb_disconnect(self.connection)
 
 
 def find_gamepad():
@@ -411,7 +582,6 @@ class StreamInput:
         self.release_gate = False
         self.previous = 0
         self.chord_started = None
-        self.both_started = None
         self.pending_buttons = 0
         self.passthrough = False
         self.guide = False
@@ -419,7 +589,6 @@ class StreamInput:
 
     def reset_chord(self):
         self.chord_started = None
-        self.both_started = None
         self.pending_buttons = 0
         self.passthrough = False
 
@@ -486,20 +655,17 @@ class StreamInput:
             return (axes, buttons, left, right)
         if self.chord_started is None:
             self.chord_started = now
+        elapsed = now - self.chord_started
+        # The second button must arrive before the first is sent to Xbox.
+        if chord == VIEW_MENU and elapsed <= VIEW_MENU_WINDOW_MS:
+            self.open_overlay()
+            return neutral
         self.pending_buttons |= chord
-        if chord == VIEW_MENU:
-            if self.both_started is None:
-                self.both_started = now
-            if now - self.both_started >= 500:
-                self.open_overlay()
-                return neutral
-        else:
-            self.both_started = None
-            if now - self.chord_started >= 90:
-                self.passthrough = True
-                replay = self.pending_buttons
-                self.pending_buttons = 0
-                return (axes, buttons | replay, left, right)
+        if elapsed >= VIEW_MENU_WINDOW_MS:
+            self.passthrough = True
+            replay = self.pending_buttons
+            self.pending_buttons = 0
+            return (axes, buttons | replay, left, right)
         return (axes, buttons & ~VIEW_MENU, left, right)
 
 
@@ -516,6 +682,7 @@ class Player:
         self.rtc.connect('on-ice-candidate', self.candidate)
         self.rtc.connect('pad-added', self.link_track)
         self.rtc.connect('notify::connection-state', self.connection_changed)
+        self.rtc.connect('notify::ice-connection-state', self.ice_connection_changed)
         self.rtc.connect('notify::ice-gathering-state', self.gathering_changed)
         self.pipeline.get_bus().add_signal_watch()
         self.pipeline.get_bus().connect('message', self.bus_message)
@@ -567,6 +734,9 @@ class Player:
         self.video_queue_out = 0
         self.vulkan_conversion = None
         self.lsfg = False
+        self.lanczos = None
+        self.upscale_requested = False
+        self.preview_mode = None
         self.motion_in_parallel = False
         self.queue_times = {}
         self.stage_profile = []
@@ -575,6 +745,9 @@ class Player:
         self.window = None
         self.hud_timer = None
         self.hud_sample = None
+        self.hud_video_latency = deque(maxlen=60)
+        self.presentation = None
+        self.presentation_attempted = False
         self.audio_volume = 1.0
         self.transport_pending = False
         self.hud_rtt = None
@@ -609,12 +782,27 @@ class Player:
             self.stream_input.open_overlay()
         else:
             self.stream_input.close_overlay(guide)
-        if self.window and self.window.overlay:
-            overlay = self.window.overlay
-            overlay.menu = self.stream_input.overlay
-            if overlay.menu and not was_open:
-                overlay.selection = 0
-            self.sync_hud_timer(overlay)
+        overlay = self.window.overlay if self.window else None
+        if overlay and guide and was_open:
+            # Xbox provides the Guide inside the video. Keep Playwake's
+            # visuals hidden until its menu is explicitly opened again.
+            overlay.guide_handoff = True
+            emit('stream-overlay-handoff', active=True)
+        self.sync_overlay()
+        if overlay and guide and was_open:
+            overlay.update(self.window.size)
+
+    def sync_overlay(self):
+        overlay = self.window.overlay if self.window else None
+        if not overlay:
+            return
+        if self.stream_input.overlay and not overlay.menu:
+            overlay.selection = 0
+            if overlay.guide_handoff:
+                overlay.guide_handoff = False
+                emit('stream-overlay-handoff', active=False)
+        overlay.menu = self.stream_input.overlay
+        self.sync_hud_timer(overlay)
 
     def toggle_overlay(self):
         if self.stream_input.focused:
@@ -629,15 +817,21 @@ class Player:
         self.sync_hud_timer(overlay)
 
     def sync_hud_timer(self, overlay):
-        if (overlay.menu or overlay.diagnostics) and self.hud_timer is None:
+        wants_stats = not overlay.guide_handoff and (overlay.menu or overlay.diagnostics)
+        if wants_stats and self.hud_timer is None:
             self.hud_sample = None
+            self.hud_video_latency.clear()
             overlay.compact = '—'
             overlay.metrics = ()
             self.refresh_hud()
             self.hud_timer = GLib.timeout_add_seconds(1, self.refresh_hud)
-        elif not (overlay.menu or overlay.diagnostics) and self.hud_timer is not None:
+        elif not wants_stats and self.hud_timer is not None:
             GLib.source_remove(self.hud_timer)
             self.hud_timer = None
+            if self.presentation:
+                self.presentation.close()
+                self.presentation = None
+                self.presentation_attempted = False
 
     def handle(self, command):
         try:
@@ -647,9 +841,21 @@ class Player:
                                command.get('benchmark', False), command.get('capture_diagnostics', False),
                                command.get('renderer', 'auto'), command.get('lsfg', False),
                                command.get('interactive', False), command)
+                case 'preview':
+                    self.start_preview(command)
                 case 'answer':
                     if self.capture_diagnostics:
                         self.inspect_timestamps(command['sdp'])
+                    if self.cloud:
+                        lines = command['sdp'].splitlines()
+                        emit('cloud-answer-info', video=sum(line.startswith('m=video ') for line in lines),
+                             inactive=lines.count('a=inactive'), sendonly=lines.count('a=sendonly'),
+                             bundle=any(line.startswith('a=group:BUNDLE') for line in lines),
+                             embeddedCandidates=sum(line.startswith('a=candidate:') for line in lines),
+                             iceLite='a=ice-lite' in lines,
+                             audioPortOpen=any(line.startswith('m=audio ') and line.split()[1] != '0' for line in lines),
+                             videoPortOpen=any(line.startswith('m=video ') and line.split()[1] != '0' for line in lines),
+                             dataPortOpen=any(line.startswith('m=application ') and line.split()[1] != '0' for line in lines))
                     _, sdp = GstSdp.SDPMessage.new_from_text(command['sdp'])
                     answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdp)
                     promise = Gst.Promise.new()
@@ -657,10 +863,23 @@ class Player:
                     checked(promise, 'Remote description rejected')
                     emit('answer-set')
                 case 'ice':
+                    added = 0
                     for candidate in command['candidates']:
                         value = candidate.get('candidate', '').removeprefix('a=')
                         if value.startswith('candidate:'):
-                            self.rtc.emit('add-ice-candidate', int(candidate.get('sdpMLineIndex') or 0), value)
+                            index = int(candidate.get('sdpMLineIndex') or 0)
+                            if self.cloud:
+                                if not self.add_cloud_candidate(index, value):
+                                    continue
+                            else:
+                                self.rtc.emit('add-ice-candidate', index, value)
+                            added += 1
+                    if self.cloud:
+                        if not added:
+                            raise RuntimeError('GStreamer rejected the Xbox Cloud ICE candidates')
+                        self.rtc.emit('add-ice-candidate', 0, None)
+                        emit('cloud-ice-applied', count=added,
+                             state=self.rtc.get_property('ice-connection-state').value_nick)
                 case 'pulse':
                     self.override = (command.get('axis', 0), command.get('buttons', 0),
                                      milliseconds() + command.get('duration', 230))
@@ -702,11 +921,65 @@ class Player:
             self.loop.quit()
         return GLib.SOURCE_REMOVE
 
+    def start_preview(self, options):
+        os.environ['DISABLE_GAMESCOPE_WSI'] = '1'
+        os.environ['GST_VULKAN_WINDOW'] = 'xcb'
+        self.renderer = 'vulkan'
+        self.lsfg = options['lsfg']
+        self.preview_mode = (options['performance'], options['flow_scale'])
+        self.benchmark = False
+        self.capture_diagnostics = False
+        width, height = int(options['width']), int(options['height'])
+        parent = int(os.getenv('GREENLIGHT_VIDEO_PARENT_XID', '0'), 0)
+        if not parent:
+            raise RuntimeError('LSFG preview requires an X11 or XWayland window')
+        if display := os.getenv('ALLY_GAMESCOPE_CONTROL_DISPLAY'):
+            try:
+                self.gamescope_focus = GamescopeInputFocus(display)
+            except OSError:
+                pass
+        self.window = X11VideoWindow(parent, self.loop.quit, adopt_vulkan=True, on_key=self.preview_key, overlay_actions=(
+            lambda: emit('preview-toggle'), lambda _: None, lambda _: None,
+        ))
+        overlay = self.window.overlay
+        overlay.russian = options.get('russian', False)
+        overlay.xbox_palette = options.get('xbox_palette', False)
+        overlay.diagnostics = True
+        overlay.preview_back = lambda: emit('preview-back')
+        overlay.compact = 'A  LSFG on/off    B  Back' if not overlay.russian else 'A  Вкл./выкл. LSFG    B  Назад'
+        branch = Gst.parse_bin_from_description(
+            'videotestsrc name=scene is-live=true pattern=ball motion=sweep '
+            'foreground-color=0xff7cdb8c background-color=0xff161c26 ! '
+            f'video/x-raw,format=NV12,width={width},height={height},framerate=60/1 ! '
+            f'{gpu_vulkan_output()} name=video_sink sync=false force-aspect-ratio=true', True)
+        self.video_sink = branch.get_by_name('video_sink')
+        sink_pad = self.video_sink.get_static_pad('sink')
+        sink_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.window.wait_for_vulkan_surface)
+        if self.lsfg:
+            sink_pad.add_probe(Gst.PadProbeType.BUFFER, self.check_lsfg_layer)
+        branch.get_by_name('scene').get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, self.decoded)
+        self.pipeline.add(branch)
+        self.window.adoption_started = milliseconds()
+        if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError('Cannot start the Vulkan preview')
+        self.sync_hud_timer(overlay)
+
+    @staticmethod
+    def preview_key(keysym):
+        if keysym in (0xff0d, 0xff8d):  # Return or KP_Enter
+            emit('preview-toggle')
+        elif keysym == 0xff1b:  # Escape
+            emit('preview-back')
+
     def start(self, bitrate, width, height, benchmark=False, capture_diagnostics=False, renderer='auto',
               lsfg=False, interactive=False, options=None):
         self.target_width, self.target_height = int(width), int(height)
-        self.bitrate_limit = int(bitrate)
+        self.bitrate_limit = int(bitrate) if bitrate is not None else None
         options = options or {}
+        self.cloud = options.get('cloud', False)
+        self.upscale_requested = options.get('lanczos_upscale', False)
+        if options.get('stun'):
+            self.rtc.set_property('stun-server', options['stun'])
         self.audio_volume = max(0, min(100, int(options.get('volume', 100)))) / 100
         self.benchmark = benchmark
         self.capture_diagnostics = capture_diagnostics
@@ -753,6 +1026,8 @@ class Player:
                     overlay.russian = options.get('russian', False)
                     overlay.xbox_palette = options.get('xbox_palette', False)
                     overlay.console_name = options.get('console_name') or 'Xbox'
+                    overlay.control_layout = options.get('control_layout', 'gamepad')
+                    overlay.control_device = options.get('control_device', 'Gamepad')
                     if options.get('compact_stats'):
                         self.set_diagnostics()
         direction = GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY
@@ -782,16 +1057,19 @@ class Player:
         offer = reply.get_value('offer')
         sdp = offer.sdp.as_text()
         lines = sdp.splitlines()
+        self.media_ids = [line.removeprefix('a=mid:') for line in lines if line.startswith('a=mid:')]
         video = next(i for i, line in enumerate(lines) if line.startswith('m=video '))
         end = next((i for i in range(video + 1, len(lines)) if lines[i].startswith('m=')), len(lines))
         # Place bandwidth ahead of media attributes (RFC 4566 field order).
         before_attributes = next((i for i in range(video + 1, end) if lines[i].startswith('a=')), end)
-        lines.insert(before_attributes, f'b=AS:{int(bitrate)}')
+        if self.bitrate_limit is not None:
+            lines.insert(before_attributes, f'b=AS:{self.bitrate_limit}')
+            before_attributes += 1
         if self.capture_diagnostics:
             used = {int(match[1]) for line in lines if (match := re.match(r'a=extmap:(\d+)', line))}
             extension = next((value for value in range(14, 0, -1) if value not in used), None)
             if extension is not None:
-                lines.insert(before_attributes + 1, f'a=extmap:{extension}/recvonly http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time')
+                lines.insert(before_attributes, f'a=extmap:{extension}/recvonly http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time')
         sdp = '\r\n'.join(lines) + '\r\n'
         _, description = GstSdp.SDPMessage.new_from_text(sdp)
         offer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.OFFER, description)
@@ -813,7 +1091,36 @@ class Player:
         emit('capture-negotiation', capture=self.capture_extension is not None, sendTime=self.send_time_offered)
 
     def candidate(self, _, index, candidate):
-        self.candidates.append({'candidate': candidate, 'sdpMLineIndex': index})
+        description = {'candidate': candidate, 'sdpMLineIndex': index}
+        if self.cloud and index < len(self.media_ids):
+            description['sdpMid'] = self.media_ids[index]
+        self.candidates.append(description)
+
+    def add_cloud_candidate(self, index, value):
+        # libnice splits candidates on literal spaces. Xbox Cloud sometimes
+        # adds padding after the final attribute, which otherwise looks like
+        # an incomplete extension pair.
+        fields = value.split()
+        value = ' '.join(fields)
+        promise = Gst.Promise.new()
+        self.rtc.emit('add-ice-candidate-full', index, value, promise)
+        reply = promise.get_reply() if promise.wait() == Gst.PromiseResult.REPLIED else None
+        error = reply.get_value('error') if reply is not None and reply.has_field('error') else None
+        if error:
+            message = error.message
+            reason = ('unknown_mline' if message.startswith('Unknown mline') else
+                      'address_format' if message.startswith('Failed to retrieve address') else
+                      'candidate_syntax' if message.startswith(('Could not parse candidate', 'candidate address')) else 'other')
+            family = None
+            try:
+                family = ipaddress.ip_address(fields[4]).version
+            except (IndexError, ValueError):
+                pass
+            emit('cloud-ice-rejected', reason=reason, mediaLine=index, addressFamily=family,
+                 fieldCount=len(fields), candidateType=fields[7] if len(fields) > 7 and fields[7] in
+                 ('host', 'srflx', 'prflx', 'relay') else None)
+            return False
+        return True
 
     def gathering_changed(self, *_):
         if self.rtc.get_property('ice-gathering-state') == GstWebRTC.WebRTCICEGatheringState.COMPLETE:
@@ -821,6 +1128,10 @@ class Player:
 
     def connection_changed(self, *_):
         emit('connection', state=self.rtc.get_property('connection-state').value_nick)
+
+    def ice_connection_changed(self, *_):
+        if getattr(self, 'cloud', False):
+            emit('ice-connection', state=self.rtc.get_property('ice-connection-state').value_nick)
 
     def send_json(self, label, data):
         channel = self.channels[label]
@@ -833,12 +1144,16 @@ class Player:
     def handshake_ack(self):
         width, height = self.target_width, self.target_height
         dimensions = {'width': width, 'height': height}
+        resolution = {'message': 'userRequestedResolutionUpdate', 'resolutionAlias': str(height)}
+        if self.cloud:
+            self.send_json('control', resolution)
         self.send_json('control', {'message': 'authorizationRequest',
             'accessKey': '4BDB3609-C1F1-4195-9B37-FEFF45DA8B8E'})
         self.send_json('control', {'message': 'gamepadChanged', 'gamepadIndex': 0, 'wasAdded': True})
-        self.send_json('control', {'message': 'VideoPreference', 'type': 'VideoPreference',
-            'resolution': dimensions, 'dimensions': dimensions, 'maxFPS': 60})
-        self.send_json('control', {'message': 'userRequestedResolutionUpdate', 'resolutionAlias': str(height)})
+        if not self.cloud:
+            self.send_json('control', {'message': 'VideoPreference', 'type': 'VideoPreference',
+                'resolution': dimensions, 'dimensions': dimensions, 'maxFPS': 60})
+            self.send_json('control', resolution)
         for target, content in (
             ('systemUi/configuration', {'version': [0, 1, 0], 'systemUis': []}),
             ('properties/clientappinstallidchanged', {'clientAppInstallId': str(uuid.uuid4())}),
@@ -898,9 +1213,7 @@ class Player:
                 self.override = None
         axes, buttons, left_trigger, right_trigger = self.stream_input.route(axes, buttons, left_trigger, right_trigger, polled)
         if self.window and self.window.overlay and self.window.overlay.menu != self.stream_input.overlay:
-            self.window.overlay.menu = self.stream_input.overlay
-            self.window.overlay.selection = 0
-            self.sync_hud_timer(self.window.overlay)
+            self.sync_overlay()
         if self.input_audit:
             sample = (buttons, any(axes), bool(left_trigger or right_trigger))
             if self.last_input_sample != sample:
@@ -937,6 +1250,7 @@ class Player:
             if not self.decoder_name:
                 emit('error', message='GStreamer H.264 decoder unavailable')
                 return
+            upscale = LanczosUpscale.pipeline if self.upscale_requested and self.window else ''
             if self.renderer == 'vulkan':
                 download = 'vapostproc ! video/x-raw,format=NV12 ! ' if self.decoder_name == 'vah264dec' else ''
                 queue = 'queue name=video_queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! '
@@ -946,17 +1260,16 @@ class Player:
                                   and Gst.ElementFactory.find('vulkancolorconvert') is not None)
                 if convert_on_gpu:
                     self.vulkan_conversion = 'gpu_nv12'
-                    conversion = ('vulkanupload name=upload ! vulkancolorconvert ! '
-                                  'video/x-raw(memory:VulkanImage),format=BGRA ! vulkansink')
+                    conversion = gpu_vulkan_output()
                 else:
                     self.vulkan_conversion = 'cpu_bgra'
                     conversion = 'videoconvert ! video/x-raw,format=BGRA ! vulkanupload name=upload ! vulkansink'
                 tap = 'tee name=frame_tap ! ' if self.motion_in_parallel else ''
-                video_output = queue + download + tap + conversion
+                video_output = queue + download + tap + upscale + conversion
                 options = 'sync=false force-aspect-ratio=true'
             elif self.window_id:
                 download = 'vapostproc ! video/x-raw,format=NV12 ! ' if self.decoder_name == 'vah264dec' else ''
-                video_output = download + 'videoconvert ! video/x-raw,format=BGRx ! ximagesink'
+                video_output = download + upscale + 'videoconvert ! video/x-raw,format=BGRx ! ximagesink'
                 options = 'sync=false force-aspect-ratio=true'
             else:
                 video_output = 'videoconvert ! autovideosink'
@@ -970,6 +1283,12 @@ class Player:
                 f'rtph264depay name=depay ! h264parse name=parser ! {self.decoder_name} name=decoder ! '
                 f'{video_output} name=video_sink {options}{motion_branch}', True)
             self.video_sink = branch.get_by_name('video_sink')
+            if upscale:
+                # After the queue, so CAPS and buffers retain their order when
+                # decoders send startup and steady-state sizes in quick succession.
+                source = branch.get_by_name('video_queue' if self.renderer == 'vulkan' else 'decoder')
+                self.lanczos = LanczosUpscale(branch, source.get_static_pad('src'), lambda: self.window.size)
+                self.window.on_resize = self.lanczos.update
             if self.window_id:
                 GstVideo.VideoOverlay.set_window_handle(self.video_sink, self.window_id)
             branch.get_by_name('depay').get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.receive_rtp)
@@ -1038,6 +1357,7 @@ class Player:
             first_packet = self.ingress_rtp.get(self.rtp_key(buffer))
             timing = {
                 'receivedAt': self.pending_rtp[1] if first_packet is None else first_packet,
+                'postJitterAt': self.pending_rtp[1],
                 'preJitter': first_packet is not None,
             }
             if self.capture_diagnostics and key is not None and (anchor := self.capture_anchors.get(ssrc)):
@@ -1258,11 +1578,13 @@ class Player:
 
     def present_frame(self, pad, probe):
         trial = self.frame_trial
-        if trial is None and not self.benchmark:
+        if trial is None and not self.benchmark and self.hud_timer is None:
             return Gst.PadProbeReturn.OK
         now = milliseconds()
         buffer = probe.get_buffer()
         timing = self.frame_timing.get(buffer.pts)
+        if self.hud_timer is not None and timing is not None:
+            self.hud_video_latency.append(now - timing['postJitterAt'])
         if self.renderer != 'vulkan':
             self.video_timing(timing, now)
         if trial is None:
@@ -1351,7 +1673,35 @@ class Player:
     def refresh_hud(self):
         overlay = self.window.overlay
         now = milliseconds()
+        if self.renderer == 'vulkan' and self.window.xid and not self.presentation_attempted:
+            self.presentation_attempted = True
+            try:
+                self.presentation = X11Presentation(self.window.xid)
+            except (OSError, AttributeError, ValueError):
+                pass
+        present_fps = self.presentation.sample() if self.presentation else None
+        display_hz = self.gamescope_focus.display_hz() if self.gamescope_focus else None
         sample = (now, self.decoded_frames, self.encoded_bytes)
+        if self.preview_mode is not None:
+            if self.hud_sample and self.width and self.height:
+                previous_time, previous_frames, _ = self.hud_sample
+                fps = (self.decoded_frames - previous_frames) * 1000 / (now - previous_time)
+                present = f'{present_fps:.0f}' if present_fps is not None else '—'
+                performance, flow = self.preview_mode
+                if self.lsfg:
+                    mode = 'Performance' if performance else ('Качество' if overlay.russian else 'Quality')
+                    title = f'LSFG 2× {mode} · Flow Scale {flow}'
+                else:
+                    title = 'LSFG выкл.' if overlay.russian else 'LSFG off'
+                overlay.compact_rate = title
+                source, output, display = ('Источник', 'Вывод', 'Экран') if overlay.russian else ('Source', 'Present', 'Display')
+                overlay.compact = f'{self.height}p · {source} {fps:.0f} FPS · {output} {present} FPS · {display} {display_hz or "—"} Hz'
+                overlay.preview_controls = (('A / Enter  Сравнить', 'B / Esc  Назад') if overlay.russian
+                                            else ('A / Enter  Compare', 'B / Esc  Back'))
+                emit('preview-stats', sourceFps=round(fps, 2),
+                     presentFps=round(present_fps, 2) if present_fps is not None else None, displayHz=display_hz)
+            self.hud_sample = sample
+            return GLib.SOURCE_CONTINUE
         if self.hud_sample and self.width and self.height:
             previous_time, previous_frames, previous_bytes = self.hud_sample
             seconds = (now - previous_time) / 1000
@@ -1367,19 +1717,42 @@ class Player:
                     return '—'
                 return f'{value:.2f} ms' if value < 1 else f'{value:.0f} ms'
             loss = self.hud_loss if self.hud_loss is not None else '—'
-            overlay.compact = (f'{self.height}p · {fps:.0f} FPS · {mbps:.1f} Mb/s · {ms(self.hud_rtt)}'
-                               f' · {queue_drops + dropped} ' +
-                               ('проп.' if overlay.russian else 'drops'))
+            recent_latency = self.hud_video_latency.copy()
+            client_ms = statistics.median(recent_latency) if recent_latency else None
+            client_label = 'Видео' if overlay.russian else 'Video'
+            client_drops = 'Пропуски' if overlay.russian else 'Drops'
+            decoded_label = 'Декодер' if overlay.russian else 'Decode'
+            present_label = 'Вывод' if overlay.russian else 'Present'
+            display_label = 'Экран' if overlay.russian else 'Display'
+            present_rate = f'{present_fps:.0f} FPS' if present_fps is not None else '—'
+            refresh = f'{display_hz} Hz' if display_hz else '—'
+            size_label = f'{self.height}p'
+            scaling_line = ()
+            if self.lanczos and self.lanczos.result:
+                sw, sh, ow, oh, method = self.lanczos.result
+                size_label = f'{sh}p → {oh}p' if method == 'lanczos' else f'{sh}p'
+                scaling_line = (f'{sw}×{sh} → {ow}×{oh} · {method.title()}',)
+            overlay.compact_rate = (f'{size_label} · {decoded_label} {fps:.0f} FPS'
+                                    f' · {present_label} {present_rate} · {display_label} {refresh}')
+            overlay.compact = (f'{mbps:.1f} Mb/s · RTT {ms(self.hud_rtt)} · {client_label} {ms(client_ms)}'
+                               f' · {client_drops} {queue_drops + dropped}')
             overlay.metrics = (
                 f'Video {self.width}×{self.height} · {fps:.1f} decoded FPS',
+                *scaling_line,
+                f'{present_label} {present_rate} · {display_label} {refresh}',
                 f'Viewport {size[0]}×{size[1]} · {self.decoder_name} · LSFG {"on" if self.lsfg else "off"}',
-                f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s',
+                (f'Video {mbps:.1f} Mb/s · limit {self.bitrate_limit / 1000:g} Mb/s'
+                 if self.bitrate_limit is not None else f'Video {mbps:.1f} Mb/s'),
                 f'RTT {ms(self.hud_rtt)} · jitter {ms(self.hud_jitter)} · RTP lost {loss}',
+                (f'Видео: после джиттер-буфера → вход видеовывода {ms(client_ms)}'
+                 if overlay.russian else f'Video: after jitter buffer → sink input {ms(client_ms)}'),
                 f'Queue {depth} · queue drops ~{queue_drops} · sink drops {dropped}',
             )
             emit('hud-stats', width=self.width, height=self.height, viewportWidth=size[0], viewportHeight=size[1],
                  decodedFps=round(fps, 2), videoMbps=round(mbps, 2), limitKbps=self.bitrate_limit,
+                 presentFps=round(present_fps, 2) if present_fps is not None else None, displayHz=display_hz,
                  rttMs=self.hud_rtt, jitterMs=self.hud_jitter, rtpLost=self.hud_loss,
+                 videoClientMs=round(client_ms, 2) if client_ms is not None else None,
                  queueDepth=depth, queueDrops=queue_drops, sinkDrops=dropped)
         self.hud_sample = sample
         if self.width and self.height and not self.transport_pending:
@@ -1460,11 +1833,14 @@ class Player:
         finally:
             if self.hud_timer is not None:
                 GLib.source_remove(self.hud_timer)
+            if self.presentation:
+                self.presentation.close()
             if self.window:
                 self.window.vulkan_surface_ready.set()
             self.pipeline.set_state(Gst.State.NULL)
             if self.gamescope_timer is not None:
                 GLib.source_remove(self.gamescope_timer)
+            if self.gamescope_focus:
                 self.gamescope_focus.close()
             if self.window:
                 self.window.close()
