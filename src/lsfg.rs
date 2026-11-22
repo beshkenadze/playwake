@@ -1,4 +1,4 @@
-use crate::xbox::Result;
+use crate::{session_store::Preferences, xbox::Result};
 use serde_json::Value;
 use std::{env, fs, path::PathBuf, process::Command};
 
@@ -41,7 +41,7 @@ impl Runtime {
         Ok(Self { dll, layer_dir })
     }
 
-    pub fn configure(&self, command: &mut Command) -> Result<()> {
+    pub fn configure(&self, command: &mut Command, prefs: Preferences) -> Result<()> {
         let mut layers = vec![self.layer_dir.clone()];
         if let Some(paths) = env::var_os("VK_ADD_IMPLICIT_LAYER_PATH") {
             layers.extend(env::split_paths(&paths).filter(|path| path != &self.layer_dir));
@@ -55,8 +55,8 @@ impl Runtime {
             .env("LSFGVK_ENV", "1")
             .env("LSFGVK_DLL_PATH", &self.dll)
             .env("LSFGVK_MULTIPLIER", "2")
-            .env("LSFGVK_PERFORMANCE_MODE", "1")
-            .env("LSFGVK_FLOW_SCALE", "1.0")
+            .env("LSFGVK_PERFORMANCE_MODE", if prefs.lsfg_performance { "1" } else { "0" })
+            .env("LSFGVK_FLOW_SCALE", prefs.lsfg_flow_scale())
             .env("LSFGVK_PACING_MODE", "vsync");
         Ok(())
     }

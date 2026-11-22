@@ -70,10 +70,10 @@ pub fn menu_input(send: impl Fn(crate::deck::Key) + Send + 'static) -> Result<Pl
     Ok(child)
 }
 
-fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, interactive: bool) -> Result<Player> {
+fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, prefs: Preferences, interactive: bool) -> Result<Player> {
     let mut cmd = worker_command()?;
     if let Some(lsfg) = lsfg {
-        lsfg.configure(&mut cmd)?;
+        lsfg.configure(&mut cmd, prefs)?;
     } else if interactive {
         cmd.env("DISABLE_LSFGVK", "1").env("DISABLE_LSFG", "1");
     }
@@ -114,6 +114,49 @@ pub enum StreamEvent {
 }
 
 pub enum OverlayKey { Left, Right, Activate, Back, Select(usize) }
+
+pub fn preview(window: VideoWindow, resolution: Resolution, prefs: Preferences, cancel: Arc<AtomicBool>,
+               notify: impl Fn(PreviewEvent)) -> Result<()> {
+    let runtime = prefs.lsfg_enabled.then(lsfg::Runtime::discover).transpose()?;
+    let mut player = launch(Some(window), runtime.as_ref(), prefs, true)?;
+    let output = player.0.stdout.take().ok_or("Missing GStreamer output pipe")?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(std::result::Result::ok) {
+            if let Ok(event) = serde_json::from_str::<Value>(&line)
+                && tx.send(event).is_err() { break; }
+        }
+    });
+    let (width, height) = resolution.dimensions();
+    command(&mut player, json!({"action":"preview","width":width,"height":height,"lsfg":prefs.lsfg_enabled,
+        "performance":prefs.lsfg_performance,"flow_scale":prefs.lsfg_flow_scale(),"russian":prefs.russian(),
+        "xbox_palette":prefs.xbox_palette}))?;
+    journal::record("lsfg_preview_started", json!({"width":width,"height":height,"lsfg":prefs.lsfg_enabled,
+        "performance":prefs.lsfg_performance,"flow_scale":prefs.lsfg_flow_scale()}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while !cancel.load(Ordering::Relaxed) {
+        if !ready && Instant::now() >= deadline { return Err("The LSFG preview did not start".into()); }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(event) => match event["event"].as_str() {
+                Some("video") if !ready => { ready = true; notify(PreviewEvent::Ready); }
+                Some("preview-toggle") => notify(PreviewEvent::Toggle),
+                Some("preview-back") => notify(PreviewEvent::Back),
+                Some("preview-stats") => journal::record("lsfg_preview_sample", json!({
+                    "lsfg":prefs.lsfg_enabled,"source_fps":event["sourceFps"].as_f64(),
+                    "present_fps":event["presentFps"].as_f64(),"display_hz":event["displayHz"].as_u64(),
+                })),
+                Some("error") => return Err(event["message"].as_str().unwrap_or("The LSFG preview failed").into()),
+                _ => {},
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("The LSFG preview closed".into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {},
+        }
+    }
+    Ok(())
+}
+
+pub enum PreviewEvent { Ready, Toggle, Back }
 
 #[derive(Clone)]
 pub enum Target {
@@ -159,7 +202,7 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
     let result = (|| {
         let config = xbox.provision(&path, &cancel, &status)?;
         journal::record("stream_provisioned", json!({"provider":provider,"stun_configured":config.stun.is_some()}));
-        let mut player = launch(window, lsfg.as_ref(), interactive)?;
+        let mut player = launch(window, lsfg.as_ref(), prefs, interactive)?;
         let output = player.0.stdout.take().ok_or("Missing GStreamer output pipe")?;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -278,7 +321,8 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
                     Some("input-ready") if is_cloud => journal::record("cloud_input_ready", json!({})),
                     Some("candidates") => candidates = event.get("candidates").cloned(),
                     Some("lsfg-ready") => journal::record("lsfg_layer_loaded", json!({
-                        "multiplier": 2, "performance_mode": true, "flow_scale": 1.0,
+                        "multiplier": 2, "performance_mode": prefs.lsfg_performance,
+                        "flow_scale": if prefs.lsfg_flow_percent == 75 { 0.75 } else { 1.0 },
                     })),
                     Some("vulkan-window-embedded") => journal::record("vulkan_window_embedded", json!({})),
                     Some("stream-overlay-handoff") => journal::record("stream_overlay_handoff", json!({

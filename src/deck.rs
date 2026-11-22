@@ -71,6 +71,9 @@ pub enum Action {
     Resolution,
     Bitrate,
     Lsfg,
+    LsfgPerformance,
+    LsfgFlowScale,
+    LsfgPreview,
     Compact,
     Language,
     Palette,
@@ -363,7 +366,7 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
         ],
         2 => vec![
             Row::new(
-                "LSFG 2× Performance",
+                "LSFG 2×",
                 t.t(
                     "Применяется при следующем подключении",
                     "Applies on the next connection",
@@ -372,12 +375,19 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 Some(Lsfg),
             ),
             Row::new(
-                "Vulkan",
+                t.t("Режим LSFG", "LSFG mode"),
                 "",
-                t.t("Вывод при включённом LSFG", "Video output with LSFG"),
-                None,
+                if p.lsfg_performance { t.t("Производительность", "Performance") }
+                else { t.t("Качество", "Quality") },
+                Some(LsfgPerformance),
             ),
-            Row::new("Flow Scale", "", "1.0", None),
+            Row::new("Flow Scale", "", p.lsfg_flow_scale(), Some(LsfgFlowScale)),
+            Row::new(
+                t.t("Предпросмотр LSFG", "LSFG preview"),
+                t.t("Сравнить движение и FPS вывода", "Compare motion and presentation FPS"),
+                t.t("Открыть", "Open"),
+                Some(LsfgPreview),
+            ),
         ],
         3 => vec![
             Row::new(
@@ -534,6 +544,12 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
     let s = |p| px(p * unit);
     let t = Text(v.prefs.russian());
     let (accent, primary) = colors(v.prefs);
+    if let Some(preview) = &v.preview {
+        return div().id("lsfg-preview").size_full().bg(rgb(0)).text_color(rgb(TEXT))
+            .flex().items_center().justify_center().track_focus(&v.keyboard_focus)
+            .when(!preview.ready, |el| el.child(t.t("Открывается превью… · B Назад", "Starting preview… · B Back")))
+            .into_any_element();
+    }
     let native_stream = v.stream.is_some() && super::x11_window(window).is_some();
     if native_stream && v.video_ready {
         return div().size_full().bg(rgb(0)).into_any_element();

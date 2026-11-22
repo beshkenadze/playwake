@@ -75,6 +75,8 @@ class StreamOverlay:
         self.metrics = ()
         self.compact = '—'
         self.compact_rate = '—'
+        self.preview_controls = ()
+        self.preview_back = None
         self.russian = False
         self.xbox_palette = False
         self.console_name = 'Xbox'
@@ -90,6 +92,9 @@ class StreamOverlay:
             return
         if entry.button == 3 and entry.window in (self.parent, self.xid):
             self.toggle()
+        elif entry.button == 1 and entry.window == self.xid and self.preview_back:
+            if entry.y / self.scale >= 44:
+                (self.toggle if entry.x / self.scale < 205 else self.preview_back)()
         elif entry.button == 1 and entry.window == self.xid and self.menu:
             x, y = entry.x / self.scale, entry.y / self.scale
             index = int((y - 152) // 58)
@@ -126,7 +131,7 @@ class StreamOverlay:
         if self.menu:
             logical_width, logical_height = 440, height / self.scale
         else:
-            logical_width, logical_height = (570, 119) if hint else (490, 49)
+            logical_width, logical_height = (570, 119) if hint else (490, 70 if self.preview_controls else 49)
         w, h = (max(1, round(value * self.scale)) for value in (logical_width, logical_height))
         if self.menu:
             x, y = width - w, 0
@@ -135,7 +140,7 @@ class StreamOverlay:
         else:
             x = y = round(12 * self.scale)
         layout = (mode, x, y, w, h)
-        frame = (layout, self.selection, self.diagnostics, self.compact, self.compact_rate,
+        frame = (layout, self.selection, self.diagnostics, self.compact, self.compact_rate, self.preview_controls,
                  self.metrics if self.menu and self.diagnostics else ())
         if self.rendered == frame:
             return
@@ -148,7 +153,7 @@ class StreamOverlay:
             self.x11.XSetWindowBackgroundPixmap(self.display, self.xid, pixmap)
             if layout != self.geometry:
                 self.x11.XMoveResizeWindow(self.display, self.xid, x, y, w, h)
-                if self.menu:
+                if self.menu or self.preview_controls:
                     self.shape.XShapeCombineMask(self.display, self.xid, 2, 0, 0, 0, 0)
                 else:
                     self.shape.XShapeCombineRectangles(self.display, self.xid, 2, 0, 0, None, 0, 0, 0)
@@ -236,6 +241,10 @@ class StreamOverlay:
                 rect(0, 0, width, height, (0.08, 0.09, 0.09))
                 text(10, 19, self.compact_rate, 13, max_width=width - 20)
                 text(10, 37, self.compact, 13, max_width=width - 20)
+                if self.preview_controls:
+                    compare, back = self.preview_controls
+                    text(10, 57, compare, 13, color=accent, max_width=185)
+                    text(215, 57, back, 13, color=accent, max_width=width - 225)
         finally:
             lib.cairo_destroy(ctx)
             lib.cairo_surface_destroy(surface)
