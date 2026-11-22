@@ -1,4 +1,4 @@
-use crate::{journal, lsfg};
+use crate::{journal, lsfg, session_store::Preferences};
 use crate::xbox::{Console, Resolution, Result, Xbox};
 use serde_json::{Value, json};
 use std::{
@@ -13,7 +13,7 @@ pub struct VideoWindow {
     pub xid: u64,
 }
 
-struct Player(Child);
+pub struct Player(Child);
 
 impl Drop for Player {
     fn drop(&mut self) {
@@ -38,19 +38,11 @@ fn player_script() -> Result<PathBuf> {
     if source.is_file() { Ok(source) } else { Err("GStreamer worker file is missing".into()) }
 }
 
-fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, interactive: bool) -> Result<Player> {
+fn worker_command() -> Result<Command> {
     let python = env::var_os("ALLY_GST_PYTHON")
         .unwrap_or_else(|| if cfg!(target_os="windows") { "python.exe".into() } else { "python3".into() });
     let mut cmd = Command::new(python);
     cmd.arg(player_script()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-    if let Some(lsfg) = lsfg {
-        lsfg.configure(&mut cmd)?;
-    } else if interactive {
-        cmd.env("DISABLE_LSFGVK", "1").env("DISABLE_LSFG", "1");
-    }
-    if let Some(window) = window {
-        cmd.env("GREENLIGHT_VIDEO_PARENT_XID", window.xid.to_string());
-    }
     if let Some(root) = env::var_os("ALLY_GST_RUNTIME") {
         let root = PathBuf::from(root);
         if !root.is_dir() { return Err("GStreamer runtime directory is missing".into()); }
@@ -63,6 +55,31 @@ fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, interactive
         if let Some(value) = env::var_os(variable) { libs.extend(env::split_paths(&value)); }
         cmd.env(variable, env::join_paths(libs).map_err(|_| "Invalid GStreamer library path")?);
     }
+    Ok(cmd)
+}
+
+pub fn menu_input(send: impl Fn(crate::deck::Key) + Send + 'static) -> Result<Player> {
+    let mut child = worker_command()?.arg("--menu-input").spawn().map(Player)
+        .map_err(|_| "Could not start menu controller".to_string())?;
+    let output = child.0.stdout.take().ok_or("Missing menu controller output")?;
+    thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(std::result::Result::ok) {
+            if let Some(key) = crate::deck::Key::parse(&line) { send(key); }
+        }
+    });
+    Ok(child)
+}
+
+fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, interactive: bool) -> Result<Player> {
+    let mut cmd = worker_command()?;
+    if let Some(lsfg) = lsfg {
+        lsfg.configure(&mut cmd)?;
+    } else if interactive {
+        cmd.env("DISABLE_LSFGVK", "1").env("DISABLE_LSFG", "1");
+    }
+    if let Some(window) = window {
+        cmd.env("GREENLIGHT_VIDEO_PARENT_XID", window.xid.to_string());
+    }
     cmd.spawn().map(Player).map_err(|_| "Could not launch Python/GStreamer. Check the runtime installation.".into())
 }
 
@@ -73,7 +90,7 @@ fn command(player: &mut Player, message: Value) -> Result<()> {
 
 #[derive(Clone, Copy)]
 pub enum Run {
-    Interactive { lsfg: bool },
+    Interactive(Preferences),
     Timed(Duration),
     Latency,
     Transport,
@@ -91,6 +108,7 @@ pub enum StreamCommand {
 
 pub enum StreamEvent {
     Status(String),
+    VideoReady,
     Overlay(bool),
     OverlayKey(OverlayKey),
 }
@@ -104,15 +122,16 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
     status("Preparing Xbox session…".into());
     let (requested_width, requested_height) = resolution.dimensions();
     let benchmark = matches!(run, Run::Latency | Run::Transport | Run::Vulkan);
-    let interactive = matches!(run, Run::Interactive { .. });
-    let enable_lsfg = matches!(run, Run::Interactive { lsfg: true });
+    let interactive = matches!(run, Run::Interactive(_));
+    let prefs = match run { Run::Interactive(prefs) => prefs, _ => Preferences::default() };
+    let enable_lsfg = interactive && prefs.lsfg_enabled;
     let lsfg = if enable_lsfg {
         if window.is_none() { return Err("LSFG requires an X11 or XWayland window".into()); }
         Some(lsfg::Runtime::discover()?)
     } else { None };
     let vulkan = enable_lsfg || matches!(run, Run::Vulkan) || env::var("ALLY_VIDEO_RENDERER").as_deref() == Ok("vulkan");
     let renderer = if vulkan { "vulkan" } else { "auto" };
-    let bitrate = if benchmark || enable_lsfg { 20000 } else { 20480 };
+    let bitrate = if interactive { prefs.bitrate_mbps * 1000 } else if benchmark { 20000 } else { 20480 };
     journal::record("stream_requested", json!({"bitrate_limit_kbps": bitrate, "width": requested_width, "height": requested_height,
         "renderer": renderer, "lsfg_requested": enable_lsfg || (!interactive && vulkan
             && env::var("LSFGVK_ENV").as_deref() == Ok("1") && env::var("DISABLE_LSFGVK").as_deref() != Ok("1"))}));
@@ -132,7 +151,10 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
         });
         command(&mut player, json!({"action":"start","bitrate":bitrate,"width":requested_width,
             "height":requested_height,"benchmark":benchmark,"capture_diagnostics":matches!(run, Run::Transport),
-            "renderer":renderer,"lsfg":enable_lsfg,"interactive":interactive}))?;
+            "renderer":renderer,"lsfg":enable_lsfg,"interactive":interactive,
+            "russian":prefs.russian(),"xbox_palette":prefs.xbox_palette,"compact_stats":prefs.compact_stats,
+            "volume": if prefs.mute { 0 } else { prefs.volume },
+            "console_name": if console.name.is_empty() { &console.model } else { &console.name }}))?;
         status("Negotiating the GStreamer connection…".into());
         let start = Instant::now();
         let mut keepalive = Instant::now();
@@ -217,7 +239,7 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                             Some("activate") => Some(OverlayKey::Activate),
                             Some("back") => Some(OverlayKey::Back),
                             Some("select") => event.get("index").and_then(Value::as_u64)
-                                .filter(|index| *index < 4).map(|index| OverlayKey::Select(index as usize)),
+                                .filter(|index| *index < 5).map(|index| OverlayKey::Select(index as usize)),
                             _ => None,
                         };
                         if let Some(key) = key { notify(StreamEvent::OverlayKey(key)); }
@@ -257,6 +279,7 @@ pub fn play(xbox: Arc<Xbox>, console: Console, resolution: Resolution, window: O
                         "trigger_active":event.get("triggerActive").and_then(Value::as_bool),
                     })),
                     Some("video") => {
+                        if first_video.is_none() { notify(StreamEvent::VideoReady); }
                         first_video.get_or_insert_with(Instant::now);
                         let width = event.get("width").and_then(Value::as_u64).unwrap_or_default();
                         let height = event.get("height").and_then(Value::as_u64).unwrap_or_default();
