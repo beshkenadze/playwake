@@ -215,6 +215,7 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
         command(&mut player, json!({"action":"start","bitrate":bitrate,"width":requested_width,
             "height":requested_height,"benchmark":benchmark,"capture_diagnostics":matches!(run, Run::Transport),
             "renderer":renderer,"lsfg":enable_lsfg,"interactive":interactive,"cloud":is_cloud,"stun":config.stun,
+            "lanczos_upscale":interactive && window.is_some() && prefs.lanczos_upscale,
             "russian":prefs.russian(),"xbox_palette":prefs.xbox_palette,"compact_stats":prefs.compact_stats,
             "control_layout": crate::device::current().id, "control_device": crate::device::current().name,
             "volume": if prefs.mute { 0 } else { prefs.volume },
@@ -374,6 +375,14 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
                         "width": event.get("width").and_then(Value::as_u64),
                         "height": event.get("height").and_then(Value::as_u64),
                     })),
+                    Some("video-scaling") => {
+                        let scaling = event.get("method").and_then(Value::as_str)
+                            .filter(|method| matches!(*method, "lanczos" | "fit"));
+                        journal::record("video_scaling", json!({"method":scaling,
+                            "source_width":event["sourceWidth"].as_u64(),"source_height":event["sourceHeight"].as_u64(),
+                            "output_width":event["outputWidth"].as_u64(),"output_height":event["outputHeight"].as_u64(),
+                        }));
+                    }
                     Some("stream-input-focus") => journal::record("stream_input_focus", json!({
                         "active":event.get("active").and_then(Value::as_bool),
                     })),

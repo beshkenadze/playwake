@@ -66,6 +66,7 @@ pub struct Preferences {
     pub lsfg_enabled: bool,
     pub lsfg_performance: bool,
     pub lsfg_flow_percent: u8,
+    pub lanczos_upscale: bool,
     pub height: u32,
     pub bitrate_mbps: u32,
     pub compact_stats: bool,
@@ -79,6 +80,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self { lsfg_enabled: false, lsfg_performance: true, lsfg_flow_percent: 100,
+            lanczos_upscale: false,
             height: 1080, bitrate_mbps: 20, compact_stats: false,
             auto_connect: false, xbox_palette: false, language: Language::System, volume: 100, mute: false }
     }
