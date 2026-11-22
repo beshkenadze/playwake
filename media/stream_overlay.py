@@ -28,6 +28,10 @@ class StreamOverlay:
         bind(x11,
             ('XSelectInput', i, [ptr, xid, c.c_long]),
             ('XUnmapWindow', i, [ptr, xid]),
+            ('XCreatePixmap', xid, [ptr, xid, u, u, u]),
+            ('XSetWindowBackgroundPixmap', i, [ptr, xid, xid]),
+            ('XClearWindow', i, [ptr, xid]),
+            ('XFreePixmap', i, [ptr, xid]),
             ('XGrabButton', i, [ptr, u, u, xid, i, u, i, i, xid, xid]))
         self.shape = c.CDLL('libXext.so.6')
         bind(self.shape,
@@ -52,12 +56,14 @@ class StreamOverlay:
         self.xid = create_child(1, 1)
         screen = x11.XDefaultScreen(display)
         self.visual = x11.XDefaultVisual(display, screen)
+        self.depth = x11.XDefaultDepth(display, screen)
         x11.XStoreName(display, self.xid, b'Playwake stream overlay')
-        x11.XSelectInput(display, self.xid, (1 << 15) | (1 << 2))  # ExposureMask | ButtonPressMask
+        x11.XSelectInput(display, self.xid, 1 << 2)  # ButtonPressMask
         # Right click opens the menu from the video or its parent, with no visible toolbar.
         x11.XGrabButton(display, 3, 1 << 15, parent, 0, (1 << 2) | (1 << 3), 1, 1, 0, 0)
         self.menu = False
         self.diagnostics = False
+        self.guide_handoff = False
         self.selection = 0
         self.metrics = ()
         self.compact = '—'
@@ -70,8 +76,6 @@ class StreamOverlay:
 
     def handle(self, event):
         entry = c.cast(event, c.POINTER(ButtonEvent)).contents
-        if entry.type == 12 and entry.window == self.xid:  # Expose
-            self.rendered = None
         if entry.type != 4:  # ButtonPress
             return
         if entry.button == 3 and entry.window in (self.parent, self.xid):
@@ -83,18 +87,20 @@ class StreamOverlay:
                 self.select(index)
 
     def show_startup_hint(self):
-        self.hint_pending = not self.menu
+        self.hint_pending = not (self.menu or self.guide_handoff)
 
     def update(self, video_size):
         now = time.monotonic()
-        if self.menu:
+        if self.menu or self.guide_handoff:
             self.hint_pending = False
             self.hint_until = 0.0
         elif self.hint_pending:
             self.hint_pending = False
             self.hint_until = now + 4.0
         hint = now < self.hint_until
-        mode = 'menu' if self.menu else 'hint' if hint else 'hud' if self.diagnostics else None
+        mode = None
+        if not self.guide_handoff:
+            mode = 'menu' if self.menu else 'hint' if hint else 'hud' if self.diagnostics else None
         was_hint = self.geometry is not None and self.geometry[0] == 'hint'
         if hint != was_hint:
             self.hint_visibility(hint)
@@ -110,7 +116,7 @@ class StreamOverlay:
         if self.menu:
             logical_width, logical_height = 440, height / self.scale
         else:
-            logical_width, logical_height = (570, 62) if hint else (340, 31)
+            logical_width, logical_height = (570, 62) if hint else (390, 31)
         w, h = (max(1, round(value * self.scale)) for value in (logical_width, logical_height))
         if self.menu:
             x, y = width - w, 0
@@ -119,25 +125,35 @@ class StreamOverlay:
         else:
             x = y = round(12 * self.scale)
         layout = (mode, x, y, w, h)
-        if layout != self.geometry:
-            self.x11.XMoveResizeWindow(self.display, self.xid, x, y, w, h)
-            # HUD is click-through. The open menu receives pointer events.
-            if self.menu:
-                self.shape.XShapeCombineMask(self.display, self.xid, 2, 0, 0, 0, 0)
-            else:
-                self.shape.XShapeCombineRectangles(self.display, self.xid, 2, 0, 0, None, 0, 0, 0)
-            self.x11.XMapRaised(self.display, self.xid)
-            self.geometry = layout
+        frame = (layout, self.selection, self.diagnostics, self.compact,
+                 self.metrics if self.menu and self.diagnostics else ())
+        if self.rendered == frame:
+            return
 
-        frame = (layout, self.selection, self.diagnostics, self.compact, self.metrics if self.menu and self.diagnostics else ())
-        if self.rendered != frame:
-            self.draw(w, h, logical_width, logical_height, mode)
+        # Compose off screen. Posting each Cairo operation to the mapped
+        # window lets the compositor sample a partially drawn panel.
+        pixmap = self.x11.XCreatePixmap(self.display, self.xid, w, h, self.depth)
+        try:
+            self.draw(pixmap, w, h, logical_width, logical_height, mode)
+            self.x11.XSetWindowBackgroundPixmap(self.display, self.xid, pixmap)
+            if layout != self.geometry:
+                self.x11.XMoveResizeWindow(self.display, self.xid, x, y, w, h)
+                if self.menu:
+                    self.shape.XShapeCombineMask(self.display, self.xid, 2, 0, 0, 0, 0)
+                else:
+                    self.shape.XShapeCombineRectangles(self.display, self.xid, 2, 0, 0, None, 0, 0, 0)
+                self.x11.XMapRaised(self.display, self.xid)
+                self.geometry = layout
+            self.x11.XClearWindow(self.display, self.xid)
             self.rendered = frame
+        finally:
+            # X11 holds its own reference while the pixmap is the background.
+            self.x11.XFreePixmap(self.display, pixmap)
+            self.x11.XFlush(self.display)
 
-    def draw(self, pixel_width, pixel_height, width, height, mode):
+    def draw(self, pixmap, pixel_width, pixel_height, width, height, mode):
         lib = self.cairo
-        surface = lib.cairo_xlib_surface_create(self.display, self.xid, self.visual,
-                                                pixel_width, pixel_height)
+        surface = lib.cairo_xlib_surface_create(self.display, pixmap, self.visual, pixel_width, pixel_height)
         ctx = lib.cairo_create(surface)
         try:
             lib.cairo_scale(ctx, pixel_width / width, pixel_height / height)
@@ -197,4 +213,3 @@ class StreamOverlay:
         finally:
             lib.cairo_destroy(ctx)
             lib.cairo_surface_destroy(surface)
-            self.x11.XFlush(self.display)

@@ -308,6 +308,10 @@ impl RemotePlay {
     }
 
     fn receive(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
+        // X11 video and its controls are drawn by the media worker. Presenting
+        // another GPUI backing frame during playback can flash black in Gamescope.
+        let native_video = self.stream.is_some() && self.video_ready && x11_window(window).is_some();
+        let redraw = !native_video || matches!(&event, Event::StreamEnded(_));
         match event {
             Event::Menu(key) => {
                 let managed = std::env::var_os("ALLY_GAMESCOPE_CONTROL_DISPLAY").is_some();
@@ -383,6 +387,9 @@ impl RemotePlay {
                 self.status = result.err().unwrap_or_else(|| "Stream stopped".into());
             }
         }
+        if redraw {
+            cx.notify();
+        }
     }
 }
 
@@ -422,7 +429,7 @@ fn main() {
                 cx.spawn_in(window, async move |view, cx| loop {
                     cx.background_executor().timer(Duration::from_millis(40)).await;
                     while let Ok(event) = rx.try_recv() {
-                        if view.update_in(cx, |view: &mut RemotePlay, window, cx| { view.receive(event, window, cx); cx.notify(); }).is_err() { return; }
+                        if view.update_in(cx, |view: &mut RemotePlay, window, cx| view.receive(event, window, cx)).is_err() { return; }
                     }
                 }).detach();
                 let mut view = RemotePlay { tx, account: None, consoles: Vec::new(), sign_in: None,
