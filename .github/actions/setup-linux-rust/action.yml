@@ -13,7 +13,7 @@ runs:
           libX11-devel libXcursor-devel libXi-devel libXrandr-devel \
           libXinerama-devel libXrender-devel libXfixes-devel libXext-devel \
           wayland-devel openssl-devel vulkan-headers vulkan-loader-devel alsa-lib-devel \
-          gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-bad-free-devel cairo-devel
+          gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-bad-free-devel cairo-devel cairo-gobject-devel
 
     - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
       with:
