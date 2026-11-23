@@ -118,11 +118,13 @@ final class SyntheticFrameSource {
         drawBarcode(in: context, hostTime: hostTime)
     }
 
-    /// 32 white/black blocks encode the capture time in milliseconds. The
+    /// 32 white/black blocks encode the capture time in microseconds. The
     /// renderer reads them straight from decoded pixels, so latency does not
-    /// depend on clock sync between the two peer connections.
+    /// depend on clock sync between the two peer connections. Microseconds
+    /// keep sub-millisecond differences visible; the 32-bit value wraps every
+    /// ~71 minutes, which is far beyond any single measurement window.
     private func drawBarcode(in context: CGContext, hostTime: Int64) {
-        let value = UInt32(truncatingIfNeeded: hostTime / 1_000_000)
+        let value = UInt32(truncatingIfNeeded: hostTime / 1_000)
         let blockWidth: CGFloat = 12
         let blockHeight: CGFloat = 16
         let originX: CGFloat = 16

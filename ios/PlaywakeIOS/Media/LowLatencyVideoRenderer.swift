@@ -71,7 +71,7 @@ final class LowLatencyVideoRenderer: NSObject, RTCVideoRenderer {
                               : CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return nil }
         let stride = bgra ? CVPixelBufferGetBytesPerRow(buffer)
                           : CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
-        let nowMs = UInt32(truncatingIfNeeded: Int64(CACurrentMediaTime() * 1000))
+        let nowUs = UInt32(truncatingIfNeeded: Int64(CACurrentMediaTime() * 1_000_000))
 
         func luma(x: Int, y: Int) -> Int {
             let column = min(max(x, 0), width - 1)
@@ -104,12 +104,12 @@ final class LowLatencyVideoRenderer: NSObject, RTCVideoRenderer {
                 }
                 value = (value << 1) | UInt32(total / count >= 128 ? 1 : 0)
             }
-            let delta = nowMs &- value
-            if delta < 5_000 {
+            let delta = nowUs &- value
+            if delta < 5_000_000 {
                 best = best.map { min($0, delta) } ?? delta
             }
         }
-        return best.map(Double.init)
+        return best.map { Double($0) / 1_000 }
     }
 
     @objc(renderFrame:) func renderFrame(_ frame: RTCVideoFrame?) {

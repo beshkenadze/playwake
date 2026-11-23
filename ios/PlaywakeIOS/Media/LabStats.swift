@@ -10,6 +10,7 @@ struct LabStats: Equatable {
     var bitrateMbps = 0.0
     var jitterMs = 0.0
     var decodeMs = 0.0
+    var encodeMs = 0.0
     var jitterBufferMs = 0.0
     var rttMs = 0.0
     var latencyMs = 0.0
@@ -18,9 +19,9 @@ struct LabStats: Equatable {
 
     var summary: String {
         String(
-            format: "%dx%d  dec %.1f  ren %.1f  enc %.1f  %.1f Mb/s\njb %.1f ms  e2e %.1f ms  dec %.1f ms  jit %.1f ms  rtt %.1f ms  drop %d",
+            format: "%dx%d  dec %.1f  ren %.1f  enc %.1f  %.1f Mb/s\njb %.1f ms  e2e %.2f ms  dec %.1f ms  encT %.1f ms  jit %.1f ms  rtt %.1f ms  drop %d",
             width, height, decodeFps, renderFps, encodeFps, bitrateMbps,
-            jitterBufferMs, latencyMs, decodeMs, jitterMs, rttMs, framesDropped)
+            jitterBufferMs, latencyMs, decodeMs, encodeMs, jitterMs, rttMs, framesDropped)
     }
 }
 

@@ -338,6 +338,8 @@ final class LoopbackRTC: NSObject {
                         let dt = max(now - previous.at, 0.001)
                         updated.encodeFps = (frames - previous.frames) / dt
                     }
+                    let encodeTime = self.number(values["totalEncodeTime"])
+                    updated.encodeMs = frames > 0 ? encodeTime / frames * 1000 : 0
                     self.lastOutbound = (frames, bytes, now)
                     encoded = frames
                     sent = bytes
