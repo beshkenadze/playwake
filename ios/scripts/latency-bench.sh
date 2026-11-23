@@ -20,9 +20,25 @@ xcodebuild -project "$IOS_ROOT/PlaywakeIOS.xcodeproj" -scheme PlaywakeIOS \
     -derivedDataPath "$IOS_ROOT/build/DerivedData" build -quiet >&2
 
 APP="$IOS_ROOT/build/DerivedData/Build/Products/Debug-iphonesimulator/Playwake.app"
+
+# Keep the signed-in session across the reinstall.
+SESSION_TMP=$(mktemp -d)
+if OLD_DATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data 2>/dev/null); then
+    for f in "$OLD_DATA"/Documents/playwake-session*.json; do
+        [ -f "$f" ] && cp "$f" "$SESSION_TMP/" || true
+    done
+fi
+
 xcrun simctl terminate "$UDID" "$BUNDLE" 2>/dev/null || true
 xcrun simctl uninstall "$UDID" "$BUNDLE" >/dev/null 2>&1 || true
 xcrun simctl install "$UDID" "$APP"
+
+NEW_DATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data)
+mkdir -p "$NEW_DATA/Documents"
+for f in "$SESSION_TMP"/*.json; do
+    [ -f "$f" ] && cp "$f" "$NEW_DATA/Documents/" || true
+done
+rm -rf "$SESSION_TMP"
 # shellcheck disable=SC2086
 xcrun simctl launch "$UDID" "$BUNDLE" -autolab ${LAUNCH_ARGS:-} >/dev/null
 sleep "$WARMUP"
