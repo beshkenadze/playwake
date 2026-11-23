@@ -5038,7 +5038,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "playwake"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "gilrs",
  "gpui-kit",
@@ -5054,7 +5054,7 @@ dependencies = [
 
 [[package]]
 name = "playwake-media"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cairo-rs",
  "evdev",
