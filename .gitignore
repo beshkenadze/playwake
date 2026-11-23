@@ -3,3 +3,6 @@
 /media/__pycache__/
 /packaging/__pycache__/
 /.kaban/
+/ios/Rust/
+/ios/build/
+/ios-core/target/

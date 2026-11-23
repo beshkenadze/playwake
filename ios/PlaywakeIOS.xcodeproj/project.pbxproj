@@ -1,0 +1,469 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		01D42ECF16A08542E58D46BA /* LabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C80D46FAD79A266D8FDEF11A /* LabView.swift */; };
+		2B1D1F33A9B58A3C8E1DF75D /* PlaywakeCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4FBA7561988CA3F95A50F3E6 /* PlaywakeCore.swift */; };
+		44601115D61AE68E93067D8E /* LabStats.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7BD78DEE266C9C6BF871BD2 /* LabStats.swift */; };
+		6925050798C2E8FBBB3BD8FE /* Gamepad.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29FA71036BEFCFFB790124B3 /* Gamepad.swift */; };
+		82FECDE1FD337D7E7923939D /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1453A4D152CBA29E4F4F33B9 /* RootView.swift */; };
+		87522FF04C4BB0F7E0325798 /* SyntheticFrameSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B23CC1352AC4BB71CA20187 /* SyntheticFrameSource.swift */; };
+		908A81A825CC72F4043B19A6 /* LoopbackRTC.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF63F2BBEF0251BCE6ACA2BE /* LoopbackRTC.swift */; };
+		9DC3243A9A9709CAB42C73AF /* LabController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27B6A7B4FA50BEC56B26F0F2 /* LabController.swift */; };
+		BD987044FF717C92940BE5BB /* PlaywakeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FE0677282293FF7D7C5AC41 /* PlaywakeApp.swift */; };
+		BED1C5E9E6C88943D884FD36 /* XboxRTC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02DEB01E4EF0645F0E3453B8 /* XboxRTC.swift */; };
+		C15554DF384588993F16E9DA /* SessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 605DA431D1D5495D07B4B9EC /* SessionController.swift */; };
+		D07122DBD797B9A7324A2836 /* LowLatencyVideoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FDD03498834D08338883759 /* LowLatencyVideoView.swift */; };
+		E890698F6F5DFD302EE6E417 /* LowLatencyVideoRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78754315CC92489912BD6F34 /* LowLatencyVideoRenderer.swift */; };
+		EFB647DE0A9F8A80E406D8C1 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 0FDE2F955A036FE6B9654FC5 /* WebRTC */; };
+		F9896B2038F3C58D005F205B /* SessionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A81CCF8170F0426EDABF013 /* SessionView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		02DEB01E4EF0645F0E3453B8 /* XboxRTC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XboxRTC.swift; sourceTree = "<group>"; };
+		0FE0677282293FF7D7C5AC41 /* PlaywakeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaywakeApp.swift; sourceTree = "<group>"; };
+		1453A4D152CBA29E4F4F33B9 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		1C2EA58F2FF8AD877AA89032 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		27B6A7B4FA50BEC56B26F0F2 /* LabController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LabController.swift; sourceTree = "<group>"; };
+		29FA71036BEFCFFB790124B3 /* Gamepad.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Gamepad.swift; sourceTree = "<group>"; };
+		3B23CC1352AC4BB71CA20187 /* SyntheticFrameSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyntheticFrameSource.swift; sourceTree = "<group>"; };
+		4FBA7561988CA3F95A50F3E6 /* PlaywakeCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaywakeCore.swift; sourceTree = "<group>"; };
+		5A81CCF8170F0426EDABF013 /* SessionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionView.swift; sourceTree = "<group>"; };
+		5FDD03498834D08338883759 /* LowLatencyVideoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LowLatencyVideoView.swift; sourceTree = "<group>"; };
+		605DA431D1D5495D07B4B9EC /* SessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionController.swift; sourceTree = "<group>"; };
+		78754315CC92489912BD6F34 /* LowLatencyVideoRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LowLatencyVideoRenderer.swift; sourceTree = "<group>"; };
+		9FAAC44F53206C54A28250C1 /* PlaywakeIOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = PlaywakeIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BF63F2BBEF0251BCE6ACA2BE /* LoopbackRTC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoopbackRTC.swift; sourceTree = "<group>"; };
+		C80D46FAD79A266D8FDEF11A /* LabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LabView.swift; sourceTree = "<group>"; };
+		CF2DDACB93699FD96F4B25C4 /* playwake_core.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = playwake_core.h; sourceTree = "<group>"; };
+		E7BD78DEE266C9C6BF871BD2 /* LabStats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LabStats.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		770736100709A7EBB1CBA4D7 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EFB647DE0A9F8A80E406D8C1 /* WebRTC in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0981A78AF8915FDBBB2683F8 /* Media */ = {
+			isa = PBXGroup;
+			children = (
+				27B6A7B4FA50BEC56B26F0F2 /* LabController.swift */,
+				E7BD78DEE266C9C6BF871BD2 /* LabStats.swift */,
+				BF63F2BBEF0251BCE6ACA2BE /* LoopbackRTC.swift */,
+				78754315CC92489912BD6F34 /* LowLatencyVideoRenderer.swift */,
+				5FDD03498834D08338883759 /* LowLatencyVideoView.swift */,
+				3B23CC1352AC4BB71CA20187 /* SyntheticFrameSource.swift */,
+			);
+			path = Media;
+			sourceTree = "<group>";
+		};
+		0C719140130C9FCEAAEAD870 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				0FE0677282293FF7D7C5AC41 /* PlaywakeApp.swift */,
+				1453A4D152CBA29E4F4F33B9 /* RootView.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		1E08BA67FD2F24DA9DF3B8E8 /* PlaywakeIOS */ = {
+			isa = PBXGroup;
+			children = (
+				1C2EA58F2FF8AD877AA89032 /* Info.plist */,
+				0C719140130C9FCEAAEAD870 /* App */,
+				3985E9796023B373AC5EEE5F /* Core */,
+				0981A78AF8915FDBBB2683F8 /* Media */,
+				8BFA23243D0B3FE75FCD143E /* Session */,
+				D1F4E0A4079D7A637ACE5E1F /* UI */,
+			);
+			path = PlaywakeIOS;
+			sourceTree = "<group>";
+		};
+		3985E9796023B373AC5EEE5F /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				CF2DDACB93699FD96F4B25C4 /* playwake_core.h */,
+				4FBA7561988CA3F95A50F3E6 /* PlaywakeCore.swift */,
+			);
+			path = Core;
+			sourceTree = "<group>";
+		};
+		8BFA23243D0B3FE75FCD143E /* Session */ = {
+			isa = PBXGroup;
+			children = (
+				29FA71036BEFCFFB790124B3 /* Gamepad.swift */,
+				605DA431D1D5495D07B4B9EC /* SessionController.swift */,
+				02DEB01E4EF0645F0E3453B8 /* XboxRTC.swift */,
+			);
+			path = Session;
+			sourceTree = "<group>";
+		};
+		937D9E3326723CECD05122F4 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				9FAAC44F53206C54A28250C1 /* PlaywakeIOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D1F4E0A4079D7A637ACE5E1F /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				C80D46FAD79A266D8FDEF11A /* LabView.swift */,
+				5A81CCF8170F0426EDABF013 /* SessionView.swift */,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+		D7FBC329BD1DD9FA150CF06D = {
+			isa = PBXGroup;
+			children = (
+				1E08BA67FD2F24DA9DF3B8E8 /* PlaywakeIOS */,
+				937D9E3326723CECD05122F4 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1E944538D90F10CCD552B2B8 /* PlaywakeIOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 11DE536089BF7048C94AC337 /* Build configuration list for PBXNativeTarget "PlaywakeIOS" */;
+			buildPhases = (
+				E45F672DD2939A8C7063D655 /* Build Rust core */,
+				1F374C3F30CEFC0BCA3CCC5C /* Sources */,
+				770736100709A7EBB1CBA4D7 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PlaywakeIOS;
+			packageProductDependencies = (
+				0FDE2F955A036FE6B9654FC5 /* WebRTC */,
+			);
+			productName = PlaywakeIOS;
+			productReference = 9FAAC44F53206C54A28250C1 /* PlaywakeIOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AE0384F1AB4E3EFA576C1FD9 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = 5B4A05012DA5717803F893A5 /* Build configuration list for PBXProject "PlaywakeIOS" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = D7FBC329BD1DD9FA150CF06D;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				748E894FE886462C6B1281E4 /* XCRemoteSwiftPackageReference "WebRTC" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 937D9E3326723CECD05122F4 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1E944538D90F10CCD552B2B8 /* PlaywakeIOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		E45F672DD2939A8C7063D655 /* Build Rust core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/scripts/build-rust-core.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1F374C3F30CEFC0BCA3CCC5C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6925050798C2E8FBBB3BD8FE /* Gamepad.swift in Sources */,
+				9DC3243A9A9709CAB42C73AF /* LabController.swift in Sources */,
+				44601115D61AE68E93067D8E /* LabStats.swift in Sources */,
+				01D42ECF16A08542E58D46BA /* LabView.swift in Sources */,
+				908A81A825CC72F4043B19A6 /* LoopbackRTC.swift in Sources */,
+				E890698F6F5DFD302EE6E417 /* LowLatencyVideoRenderer.swift in Sources */,
+				D07122DBD797B9A7324A2836 /* LowLatencyVideoView.swift in Sources */,
+				BD987044FF717C92940BE5BB /* PlaywakeApp.swift in Sources */,
+				2B1D1F33A9B58A3C8E1DF75D /* PlaywakeCore.swift in Sources */,
+				82FECDE1FD337D7E7923939D /* RootView.swift in Sources */,
+				C15554DF384588993F16E9DA /* SessionController.swift in Sources */,
+				F9896B2038F3C58D005F205B /* SessionView.swift in Sources */,
+				87522FF04C4BB0F7E0325798 /* SyntheticFrameSource.swift in Sources */,
+				BED1C5E9E6C88943D884FD36 /* XboxRTC.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		6F5765F38D76E7FFEC444D00 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = PlaywakeIOS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Rust",
+				);
+				OTHER_LDFLAGS = (
+					"-lplaywake_core",
+					"-framework",
+					Security,
+					"-framework",
+					CoreFoundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.beshkenadze.playwake.ios;
+				PRODUCT_NAME = Playwake;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = PlaywakeIOS/Core/playwake_core.h;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		88C320202F8097C1C997FDBF /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = PlaywakeIOS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Rust",
+				);
+				OTHER_LDFLAGS = (
+					"-lplaywake_core",
+					"-framework",
+					Security,
+					"-framework",
+					CoreFoundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.beshkenadze.playwake.ios;
+				PRODUCT_NAME = Playwake;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = PlaywakeIOS/Core/playwake_core.h;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		AE5312286EBA7DF762F51191 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		FE3B5A44D0C169930A0C3AF4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		11DE536089BF7048C94AC337 /* Build configuration list for PBXNativeTarget "PlaywakeIOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				88C320202F8097C1C997FDBF /* Debug */,
+				6F5765F38D76E7FFEC444D00 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		5B4A05012DA5717803F893A5 /* Build configuration list for PBXProject "PlaywakeIOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FE3B5A44D0C169930A0C3AF4 /* Debug */,
+				AE5312286EBA7DF762F51191 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		748E894FE886462C6B1281E4 /* XCRemoteSwiftPackageReference "WebRTC" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/stasel/WebRTC.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 158.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		0FDE2F955A036FE6B9654FC5 /* WebRTC */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 748E894FE886462C6B1281E4 /* XCRemoteSwiftPackageReference "WebRTC" */;
+			productName = WebRTC;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = AE0384F1AB4E3EFA576C1FD9 /* Project object */;
+}
