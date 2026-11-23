@@ -39,10 +39,11 @@ done
 
 die() { echo "error: $*" >&2; exit 1; }
 
-# SteamOS supervises Steam with a user unit; killing the client directly
-# makes the session restart it. Stop/start the unit when it exists.
+# SteamOS supervises Steam with a user unit in Game Mode; killing the
+# client directly makes the session restart it. In Desktop Mode Steam runs
+# outside the unit, so fall back to signals there.
 steam_unit=0
-if systemctl --user cat steam-launcher.service >/dev/null 2>&1; then
+if systemctl --user is-active --quiet steam-launcher.service 2>/dev/null; then
     steam_unit=1
 fi
 
