@@ -15,6 +15,9 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # The runner image ships LLVM's libunwind-14-dev, which conflicts
+          # with libunwind-dev pulled in by libgstreamer1.0-dev.
+          sudo apt-get remove -y --purge libunwind-14-dev libunwind-14
           sudo apt-get install -y --no-install-recommends $(cat packaging/build-deps.txt)
 
       - uses: dtolnay/rust-toolchain@stable
