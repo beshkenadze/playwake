@@ -32,6 +32,7 @@ FIXTURE = (
     b"\x07SomeU64\x00" + struct.pack("<Q", 2**40) +
     b"\x08"
     b"\x08"
+    b"\x08"
 )
 
 
@@ -100,8 +101,9 @@ class VdfTests(unittest.TestCase):
         self.assertEqual(sc.dump_vdf(parsed), FIXTURE)
 
     def test_empty_file_is_empty_map(self):
-        self.assertEqual(sc.dump_vdf({}), b"")
+        self.assertEqual(sc.dump_vdf({}), b"\x08")
         self.assertEqual(sc.parse_vdf(b""), {})
+        self.assertEqual(sc.parse_vdf(b"\x08"), {})
 
 
 class InstallTests(unittest.TestCase):

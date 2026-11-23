@@ -30,6 +30,30 @@ done
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# SteamOS supervises Steam with a user unit; killing the client directly
+# makes the session restart it. Stop/start the unit when it exists.
+steam_unit=0
+if systemctl --user cat steam-launcher.service >/dev/null 2>&1; then
+    steam_unit=1
+fi
+
+close_steam() {
+    if [[ $steam_unit == 1 ]]; then
+        systemctl --user stop steam-launcher.service || die "could not stop steam-launcher.service"
+    else
+        pkill -15 -x steam 2>/dev/null || true
+    fi
+}
+
+start_steam() {
+    if [[ $steam_unit == 1 ]]; then
+        systemctl --user start steam-launcher.service || die "could not start steam-launcher.service"
+    else
+        nohup steam -silent >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+}
+
 [[ $(uname -s) == Linux ]] || die "this uninstaller targets Linux/SteamOS"
 dir=$(cd -- "$dir" 2>/dev/null && pwd) || die "$dir does not exist"
 manifest="$dir/install.json"
@@ -46,7 +70,10 @@ if Path(manifest.get("dir", "")).resolve() != Path(sys.argv[2]).resolve():
     raise SystemExit(1)
 PY
 [[ $dir != "$HOME" && $dir != "/" ]] || die "refusing to remove $dir"
-if [[ -n ${GAMESCOPE_WAYLAND_DISPLAY:-} ]]; then
+# Game Mode restarts Steam whenever it exits, clobbering shortcuts.vdf.
+# The env var is absent in SSH sessions, so also check the session target.
+if [[ -n ${GAMESCOPE_WAYLAND_DISPLAY:-} ]] ||
+    [[ $(systemctl --user is-active gamescope-session.target 2>/dev/null) == active ]]; then
     die "Game Mode detected. Switch to Desktop Mode and re-run."
 fi
 
@@ -62,9 +89,9 @@ fi
 closed_steam=0
 if pgrep -x steam >/dev/null 2>&1; then
     echo "Closing Steam (it rewrites shortcuts.vdf on exit)..."
-    pkill -15 -x steam 2>/dev/null || true
+    close_steam
     closed_steam=1
-    for _ in $(seq 1 30); do
+    for _ in $(seq 1 60); do
         pgrep -x steam >/dev/null 2>&1 || break
         sleep 1
     done
@@ -85,6 +112,5 @@ echo "Kept sign-in state: $HOME/.local/state/ally-remote-play"
 
 if [[ $restart_steam == 1 && $closed_steam == 1 ]]; then
     echo "Starting Steam..."
-    nohup steam -silent >/dev/null 2>&1 &
-    disown 2>/dev/null || true
+    start_steam
 fi

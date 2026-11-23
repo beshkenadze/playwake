@@ -39,10 +39,38 @@ done
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# SteamOS supervises Steam with a user unit; killing the client directly
+# makes the session restart it. Stop/start the unit when it exists.
+steam_unit=0
+if systemctl --user cat steam-launcher.service >/dev/null 2>&1; then
+    steam_unit=1
+fi
+
+close_steam() {
+    if [[ $steam_unit == 1 ]]; then
+        systemctl --user stop steam-launcher.service || die "could not stop steam-launcher.service"
+    else
+        pkill -15 -x steam 2>/dev/null || true
+    fi
+}
+
+start_steam() {
+    if [[ $steam_unit == 1 ]]; then
+        systemctl --user start steam-launcher.service || die "could not start steam-launcher.service"
+    else
+        nohup steam -silent >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+}
+
 [[ $(uname -s) == Linux ]] || die "this installer targets Linux/SteamOS"
 [[ $(uname -m) == x86_64 ]] || die "x86_64 only (got $(uname -m))"
 command -v python3 >/dev/null || die "python3 is required"
-if [[ $do_shortcut == 1 && -n ${GAMESCOPE_WAYLAND_DISPLAY:-} ]]; then
+# Game Mode restarts Steam whenever it exits, clobbering shortcuts.vdf.
+# The env var is absent in SSH sessions, so also check the session target.
+if [[ $do_shortcut == 1 ]] &&
+    { [[ -n ${GAMESCOPE_WAYLAND_DISPLAY:-} ]] ||
+      [[ $(systemctl --user is-active gamescope-session.target 2>/dev/null) == active ]]; }; then
     die "Game Mode detected. Switch to Desktop Mode and re-run (closing Steam ends the session)."
 fi
 mkdir -p "$dir"
@@ -130,9 +158,9 @@ if [[ $do_shortcut == 1 ]]; then
             esac
         fi
         say "Closing Steam (it rewrites shortcuts.vdf on exit)..."
-        pkill -15 -x steam 2>/dev/null || true
+        close_steam
         closed_steam=1
-        for _ in $(seq 1 30); do
+        for _ in $(seq 1 60); do
             pgrep -x steam >/dev/null 2>&1 || break
             sleep 1
         done
@@ -165,8 +193,7 @@ PY
 
 if [[ $restart_steam == 1 && $closed_steam == 1 ]]; then
     say "Starting Steam..."
-    nohup steam -silent >/dev/null 2>&1 &
-    disown 2>/dev/null || true
+    start_steam
 fi
 
 say "==> Done"

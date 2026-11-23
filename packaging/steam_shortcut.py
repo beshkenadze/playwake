@@ -116,6 +116,9 @@ def dump_vdf(obj: dict) -> bytes:
                 fail(f"cannot serialize {key!r} of type {type(value).__name__}")
 
     emit(obj)
+    # Steam requires the root map's closing byte; without it the client
+    # rejects shortcuts.vdf ("failed to load shortcut file") and drops it.
+    out.append(BIN_END)
     return bytes(out)
 
 
