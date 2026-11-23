@@ -4,6 +4,8 @@
 
 pub const VIEW_MENU: u16 = 8 | 4;
 pub const GUIDE: u16 = 2;
+/// Both chord buttons must arrive inside this window to count as a tap.
+pub const CHORD_WINDOW_MS: f64 = 90.0;
 
 #[derive(Debug, PartialEq)]
 pub enum RouteEvent {
@@ -34,7 +36,6 @@ pub struct Route {
     release_gate: bool,
     previous: u16,
     chord_started: Option<f64>,
-    both_started: Option<f64>,
     pending_buttons: u16,
     passthrough: bool,
     guide: bool,
@@ -49,7 +50,6 @@ impl Default for Route {
             release_gate: false,
             previous: 0,
             chord_started: None,
-            both_started: None,
             pending_buttons: 0,
             passthrough: false,
             guide: false,
@@ -61,7 +61,6 @@ impl Default for Route {
 impl Route {
     fn reset_chord(&mut self) {
         self.chord_started = None;
-        self.both_started = None;
         self.pending_buttons = 0;
         self.passthrough = false;
     }
@@ -147,23 +146,19 @@ impl Route {
         if self.chord_started.is_none() {
             self.chord_started = Some(now);
         }
+        let elapsed = now - self.chord_started.unwrap();
+        // The second button must arrive before the first is sent to Xbox:
+        // a simultaneous tap opens the overlay instead of a hold.
+        if chord == VIEW_MENU && elapsed <= CHORD_WINDOW_MS {
+            events.extend(self.open_overlay());
+            return (Routed::neutral(), events);
+        }
         self.pending_buttons |= chord;
-        if chord == VIEW_MENU {
-            if self.both_started.is_none() {
-                self.both_started = Some(now);
-            }
-            if now - self.both_started.unwrap() >= 500.0 {
-                events.extend(self.open_overlay());
-                return (Routed::neutral(), events);
-            }
-        } else {
-            self.both_started = None;
-            if now - self.chord_started.unwrap() >= 90.0 {
-                self.passthrough = true;
-                let replay = self.pending_buttons;
-                self.pending_buttons = 0;
-                return (Routed { axes, buttons: buttons | replay, lt, rt }, events);
-            }
+        if elapsed >= CHORD_WINDOW_MS {
+            self.passthrough = true;
+            let replay = self.pending_buttons;
+            self.pending_buttons = 0;
+            return (Routed { axes, buttons: buttons | replay, lt, rt }, events);
         }
         (Routed { axes, buttons: buttons & !VIEW_MENU, lt, rt }, events)
     }
@@ -250,15 +245,22 @@ mod tests {
     }
 
     #[test]
-    fn chord_hold_opens_overlay_at_500ms() {
+    fn simultaneous_tap_opens_overlay() {
         let mut r = Route::default();
         let (out, ev) = r.route(axes(), VIEW_MENU, 0, 0, 0.0);
+        assert_eq!(out, Routed::neutral());
+        assert_eq!(ev, vec![RouteEvent::Overlay(true)]);
+        assert!(r.overlay);
+    }
+
+    #[test]
+    fn second_button_within_window_opens_overlay() {
+        let mut r = Route::default();
+        let (out, ev) = r.route(axes(), 8, 0, 0, 0.0);
         assert_eq!(out.buttons, 0);
         assert!(ev.is_empty());
-        let (out, ev) = r.route(axes(), VIEW_MENU, 0, 0, 499.0);
-        assert_eq!(out.buttons, 0);
-        assert!(ev.is_empty());
-        let (out, ev) = r.route(axes(), VIEW_MENU, 0, 0, 500.0);
+        // Menu arrives 40 ms after View: still a simultaneous tap.
+        let (out, ev) = r.route(axes(), VIEW_MENU, 0, 0, 40.0);
         assert_eq!(out, Routed::neutral());
         assert_eq!(ev, vec![RouteEvent::Overlay(true)]);
         assert!(r.overlay);
@@ -289,14 +291,17 @@ mod tests {
     }
 
     #[test]
-    fn chord_then_full_chord_resets_single_timer() {
+    fn late_second_button_passes_chord_to_xbox() {
         let mut r = Route::default();
         r.route(axes(), 8, 0, 0, 0.0);
         let (out, ev) = r.route(axes(), VIEW_MENU, 0, 0, 100.0);
-        assert_eq!(out.buttons, 0);
+        assert_eq!(out.buttons, VIEW_MENU);
         assert!(ev.is_empty());
-        let (_, ev) = r.route(axes(), VIEW_MENU, 0, 0, 600.0);
-        assert_eq!(ev, vec![RouteEvent::Overlay(true)]);
+        assert!(!r.overlay);
+        // Passthrough stays armed, so the held chord is not stripped.
+        let (out, ev) = r.route(axes(), VIEW_MENU, 0, 0, 600.0);
+        assert_eq!(out.buttons, VIEW_MENU);
+        assert!(ev.is_empty());
     }
 
     #[test]
@@ -340,7 +345,7 @@ mod tests {
     #[test]
     fn focus_loss_clears_guide_and_chord() {
         let mut r = Route::default();
-        r.route(axes(), VIEW_MENU, 0, 0, 0.0);
+        r.route(axes(), 8, 0, 0, 0.0);
         r.focus(false);
         r.focus(true);
         let (out, ev) = r.route([0, 0, 0, 0], 0, 0, 0, 10.0);
@@ -348,8 +353,10 @@ mod tests {
         assert_eq!(ev, vec![RouteEvent::Rearmed]);
         let (_, ev) = r.route([0, 0, 0, 0], 0, 0, 0, 20.0);
         assert!(ev.is_empty());
-        let (out, _) = r.route(axes(), VIEW_MENU, 0, 0, 30.0);
-        assert_eq!(out.buttons, 0);
+        // The chord window was reset, so both buttons count as a fresh tap.
+        let (out, ev) = r.route(axes(), VIEW_MENU, 0, 0, 30.0);
+        assert_eq!(out, Routed::neutral());
+        assert_eq!(ev, vec![RouteEvent::Overlay(true)]);
     }
 
     #[test]

@@ -45,9 +45,9 @@ The Flatpak uses the Freedesktop 26.08 runtime. Cloud Gaming availability depend
 | **LB / RB** | Switch tabs |
 | **D-pad / left stick** | Move focus. Press **Up** from the first row to reach the tabs |
 | **A / B** | Select or go back |
-| **View + Menu together** | Open the Playwake stream overlay, with Xbox Guide, statistics, reconnect and end stream |
+| **View + Menu tapped together** | Open the Playwake stream overlay, with Xbox Guide, statistics, reconnect and end stream |
 
-The stream shows the overlay shortcut when it starts. On desktop, you can also right-click the video to open the overlay. See the [Linux setup guide](docs/development.md#lsfg-on-linux) for optional Lossless Scaling configuration.
+Tap both buttons at the same time; there is no need to hold them. The stream shows the overlay shortcut when it starts. On desktop, you can also right-click the video to open the overlay. See the [Linux setup guide](docs/development.md#lsfg-on-linux) for optional Lossless Scaling configuration.
 
 ## Project status
 

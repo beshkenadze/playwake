@@ -1,7 +1,7 @@
 //! Shared worker state touched by streaming-thread pad probes (short mutex
 //! holds, no IO) and read by main-loop timers for stats/HUD emission.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use gstreamer::prelude::*;
 use crate::transport::Transport;
@@ -10,6 +10,8 @@ use crate::trial::TrialState;
 #[derive(Clone, Debug, Default)]
 pub struct Timing {
     pub received_at: f64,
+    /// Wall time when depay/parser received the frame after the jitter buffer.
+    pub post_jitter_at: f64,
     pub pre_jitter: bool,
     pub decoded_at: Option<f64>,
     pub sink_at: Option<f64>,
@@ -52,6 +54,9 @@ pub struct State {
     pub trial: Option<TrialState>,
     pub viewport: (u32, u32),
     pub hud_compact: String,
+    pub hud_compact_rate: String,
+    pub hud_video_latency: VecDeque<f64>,
+    pub hud_enabled: bool,
     pub hud_metrics: Vec<String>,
     pub lsfg: bool,
     pub russian: bool,
@@ -82,6 +87,16 @@ impl State {
             transport,
             ..Default::default()
         }
+    }
+
+    /// Forget the previous HUD sample and stale text so the next refresh
+    /// measures rates from the moment statistics became visible.
+    pub fn reset_hud(&mut self) {
+        self.hud_snapshot = None;
+        self.hud_compact = "—".into();
+        self.hud_compact_rate = "—".into();
+        self.hud_video_latency.clear();
+        self.hud_metrics.clear();
     }
 
     pub fn remember_timing(&mut self, pts: u64, timing: Timing) {
@@ -139,6 +154,9 @@ impl Default for State {
             trial_input_timing: None,
             viewport: (1920, 1080),
             hud_compact: String::new(),
+            hud_compact_rate: "—".into(),
+            hud_video_latency: VecDeque::new(),
+            hud_enabled: false,
             hud_metrics: Vec::new(),
             lsfg: false,
             russian: false,

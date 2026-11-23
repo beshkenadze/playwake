@@ -128,12 +128,12 @@ pub fn attach_video(
                 sr_wall_gap_ms = transport.sr_wall_gap_ms();
             }
         }
-        st.remember_timing(pts, Timing { received_at, pre_jitter: first_packet.is_some(),
+        st.remember_timing(pts, Timing { received_at, post_jitter_at: now, pre_jitter: first_packet.is_some(),
             decoded_at: None, sink_at: None, capture_at, sr_wall_gap_ms });
         gst::PadProbeReturn::Ok
     });
 
-    // parser src: encoded frame/byte counters.
+    // parser src: encoded frame/byte counters (Python `encoded` probe).
     let parser = bin.by_name("parser").ok_or("parser missing")?;
     let st = state.clone();
     parser.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
@@ -256,7 +256,17 @@ pub fn attach_video(
         }
         let pts = buffer.pts().map(|t| t.nseconds());
         if let Some(pts) = pts {
-            if let Some(timing) = st.frame_timing.get_mut(&pts) { timing.sink_at = Some(now); }
+            let hud_enabled = st.hud_enabled;
+            let latency = st.frame_timing.get_mut(&pts).and_then(|timing| {
+                timing.sink_at = Some(now);
+                (timing.post_jitter_at > 0.0).then(|| now - timing.post_jitter_at)
+            });
+            if hud_enabled {
+                if let Some(ms) = latency.filter(|ms| *ms >= 0.0 && *ms < 10_000.0) {
+                    st.hud_video_latency.push_back(ms);
+                    while st.hud_video_latency.len() > 60 { st.hud_video_latency.pop_front(); }
+                }
+            }
             if st.benchmark && vulkan {
                 if let Some(stage) = st.queue_times.remove(&pts) {
                     if let (Some(dequeued), Some(pre_upload)) = (stage.dequeued, stage.pre_upload) {

@@ -29,10 +29,11 @@ pub struct Overlay {
     pub selection: usize,
     pub metrics: Vec<String>,
     pub compact: String,
+    pub compact_rate: String,
     pub russian: bool,
     pub xbox_palette: bool,
     pub console_name: String,
-    rendered: Option<(String, usize, bool, String, Vec<String>)>,
+    rendered: Option<(String, usize, bool, String, String, Vec<String>)>,
     geometry: Option<(String, i32, i32, i32, i32)>,
     scale: f64,
 }
@@ -59,7 +60,7 @@ impl Overlay {
                 xlib, shape_conn, display, xid: xid as u32, parent, visual,
                 hint_pending: false, hint_until: 0.0,
                 menu: false, diagnostics: false, selection: 0,
-                metrics: Vec::new(), compact: "—".into(),
+                metrics: Vec::new(), compact: "—".into(), compact_rate: "—".into(),
                 russian: false, xbox_palette: false, console_name: "Xbox".into(),
                 rendered: None, geometry: None, scale: 1.0,
             })
@@ -123,9 +124,9 @@ impl Overlay {
         let (logical_width, logical_height) = if self.menu {
             (440.0, height / self.scale)
         } else if hint {
-            (570.0, 62.0)
+            (570.0, 86.0)
         } else {
-            (340.0, 31.0)
+            (490.0, 49.0)
         };
         let w = (logical_width * self.scale).round().max(1.0) as i32;
         let h = (logical_height * self.scale).round().max(1.0) as i32;
@@ -153,8 +154,12 @@ impl Overlay {
                 (self.xlib.XFlush)(self.display);
             }
             self.geometry = Some(layout);
+            // A resize repaints the new area with the window background, so
+            // repaint even when the text itself did not change.
+            self.rendered = None;
         }
-        let frame = (mode.to_string(), self.selection, self.diagnostics, self.compact.clone(),
+        let frame = (mode.to_string(), self.selection, self.diagnostics,
+            self.compact.clone(), self.compact_rate.clone(),
             if self.menu && self.diagnostics { self.metrics.clone() } else { Vec::new() });
         if self.rendered.as_ref() != Some(&frame) {
             self.draw(w, h, logical_width, logical_height, mode);
@@ -199,7 +204,8 @@ impl Overlay {
             ctx.arc(36.0, 79.0, 4.0, 0.0, 6.284);
             let _ = ctx.fill();
             text(&ctx, 48.0, 85.0, &label("Стрим идёт", "Streaming"), 16.0, false, accent);
-            text(&ctx, 32.0, 117.0, &self.compact, 14.0, false, muted);
+            text(&ctx, 32.0, 111.0, &self.compact_rate, 13.0, false, muted);
+            text(&ctx, 32.0, 131.0, &self.compact, 13.0, false, muted);
             let diagnostics = if self.diagnostics { label("Скрыть статистику", "Hide statistics") }
                 else { label("Статистика", "Statistics") };
             let names = [label("Продолжить", "Resume"), "Xbox Guide".to_string(), diagnostics,
@@ -226,10 +232,12 @@ impl Overlay {
             rect(&ctx, 0.0, 0.0, width, height, (0.12, 0.12, 0.13));
             rect(&ctx, 0.0, 0.0, 4.0, height, accent);
             text(&ctx, 19.0, 25.0, &label("Меню Playwake", "Playwake stream menu"), 15.0, true, accent);
-            text(&ctx, 19.0, 47.0, &label("Удерживайте View + Menu 0,5 с", "Hold View + Menu for 0.5 s"), 17.0, false, (0.93, 0.95, 0.99));
+            text(&ctx, 19.0, 54.0, "View + Menu", 24.0, true, (0.93, 0.95, 0.99));
+            text(&ctx, 19.0, 78.0, &label("Нажмите одновременно", "Tap both buttons together"), 15.0, false, (0.93, 0.95, 0.99));
         } else {
             rect(&ctx, 0.0, 0.0, width, height, (0.08, 0.09, 0.09));
-            text(&ctx, 10.0, 21.0, &self.compact, 14.0, false, (0.93, 0.95, 0.99));
+            text(&ctx, 10.0, 19.0, &self.compact_rate, 13.0, false, (0.93, 0.95, 0.99));
+            text(&ctx, 10.0, 37.0, &self.compact, 13.0, false, (0.93, 0.95, 0.99));
         }
         drop(ctx);
         unsafe {

@@ -68,6 +68,7 @@ struct Worker {
     quit: glib::MainLoop,
     start_time: f64,
     input_timer: bool,
+    hud_active: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -157,16 +158,29 @@ fn run() -> Result<(), String> {
         });
     }
 
-    // 1 s HUD cadence while diagnostics are enabled (Python refresh_hud).
+    // 1 s HUD cadence while the overlay menu or diagnostics are visible
+    // (Python sync_hud_timer). Opening the menu shows live values too.
     {
         let slot = slot.clone();
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
-            if let Some(w) = slot.lock().unwrap().as_ref() {
-                let enabled = w.state.lock().unwrap().diagnostics;
-                if enabled {
+            let mut guard = slot.lock().unwrap();
+            if let Some(w) = guard.as_mut() {
+                let wants_stats = w.input.route.overlay || w.state.lock().unwrap().diagnostics;
+                if wants_stats {
+                    if !w.hud_active {
+                        w.hud_active = true;
+                        let mut st = w.state.lock().unwrap();
+                        st.reset_hud();
+                        st.hud_enabled = true;
+                    }
                     let queue = w.video.as_ref().and_then(|v| v.queue.clone());
                     let element = w.rtc.lock().unwrap().element.clone();
                     hud::refresh_hud(&w.state, &element, queue.as_ref());
+                } else if w.hud_active {
+                    w.hud_active = false;
+                    let mut st = w.state.lock().unwrap();
+                    st.hud_enabled = false;
+                    st.reset_hud();
                 }
             }
             glib::ControlFlow::Continue
@@ -196,6 +210,7 @@ fn run() -> Result<(), String> {
                                 let st = w.state.lock().unwrap();
                                 overlay.diagnostics = st.diagnostics;
                                 overlay.compact = st.hud_compact.clone();
+                                overlay.compact_rate = st.hud_compact_rate.clone();
                                 overlay.metrics = st.hud_metrics.clone();
                                 drop(st);
                                 let size = x11.size;
@@ -491,6 +506,7 @@ fn start(
         x11: x11_window, overlay, focus, target_app,
         input, renderer: renderer.clone(), window, lsfg, volume,
         tracked: std::collections::HashSet::new(), quit: quit.clone(), start_time, input_timer: false,
+        hud_active: false,
     });
 
     // pad-added → branch attachment.
