@@ -1,0 +1,13 @@
+# Private GStreamer runtime for the SteamOS bundle.
+#
+# These are SteamOS's own packages (repo extra-3.9), so the plugin ABI and the
+# library versions match the system exactly. SteamOS already ships GStreamer
+# core/base/good, the Vulkan plugins, PyGObject, evdev, libnice, libva, ffmpeg
+# and libXRes. The packages below add only what it lacks: webrtcbin, the VA-API
+# plugin, the libav decoder and libsrtp2.
+#
+# Refresh on a SteamOS device with packaging/refresh-runtime-packages.sh.
+https://steamdeck-packages.steamos.cloud/archlinux-mirror/extra-3.9/os/x86_64/gst-plugins-bad-1.28.5-2-x86_64.pkg.tar.zst
+https://steamdeck-packages.steamos.cloud/archlinux-mirror/extra-3.9/os/x86_64/gst-plugin-va-1.28.5-2-x86_64.pkg.tar.zst
+https://steamdeck-packages.steamos.cloud/archlinux-mirror/extra-3.9/os/x86_64/gst-libav-1.28.5-2-x86_64.pkg.tar.zst
+https://steamdeck-packages.steamos.cloud/archlinux-mirror/extra-3.9/os/x86_64/libsrtp-1:2.8.0-1-x86_64.pkg.tar.zst
