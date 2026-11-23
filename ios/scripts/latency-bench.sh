@@ -6,8 +6,8 @@ set -eu
 
 IOS_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUNDLE=io.github.beshkenadze.playwake.ios
-WARMUP=${WARMUP:-32}
-SAMPLES=${SAMPLES:-10}
+WARMUP=${WARMUP:-44}
+SAMPLES=${SAMPLES:-20}
 
 UDID=${SIM_UDID:-}
 if [ -z "$UDID" ]; then

@@ -4,7 +4,7 @@ import SwiftUI
 final class LabController: ObservableObject {
     @Published private(set) var stats = LabStats()
     @Published private(set) var running = false
-    let renderer = LowLatencyVideoRenderer()
+    let renderer = LowLatencyVideoRenderer(usesBarcode: true)
     private var rtc: LoopbackRTC?
 
     func start() {

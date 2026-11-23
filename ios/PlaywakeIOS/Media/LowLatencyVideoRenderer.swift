@@ -11,10 +11,20 @@ final class LowLatencyVideoRenderer: NSObject, RTCVideoRenderer {
     private let lock = NSLock()
     private weak var targetLayer: AVSampleBufferDisplayLayer?
     private let renderQueue = DispatchQueue(label: "io.playwake.render", qos: .userInteractive)
+    private let usesBarcode: Bool
     private var formatDescription: CMVideoFormatDescription?
     private var formatSize: CGSize = .zero
     private var lastLog = CFAbsoluteTimeGetCurrent()
     private var bufferKinds: Set<String> = []
+
+    /// `usesBarcode` is for the synthetic lab only: it stamps the capture time
+    /// into each frame and the renderer reads it back to measure end-to-end
+    /// latency without clock sync. Real console frames have no barcode and the
+    /// read would be a wasted IOSurface readback per frame.
+    init(usesBarcode: Bool = false) {
+        self.usesBarcode = usesBarcode
+        super.init()
+    }
 
     private var frameCount = 0
     private var windowStart = CFAbsoluteTimeGetCurrent()
@@ -120,9 +130,10 @@ final class LowLatencyVideoRenderer: NSObject, RTCVideoRenderer {
             lock.lock(); dropped += 1; lock.unlock()
             return
         }
-        let decodedLatency = barcodeLatency(cvBuffer.pixelBuffer)
+        let decodedLatency = usesBarcode ? barcodeLatency(cvBuffer.pixelBuffer) : nil
+        let plausibleTimestamp = timeStampLatency >= 0 && timeStampLatency < 1_000
         lock.lock()
-        latencyMs = decodedLatency ?? timeStampLatency
+        latencyMs = decodedLatency ?? (plausibleTimestamp ? timeStampLatency : 0)
         lock.unlock()
 
         let width = CVPixelBufferGetWidth(cvBuffer.pixelBuffer)
