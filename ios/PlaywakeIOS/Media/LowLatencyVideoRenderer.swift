@@ -31,6 +31,8 @@ final class LowLatencyVideoRenderer: NSObject, RTCVideoRenderer {
     private var frameFps = 0.0
     private var latencyMs = 0.0
     private var dropped = 0
+    private var submitSum = 0.0
+    private var submitCount = 0
     private(set) var lastFrameAt: CFAbsoluteTime = 0
 
     func attach(_ layer: AVSampleBufferDisplayLayer) {
@@ -54,6 +56,17 @@ final class LowLatencyVideoRenderer: NSObject, RTCVideoRenderer {
         lock.lock()
         defer { lock.unlock() }
         return latencyMs
+    }
+
+    /// Average time spent between the renderer callback and the sample buffer
+    /// being handed to the display layer, in milliseconds.
+    func snapshotSubmit() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        let average = submitCount > 0 ? submitSum / Double(submitCount) * 1000 : 0
+        submitSum = 0
+        submitCount = 0
+        return average
     }
 
     private var callbacks = 0
@@ -118,7 +131,8 @@ final class LowLatencyVideoRenderer: NSObject, RTCVideoRenderer {
             LabLog.write("renderFrame callback #1 frame=\(frame == nil ? "nil" : "buffer")")
         }
         guard let frame else { return }
-        let nowNs = Int64(CACurrentMediaTime() * 1_000_000_000)
+        let entryTime = CACurrentMediaTime()
+        let nowNs = Int64(entryTime * 1_000_000_000)
         let timeStampLatency = Double(nowNs - frame.timeStampNs) / 1_000_000
         let kind = String(describing: type(of: frame.buffer))
         lock.lock()
@@ -193,6 +207,11 @@ final class LowLatencyVideoRenderer: NSObject, RTCVideoRenderer {
                 LabLog.write("display layer failed, flushed")
             }
             layer.enqueue(sampleBuffer)
+            let submitted = CACurrentMediaTime() - entryTime
+            self.lock.lock()
+            self.submitSum += submitted
+            self.submitCount += 1
+            self.lock.unlock()
         }
 
         if now - lastLog > 5 {

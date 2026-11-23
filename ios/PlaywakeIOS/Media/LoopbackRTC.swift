@@ -280,6 +280,7 @@ final class LoopbackRTC: NSObject {
             var updated = self.stats
             updated.renderFps = self.renderer.snapshotFPS()
             updated.latencyMs = self.renderer.snapshotLatency()
+            updated.submitMs = self.renderer.snapshotSubmit()
 
             for (_, stat) in report.statistics {
                 let values = stat.values
