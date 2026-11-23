@@ -18,6 +18,7 @@
 		BD987044FF717C92940BE5BB /* PlaywakeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FE0677282293FF7D7C5AC41 /* PlaywakeApp.swift */; };
 		BED1C5E9E6C88943D884FD36 /* XboxRTC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02DEB01E4EF0645F0E3453B8 /* XboxRTC.swift */; };
 		C15554DF384588993F16E9DA /* SessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 605DA431D1D5495D07B4B9EC /* SessionController.swift */; };
+		CC97717A7C815D20217C7B93 /* WebRTCTrials.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05897027EE34FEF03CD9A9B0 /* WebRTCTrials.swift */; };
 		D07122DBD797B9A7324A2836 /* LowLatencyVideoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FDD03498834D08338883759 /* LowLatencyVideoView.swift */; };
 		E890698F6F5DFD302EE6E417 /* LowLatencyVideoRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78754315CC92489912BD6F34 /* LowLatencyVideoRenderer.swift */; };
 		EFB647DE0A9F8A80E406D8C1 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 0FDE2F955A036FE6B9654FC5 /* WebRTC */; };
@@ -26,6 +27,7 @@
 
 /* Begin PBXFileReference section */
 		02DEB01E4EF0645F0E3453B8 /* XboxRTC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XboxRTC.swift; sourceTree = "<group>"; };
+		05897027EE34FEF03CD9A9B0 /* WebRTCTrials.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebRTCTrials.swift; sourceTree = "<group>"; };
 		0FE0677282293FF7D7C5AC41 /* PlaywakeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaywakeApp.swift; sourceTree = "<group>"; };
 		1453A4D152CBA29E4F4F33B9 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		1C2EA58F2FF8AD877AA89032 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -65,6 +67,7 @@
 				78754315CC92489912BD6F34 /* LowLatencyVideoRenderer.swift */,
 				5FDD03498834D08338883759 /* LowLatencyVideoView.swift */,
 				3B23CC1352AC4BB71CA20187 /* SyntheticFrameSource.swift */,
+				05897027EE34FEF03CD9A9B0 /* WebRTCTrials.swift */,
 			);
 			path = Media;
 			sourceTree = "<group>";
@@ -231,6 +234,7 @@
 				C15554DF384588993F16E9DA /* SessionController.swift in Sources */,
 				F9896B2038F3C58D005F205B /* SessionView.swift in Sources */,
 				87522FF04C4BB0F7E0325798 /* SyntheticFrameSource.swift in Sources */,
+				CC97717A7C815D20217C7B93 /* WebRTCTrials.swift in Sources */,
 				BED1C5E9E6C88943D884FD36 /* XboxRTC.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -58,6 +58,7 @@ final class XboxRTC: NSObject {
 
     init(renderer: LowLatencyVideoRenderer) {
         self.renderer = renderer
+        WebRTCTrials.install()
         RTCSetMinDebugLogLevel(.warning)
         self.factory = RTCPeerConnectionFactory(
             encoderFactory: RTCDefaultVideoEncoderFactory(),

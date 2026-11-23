@@ -41,13 +41,7 @@ final class LoopbackRTC: NSObject {
 
     init(renderer: LowLatencyVideoRenderer) {
         self.renderer = renderer
-        if let playout = UserDefaults.standard.string(forKey: "forceplayout") {
-            RTCInitFieldTrialDictionary([
-                "WebRTC-ForcePlayoutDelay": playout,
-                "WebRTC-ForceSendPlayoutDelay": playout,
-            ])
-            LabLog.write("force playout delay trial: \(playout)")
-        }
+        WebRTCTrials.install()
         RTCSetMinDebugLogLevel(.warning)
         self.factory = RTCPeerConnectionFactory(encoderFactory: RTCDefaultVideoEncoderFactory(),
                                                 decoderFactory: RTCDefaultVideoDecoderFactory())
