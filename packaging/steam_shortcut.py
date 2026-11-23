@@ -12,14 +12,17 @@ artwork files in userdata/<id>/config/grid.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import time
+import urllib.request
 import zlib
 from pathlib import Path
 
@@ -387,9 +390,106 @@ def report(result: dict) -> None:
             log(f"  art removed: {path}")
 
 
+CDP_PORT = 8080
+REFRESH_ASSETS = (("steam-cover.png", 0), ("steam-hero.png", 1))
+
+
+def _cdp_eval(expression: str, timeout: float = 30.0) -> str:
+    """Evaluate JS in Steam's shared library context over the CEF debug port."""
+    targets = json.load(urllib.request.urlopen(
+        f"http://127.0.0.1:{CDP_PORT}/json/list", timeout=5))
+    page = next(t for t in targets if t.get("title") == "SharedJSContext")
+    host, rest = page["webSocketDebuggerUrl"].split("://", 1)[1].split("/", 1)
+    hostname, port = host.split(":")
+    sock = socket.create_connection((hostname, int(port)), timeout=timeout)
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((f"GET /{rest} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                  f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+    response = b""
+    while b"\r\n\r\n" not in response:
+        response += sock.recv(4096)
+    if b"101" not in response.split(b"\r\n")[0]:
+        fail("CEF debug handshake refused")
+
+    def send_frame(payload: bytes) -> None:
+        mask = os.urandom(4)
+        header = bytearray([0x81])
+        size = len(payload)
+        if size < 126:
+            header.append(0x80 | size)
+        elif size < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", size)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", size)
+        sock.sendall(bytes(header + mask) +
+                     bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def read_exact(count: int) -> bytes:
+        buf = b""
+        while len(buf) < count:
+            chunk = sock.recv(count - len(buf))
+            if not chunk:
+                fail("CEF debug connection closed")
+            buf += chunk
+        return buf
+
+    send_frame(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+        "expression": expression, "awaitPromise": True, "returnByValue": True}}).encode())
+    while True:
+        first, second = read_exact(2)
+        opcode, size = first & 0x0F, second & 0x7F
+        if size == 126:
+            size = struct.unpack(">H", read_exact(2))[0]
+        elif size == 127:
+            size = struct.unpack(">Q", read_exact(8))[0]
+        payload = read_exact(size)
+        if opcode == 1:
+            message = json.loads(payload)
+            if message.get("id") == 1:
+                return json.dumps(message.get("result", {}))
+
+
+def refresh_artwork(install_dir: Path, args: argparse.Namespace) -> dict:
+    """Push cover/hero through Steam's own artwork API.
+
+    The client caches its grid/ scan and does not rescan after an install
+    replaces the files, leaving stale library placeholders. The API call is
+    the same one Steam's custom-artwork UI uses; it rescans and notifies.
+    """
+    root = steam_root(args.steam_root)
+    account = user_id(root, args.user_id)
+    shortcuts = load_shortcuts(root / "userdata" / account / "config" / "shortcuts.vdf")["shortcuts"]
+    _, entry = find_entry(shortcuts, 0)
+    if entry is None or not isinstance(entry.get("appid"), int):
+        fail("no Playwake shortcut to refresh artwork for")
+    appid = entry["appid"] & 0xFFFFFFFF
+    result = {"appid": appid, "assets": {}}
+    for source, asset_type in REFRESH_ASSETS:
+        src = install_dir / "assets/branding" / source
+        if not src.is_file():
+            continue
+        encoded = base64.b64encode(src.read_bytes()).decode()
+        expression = (f'SteamClient.Apps.SetCustomArtworkForApp({appid}, '
+                      f'"{encoded}", "png", {asset_type})')
+        last_error = None
+        for attempt in range(6):
+            try:
+                result["assets"][source] = _cdp_eval(expression)
+                break
+            except (OSError, StopIteration, SystemExit) as error:
+                last_error = error
+                time.sleep(5)
+        else:
+            raise SystemExit(f"error: artwork refresh failed: {last_error}")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["install", "uninstall"])
+    parser.add_argument("action", choices=["install", "uninstall", "refresh-artwork"])
     parser.add_argument("--dir", required=True, help="Playwake install directory")
     parser.add_argument("--steam-root", help="Steam root (default ~/.local/share/Steam)")
     parser.add_argument("--user-id", help="Steam userdata id32 (default: most recent login)")
@@ -397,6 +497,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="report changes, write nothing")
     parser.add_argument("--json", action="store_true", help="print the result as JSON on stdout")
     args = parser.parse_args(argv)
+
+    if args.action == "refresh-artwork":
+        result = refresh_artwork(Path(args.dir).expanduser().resolve(), args)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            names = ", ".join(result["assets"]) or "nothing to refresh"
+            log(f"refreshed library artwork for appid {result['appid']}: {names}")
+        return 0
 
     result = run(args)
     if args.json:
