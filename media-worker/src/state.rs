@@ -57,6 +57,10 @@ pub struct State {
     pub hud_compact_rate: String,
     pub hud_video_latency: VecDeque<f64>,
     pub hud_enabled: bool,
+    /// The host's HDR display, once a PC stream has described it.
+    pub hdr_display: Option<gamestream::HdrDisplay>,
+    /// The overlay's picture, when the video sink draws the overlay itself.
+    pub overlay_layer: Option<std::sync::Arc<crate::overlay::Layer>>,
     pub hud_metrics: Vec<String>,
     pub lsfg: bool,
     pub russian: bool,
@@ -157,6 +161,8 @@ impl Default for State {
             hud_compact_rate: "—".into(),
             hud_video_latency: VecDeque::new(),
             hud_enabled: false,
+            hdr_display: None,
+            overlay_layer: None,
             hud_metrics: Vec::new(),
             lsfg: false,
             russian: false,

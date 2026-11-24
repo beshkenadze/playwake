@@ -54,7 +54,7 @@ pub fn emit_video_timing(state: &mut State, pts: u64, sink_at: f64) {
     }));
 }
 
-pub fn refresh_hud(state: &Arc<Mutex<State>>, webrtc: &gstreamer::Element, queue: Option<&gstreamer::Element>) {
+pub fn refresh_hud(state: &Arc<Mutex<State>>, webrtc: Option<&gstreamer::Element>, queue: Option<&gstreamer::Element>) {
     let now = clock::now_ms();
     let snapshot = {
         let mut st = state.lock().unwrap();
@@ -151,7 +151,8 @@ fn limit_kbps() -> u32 {
 
 /// HUD rtt/jitter/loss from get-stats (Python hud_transport_reply). Report
 /// fields are keyed by candidate/pair id, not by an inner "id" field.
-pub fn request_hud_transport(state: &Arc<Mutex<State>>, webrtc: &gstreamer::Element) {
+pub fn request_hud_transport(state: &Arc<Mutex<State>>, webrtc: Option<&gstreamer::Element>) {
+    let Some(webrtc) = webrtc else { return };
     {
         let mut st = state.lock().unwrap();
         if st.hud_transport.pending { return; }

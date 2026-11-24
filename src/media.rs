@@ -164,6 +164,30 @@ pub enum StreamCommand {
     ToggleDiagnostics,
     OverlaySelection(usize),
     InputFocus(bool),
+    /// A character typed on this device, for the PC being streamed.
+    Type(char),
+    /// A key pressed and released, as a Windows virtual-key code.
+    Key(u8),
+}
+
+/// The Windows virtual-key code of a keyboard key that types no character.
+pub fn named_key(key: &str) -> Option<u8> {
+    Some(match key {
+        "backspace" => 0x08,
+        "tab" => 0x09,
+        "enter" | "return" => 0x0d,
+        "escape" => 0x1b,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "end" => 0x23,
+        "home" => 0x24,
+        "left" => 0x25,
+        "up" => 0x26,
+        "right" => 0x27,
+        "down" => 0x28,
+        "delete" => 0x2e,
+        _ => return None,
+    })
 }
 
 pub enum StreamEvent {
@@ -174,6 +198,103 @@ pub enum StreamEvent {
 }
 
 pub enum OverlayKey { Left, Right, Activate, Back, Select(usize) }
+
+impl StreamCommand {
+    /// The command as the media worker reads it.
+    fn message(self) -> Value {
+        match self {
+            Self::OpenOverlay => json!({"action":"overlay-open"}),
+            Self::CloseOverlay => json!({"action":"overlay-close"}),
+            Self::XboxGuide => json!({"action":"xbox-guide"}),
+            Self::ToggleDiagnostics => json!({"action":"diagnostics-toggle"}),
+            Self::OverlaySelection(index) => json!({"action":"overlay-selection","index":index}),
+            Self::InputFocus(active) => json!({"action":"input-focus","active":active}),
+            Self::Type(character) => json!({"action":"type","text":character.to_string()}),
+            Self::Key(code) => json!({"action":"key","code":code}),
+        }
+    }
+}
+
+impl OverlayKey {
+    /// The key in a `stream-overlay-key` event from the media worker.
+    fn read(event: &Value) -> Option<Self> {
+        match event.get("key").and_then(Value::as_str) {
+            Some("left") => Some(Self::Left),
+            Some("right") => Some(Self::Right),
+            Some("activate") => Some(Self::Activate),
+            Some("back") => Some(Self::Back),
+            Some("select") => event.get("index").and_then(Value::as_u64)
+                .filter(|index| *index < 5).map(|index| Self::Select(index as usize)),
+            _ => None,
+        }
+    }
+}
+
+/// Streams a game from a PC until the stream ends or `cancel` is set. The
+/// media worker starts the game on the PC and plays what it sends.
+pub fn play_pc(game: crate::pc::Game, window: Option<VideoWindow>, cancel: Arc<AtomicBool>, prefs: Preferences,
+               controls: mpsc::Receiver<StreamCommand>, notify: impl Fn(StreamEvent)) -> Result<()> {
+    // The Python worker knows only Xbox streams and would wait for one.
+    if matches!(worker()?, Worker::Python(_)) { return Err("PC streaming needs the playwake-media worker".into()); }
+    let enable_lsfg = prefs.lsfg_enabled && window.is_some();
+    let lsfg = if enable_lsfg { Some(lsfg::Runtime::discover()?) } else { None };
+    let vulkan = enable_lsfg || env::var("ALLY_VIDEO_RENDERER").as_deref() == Ok("vulkan");
+    let panel = crate::pc::Panel::of(crate::device::current());
+    journal::record("stream_requested", json!({"provider":"pc","bitrate_limit_kbps": prefs.bitrate_mbps * 1000,
+        "jitter_ms": prefs.jitter_ms,
+        "width": panel.width, "height": panel.height, "fps": panel.fps}));
+    let mut player = launch(window, lsfg.as_ref(), prefs, true)?;
+    let output = player.0.stdout.take().ok_or("Missing GStreamer output pipe")?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(std::result::Result::ok) {
+            if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                if tx.send(event).is_err() { break; }
+            }
+        }
+    });
+    command(&mut player, json!({"action":"start","bitrate":prefs.bitrate_mbps * 1000,"jitter_ms":prefs.jitter_ms,"width":panel.width,
+        "height":panel.height,"renderer":if vulkan { "vulkan" } else { "auto" },"lsfg":enable_lsfg,"interactive":true,
+        "lanczos_upscale":window.is_some() && prefs.lanczos_upscale,
+        "russian":prefs.russian(),"xbox_palette":prefs.xbox_palette,"compact_stats":prefs.compact_stats,
+        "control_layout": crate::device::current().id, "control_device": crate::device::current().name,
+        "volume": if prefs.mute { 0 } else { prefs.volume },
+        "console_name":game.pc(),"pc":game.start(panel, prefs.pc_hdr)}))?;
+    let mut video = false;
+    while !cancel.load(Ordering::Relaxed) {
+        for control in controls.try_iter() { command(&mut player, control.message())?; }
+        match rx.recv_timeout(Duration::from_millis(8)) {
+            Ok(event) => match event.get("event").and_then(Value::as_str) {
+                Some("stream-overlay") => {
+                    if let Some(open) = event.get("open").and_then(Value::as_bool) { notify(StreamEvent::Overlay(open)); }
+                }
+                Some("stream-overlay-key") => {
+                    if let Some(key) = OverlayKey::read(&event) { notify(StreamEvent::OverlayKey(key)); }
+                }
+                Some("video") if !video => {
+                    video = true;
+                    notify(StreamEvent::VideoReady);
+                    if window.is_some() { command(&mut player, json!({"action":"overlay-hint"}))?; }
+                }
+                Some("error") => {
+                    let message = event.get("message").and_then(Value::as_str).unwrap_or("PC stream failed");
+                    journal::record("gstreamer_error", json!({"message": message}));
+                    return Err(message.to_owned());
+                }
+                _ => {}
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // The worker leaves when the PC ends the stream.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return left(player.0.wait()),
+        }
+    }
+    Ok(())
+}
+
+/// What a worker that left by itself means: the stream ended, or it crashed.
+fn left(status: std::io::Result<std::process::ExitStatus>) -> Result<()> {
+    if status.is_ok_and(|status| status.success()) { Ok(()) } else { Err("The media worker stopped unexpectedly".into()) }
+}
 
 pub fn preview(window: VideoWindow, resolution: Resolution, prefs: Preferences, cancel: Arc<AtomicBool>,
                notify: impl Fn(PreviewEvent)) -> Result<()> {
@@ -222,6 +343,7 @@ pub enum PreviewEvent { Ready, Toggle, Back }
 pub enum Target {
     Home(Console),
     Cloud(cloud::Game),
+    Pc(crate::pc::Game),
 }
 
 pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: Option<VideoWindow>,
@@ -244,9 +366,12 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
     let bitrate = (!is_cloud).then_some(if interactive { prefs.bitrate_mbps * 1000 } else if benchmark { 20000 } else { 20480 });
     let provider = if is_cloud { "cloud" } else { "remote_play" };
     journal::record("stream_requested", json!({"provider":provider,"bitrate_limit_kbps": bitrate, "width": requested_width, "height": requested_height,
+        "jitter_ms": interactive.then_some(prefs.jitter_ms),
         "renderer": renderer, "lsfg_requested": enable_lsfg || (!interactive && vulkan
             && env::var("LSFGVK_ENV").as_deref() == Ok("1") && env::var("DISABLE_LSFGVK").as_deref() != Ok("1"))}));
     let (mut xbox, path, title) = match target {
+        // A PC stream has no Xbox session; `play_pc` runs it.
+        Target::Pc(_) => return Err("A PC stream does not go through Xbox".into()),
         Target::Home(console) => {
             let xbox = account.home()?;
             let path = xbox.reserve(&console, resolution)?;
@@ -273,7 +398,7 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
             }
         });
         command(&mut player, json!({"action":"start","bitrate":bitrate,"width":requested_width,
-            "height":requested_height,"benchmark":benchmark,"capture_diagnostics":matches!(run, Run::Transport),
+            "height":requested_height,"jitter_ms":interactive.then_some(prefs.jitter_ms),"benchmark":benchmark,"capture_diagnostics":matches!(run, Run::Transport),
             "renderer":renderer,"lsfg":enable_lsfg,"interactive":interactive,"cloud":is_cloud,"stun":config.stun,
             "lanczos_upscale":interactive && window.is_some() && prefs.lanczos_upscale,
             "russian":prefs.russian(),"xbox_palette":prefs.xbox_palette,"compact_stats":prefs.compact_stats,
@@ -296,15 +421,7 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
         while !cancel.load(Ordering::Relaxed) {
             if let Some(controls) = &controls {
                 for control in controls.try_iter() {
-                    let message = match control {
-                        StreamCommand::OpenOverlay => json!({"action":"overlay-open"}),
-                        StreamCommand::CloseOverlay => json!({"action":"overlay-close"}),
-                        StreamCommand::XboxGuide => json!({"action":"xbox-guide"}),
-                        StreamCommand::ToggleDiagnostics => json!({"action":"diagnostics-toggle"}),
-                        StreamCommand::OverlaySelection(index) => json!({"action":"overlay-selection","index":index}),
-                        StreamCommand::InputFocus(active) => json!({"action":"input-focus","active":active}),
-                    };
-                    command(&mut player, message)?;
+                    command(&mut player, control.message())?;
                 }
             }
             if matches!(run, Run::Timed(limit) if first_video.is_some_and(|time| time.elapsed() >= limit)) {
@@ -399,16 +516,7 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
                         }
                     }
                     Some("stream-overlay-key") => {
-                        let key = match event.get("key").and_then(Value::as_str) {
-                            Some("left") => Some(OverlayKey::Left),
-                            Some("right") => Some(OverlayKey::Right),
-                            Some("activate") => Some(OverlayKey::Activate),
-                            Some("back") => Some(OverlayKey::Back),
-                            Some("select") => event.get("index").and_then(Value::as_u64)
-                                .filter(|index| *index < 5).map(|index| OverlayKey::Select(index as usize)),
-                            _ => None,
-                        };
-                        if let Some(key) = key { notify(StreamEvent::OverlayKey(key)); }
+                        if let Some(key) = OverlayKey::read(&event) { notify(StreamEvent::OverlayKey(key)); }
                     }
                     Some("stream-diagnostics") => journal::record("stream_diagnostics", json!({
                         "enabled": event.get("enabled").and_then(Value::as_bool),
@@ -650,6 +758,27 @@ mod tests {
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("temp dir")
+    }
+
+    #[test]
+    fn typing_reaches_the_worker_as_text_and_named_keys_as_key_codes() {
+        assert_eq!(StreamCommand::Type('я').message(), json!({"action":"type","text":"я"}));
+        assert_eq!(StreamCommand::Key(0x0d).message(), json!({"action":"key","code":13}));
+        assert_eq!(named_key("enter"), Some(0x0d));
+        assert_eq!(named_key("backspace"), Some(0x08));
+        assert_eq!(named_key("left"), Some(0x25));
+        // A key that types a character has no code of its own here.
+        assert_eq!(named_key("a"), None);
+        assert_eq!(named_key("space"), None);
+    }
+
+    #[test]
+    fn a_worker_that_crashed_is_not_a_stream_that_ended() {
+        let exit = |script: &str| Command::new("sh").args(["-c", script]).status();
+        assert_eq!(left(exit("exit 0")), Ok(()));
+        assert!(left(exit("exit 1")).is_err());
+        assert!(left(exit("kill -9 $$")).is_err());
+        assert!(left(Err(std::io::Error::other("gone"))).is_err());
     }
 
     #[test]

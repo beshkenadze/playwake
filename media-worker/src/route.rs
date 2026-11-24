@@ -6,6 +6,9 @@ pub const VIEW_MENU: u16 = 8 | 4;
 pub const GUIDE: u16 = 2;
 /// Both chord buttons must arrive inside this window to count as a tap.
 pub const CHORD_WINDOW_MS: f64 = 90.0;
+/// A replayed tap stays pressed this long, one input tick, however fast the
+/// packets follow each other.
+const REPLAY_MS: f64 = 8.0;
 
 #[derive(Debug, PartialEq)]
 pub enum RouteEvent {
@@ -37,6 +40,7 @@ pub struct Route {
     previous: u16,
     chord_started: Option<f64>,
     pending_buttons: u16,
+    replay: Option<(u16, f64)>,
     passthrough: bool,
     guide: bool,
     guide_until: Option<f64>,
@@ -51,6 +55,7 @@ impl Default for Route {
             previous: 0,
             chord_started: None,
             pending_buttons: 0,
+            replay: None,
             passthrough: false,
             guide: false,
             guide_until: None,
@@ -136,8 +141,14 @@ impl Route {
 
         let chord = buttons & VIEW_MENU;
         if chord == 0 {
-            let replay = self.pending_buttons;
+            if self.pending_buttons != 0 {
+                self.replay = Some((self.pending_buttons, now + REPLAY_MS));
+            }
             self.reset_chord();
+            let replay = match self.replay {
+                Some((held, until)) if now < until => held,
+                _ => { self.replay = None; 0 }
+            };
             return (Routed { axes, buttons: buttons | replay, lt, rt }, events);
         }
         if self.passthrough {
@@ -288,6 +299,18 @@ mod tests {
         // tap released while waiting for second button
         let (out, _) = r.route(axes(), 0, 0, 0, 60.0);
         assert_eq!(out.buttons, 8);
+    }
+
+    #[test]
+    fn replayed_tap_lasts_a_tick_when_packets_come_faster() {
+        let mut r = Route::default();
+        r.route(axes(), 8, 0, 0, 0.0);
+        assert_eq!(r.route(axes(), 0, 0, 0, 60.0).0.buttons, 8);
+        // a stick event one millisecond later must not end the tap
+        assert_eq!(r.route(axes(), 16, 0, 0, 61.0).0.buttons, 8 | 16);
+        assert_eq!(r.route(axes(), 0, 0, 0, 67.9).0.buttons, 8);
+        assert_eq!(r.route(axes(), 0, 0, 0, 68.0).0.buttons, 0);
+        assert_eq!(r.route(axes(), 0, 0, 0, 69.0).0.buttons, 0);
     }
 
     #[test]

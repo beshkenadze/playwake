@@ -75,14 +75,22 @@ pub struct Preferences {
     pub language: Language,
     pub volume: u32,
     pub mute: bool,
+    /// How long incoming media waits for late packets, in milliseconds.
+    pub jitter_ms: u32,
+    /// HDR for PC streams, where the screen shows it and the PC encodes it.
+    pub pc_hdr: bool,
 }
+
+/// The jitter buffer lengths the settings offer, in milliseconds.
+pub const JITTER_CHOICES: [u32; 7] = [5, 10, 15, 20, 25, 30, 50];
 
 impl Default for Preferences {
     fn default() -> Self {
         Self { lsfg_enabled: false, lsfg_performance: true, lsfg_flow_percent: 100,
             lanczos_upscale: false,
             height: 1080, bitrate_mbps: 20, compact_stats: false,
-            auto_connect: false, xbox_palette: false, language: Language::System, volume: 100, mute: false }
+            auto_connect: false, xbox_palette: false, language: Language::System, volume: 100, mute: false,
+            jitter_ms: 20, pc_hdr: true }
     }
 }
 
@@ -110,7 +118,19 @@ pub fn load_preferences() -> Preferences {
     prefs.height = supported_stream_height(prefs.height);
     prefs.bitrate_mbps = prefs.bitrate_mbps.clamp(5, 40);
     prefs.volume = prefs.volume.min(100);
+    prefs.jitter_ms = nearest_jitter(prefs.jitter_ms);
     prefs
+}
+
+/// The jitter buffer one step up (`direction` 1) or down (-1), stopping at the ends.
+pub fn next_jitter(current: u32, direction: isize) -> u32 {
+    let index = JITTER_CHOICES.iter().position(|choice| *choice == current).unwrap_or(3);
+    JITTER_CHOICES[(index as isize + direction).clamp(0, JITTER_CHOICES.len() as isize - 1) as usize]
+}
+
+/// The offered jitter buffer length closest to `saved`.
+pub fn nearest_jitter(saved: u32) -> u32 {
+    JITTER_CHOICES.into_iter().min_by_key(|choice| choice.abs_diff(saved)).unwrap_or(20)
 }
 
 fn supported_stream_height(saved: u32) -> u32 {
@@ -151,6 +171,28 @@ pub fn clear() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_jitter_buffer_snaps_to_an_offered_length() {
+        assert_eq!(nearest_jitter(20), 20);
+        assert_eq!(nearest_jitter(0), 5);
+        assert_eq!(nearest_jitter(42), 50);
+        assert_eq!(nearest_jitter(1000), 50);
+        // Preferences saved before the setting existed keep today's 20 ms.
+        let prefs: Preferences = serde_json::from_str(r#"{"bitrate_mbps":20}"#).unwrap();
+        assert_eq!(prefs.jitter_ms, 20);
+    }
+
+    #[test]
+    fn the_jitter_setting_steps_through_the_offered_lengths_and_stops_at_the_ends() {
+        assert_eq!(next_jitter(20, 1), 25);
+        assert_eq!(next_jitter(30, 1), 50);
+        assert_eq!(next_jitter(50, 1), 50);
+        assert_eq!(next_jitter(10, -1), 5);
+        assert_eq!(next_jitter(5, -1), 5);
+        // A value that is not offered starts from the default.
+        assert_eq!(next_jitter(17, 1), 25);
+    }
 
     #[test]
     fn reads_existing_lsfg_only_preferences() {

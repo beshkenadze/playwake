@@ -25,6 +25,17 @@ pub struct X11Window {
     res_conn: Option<RustConnection>,
     root: xlib::Window,
     baselayer_previous: Option<u32>,
+    /// Steam's on-screen keyboard is up, so the video sits above it.
+    pub keyboard: bool,
+    /// Where the video window was last put.
+    placed: Option<(i32, i32, u32, u32)>,
+}
+
+/// Where the video goes while an on-screen keyboard covers the lower half of
+/// `area`: the largest area of the same shape in the upper half.
+fn above_keyboard((x, y, width, height): (i32, i32, u32, u32)) -> (i32, i32, u32, u32) {
+    let (half_width, half_height) = (width / 2, height / 2);
+    (x + ((width - half_width) / 2) as i32, y, half_width.max(1), half_height.max(1))
 }
 
 pub struct Tick {
@@ -103,7 +114,7 @@ impl X11Window {
             Ok(Self {
                 xlib, display, xid, parent: parent_xid, size: (width, height), delete_atom,
                 deleted: false, adopt, adopted: false, adopt_started: None, known_children,
-                res_conn, root, baselayer_previous: None,
+                res_conn, root, baselayer_previous: None, keyboard: false, placed: None,
             })
         }
     }
@@ -178,14 +189,16 @@ impl X11Window {
                 &mut w, &mut h, &mut b, &mut d) == 0 { return Ok(tick); }
             (x, y, w, h)
         };
-        if (target.2, target.3) != self.size {
+        let target = if self.keyboard { above_keyboard(target) } else { target };
+        if (target.2, target.3) != self.size || self.placed.is_some_and(|placed| placed != target) {
             unsafe {
                 (self.xlib.XMoveResizeWindow)(self.display, self.xid, target.0, target.1, target.2, target.3);
                 (self.xlib.XFlush)(self.display);
             }
+            if (target.2, target.3) != self.size { tick.size_changed = Some((target.2, target.3)); }
             self.size = (target.2, target.3);
-            tick.size_changed = Some((target.2, target.3));
         }
+        self.placed = Some(target);
         Ok(tick)
     }
 
@@ -246,12 +259,33 @@ impl X11Window {
 // The Xlib display is only touched from the glib main-loop thread.
 unsafe impl Send for X11Window {}
 
+/// Whether Gamescope shows HDR now. Its Vulkan layer goes by the same fact
+/// when it offers a window the HDR10 colour space.
+pub fn hdr_output() -> bool {
+    let Ok((connection, screen)) = x11rb::connect(None) else { return false };
+    let root = connection.setup().roots[screen].root;
+    let value = || {
+        let atom = connection.intern_atom(true, b"GAMESCOPE_HDR_OUTPUT_FEEDBACK").ok()?.reply().ok()?.atom;
+        connection.get_property(false, root, atom, x11rb::protocol::xproto::AtomEnum::CARDINAL, 0, 1)
+            .ok()?.reply().ok()?.value32()?.next()
+    };
+    value().is_some_and(|value| value != 0)
+}
+
 /// GAMESCOPE_FOCUSED_APP root-atom tracker on the control display.
 pub struct GamescopeFocus {
     connection: RustConnection,
     root: u32,
     atom: Option<u32>,
+    /// STEAM_INPUT_FOCUS, which Steam sets on its overlay window.
+    input_focus: Option<u32>,
+    /// Steam's overlay window, once found.
+    steam_overlay: Option<u32>,
 }
+
+/// The value of STEAM_INPUT_FOCUS while Steam shows its on-screen keyboard:
+/// the game keeps the keys and Steam takes only the pointer.
+const KEYBOARD_SHOWN: u32 = 2;
 
 impl GamescopeFocus {
     pub fn new(display: &str) -> Result<Self, String> {
@@ -262,7 +296,30 @@ impl GamescopeFocus {
             .ok().and_then(|cookie| cookie.reply().ok())
             .map(|reply| reply.atom)
             .filter(|atom| *atom != 0);
-        Ok(Self { connection, root, atom })
+        let input_focus = connection.intern_atom(true, b"STEAM_INPUT_FOCUS")
+            .ok().and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.atom)
+            .filter(|atom| *atom != 0);
+        Ok(Self { connection, root, atom, input_focus, steam_overlay: None })
+    }
+
+    fn cardinal(&self, window: u32, atom: u32) -> Option<u32> {
+        let reply = self.connection.get_property(false, window, atom,
+            x11rb::protocol::xproto::AtomEnum::CARDINAL, 0, 1).ok()?.reply().ok()?;
+        reply.value32()?.next()
+    }
+
+    /// Whether Steam's on-screen keyboard is up.
+    pub fn keyboard_shown(&mut self) -> bool {
+        let Some(atom) = self.input_focus else { return false };
+        if let Some(value) = self.steam_overlay.and_then(|window| self.cardinal(window, atom)) {
+            return value == KEYBOARD_SHOWN;
+        }
+        // Steam's overlay is the root child that carries the property.
+        let children = self.connection.query_tree(self.root).ok().and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.children).unwrap_or_default();
+        self.steam_overlay = children.into_iter().find(|window| self.cardinal(*window, atom).is_some());
+        self.steam_overlay.and_then(|window| self.cardinal(window, atom)) == Some(KEYBOARD_SHOWN)
     }
 
     pub fn focused_app(&self) -> Option<u32> {
@@ -276,5 +333,17 @@ impl GamescopeFocus {
             return None;
         }
         reply.value32()?.next().map(|value| value & 0xffff_ffff)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_video_keeps_its_shape_in_the_upper_half_above_the_keyboard() {
+        assert_eq!(above_keyboard((0, 0, 1920, 1080)), (480, 0, 960, 540));
+        assert_eq!(above_keyboard((10, 20, 1280, 800)), (330, 20, 640, 400));
+        // A window too small to halve still has a size.
+        assert_eq!(above_keyboard((0, 0, 1, 1)), (0, 0, 1, 1));
     }
 }

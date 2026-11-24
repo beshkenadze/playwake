@@ -28,6 +28,8 @@ mod transport;
 #[cfg(target_os = "linux")]
 mod trial;
 #[cfg(target_os = "linux")]
+mod pc;
+mod present;
 mod webrtc;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -52,7 +54,10 @@ type Slot = Arc<Mutex<Option<Worker>>>;
 #[cfg(target_os = "linux")]
 struct Worker {
     pipeline: gst::Pipeline,
-    rtc: Arc<Mutex<webrtc::Rtc>>,
+    /// The WebRTC session of an Xbox stream.
+    rtc: Option<Arc<Mutex<webrtc::Rtc>>>,
+    /// The session of a PC stream, once it has started.
+    pc: Option<Arc<gamestream::Stream>>,
     state: Arc<Mutex<state::State>>,
     video: Option<pipeline::VideoBranch>,
     x11: Option<x11::X11Window>,
@@ -67,8 +72,10 @@ struct Worker {
     tracked: std::collections::HashSet<String>,
     quit: glib::MainLoop,
     start_time: f64,
-    input_timer: bool,
+    input_retry: bool,
     hud_active: bool,
+    /// Removes the pipeline's error watch when dropped, so it lives here.
+    bus_watch: Option<gst::bus::BusWatchGuard>,
 }
 
 #[cfg(target_os = "linux")]
@@ -79,6 +86,13 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("--menu-input") {
         menu_input_mode();
         return;
+    }
+    // The app discards what the worker writes to stderr; this keeps it in a file.
+    if let Some(path) = std::env::var_os("ALLY_WORKER_STDERR") {
+        use std::os::fd::AsRawFd;
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            unsafe { libc::dup2(file.as_raw_fd(), 2); }
+        }
     }
     if let Err(error) = run() {
         protocol::error(error);
@@ -102,7 +116,7 @@ fn selftest() -> i32 {
     let mut failed = false;
     let required = ["webrtcbin", "rtph264depay", "h264parse", "vulkanupload", "vulkansink",
         "vulkancolorconvert", "videoconvert", "videoscale", "ximagesink", "rtpopusdepay",
-        "opusdec", "audioconvert", "audioresample", "volume", "queue", "tee", "fakesink"];
+        "opusdec", "audioconvert", "audioresample", "volume", "queue", "tee", "fakesink", "appsrc"];
     for element in required {
         if gst::ElementFactory::find(element).is_some() {
             println!("[ok]   element {element}");
@@ -174,8 +188,8 @@ fn run() -> Result<(), String> {
                         st.hud_enabled = true;
                     }
                     let queue = w.video.as_ref().and_then(|v| v.queue.clone());
-                    let element = w.rtc.lock().unwrap().element.clone();
-                    hud::refresh_hud(&w.state, &element, queue.as_ref());
+                    let element = w.rtc.as_ref().map(|rtc| rtc.lock().unwrap().element.clone());
+                    hud::refresh_hud(&w.state, element.as_ref(), queue.as_ref());
                 } else if w.hud_active {
                     w.hud_active = false;
                     let mut st = w.state.lock().unwrap();
@@ -195,7 +209,11 @@ fn run() -> Result<(), String> {
             let now = clock::now_ms();
             let mut guard = slot.lock().unwrap();
             if let Some(w) = guard.as_mut() {
+                // A PC stream takes typed text, so its picture moves out of
+                // the way of Steam's on-screen keyboard.
+                let keyboard = w.pc.is_some() && w.focus.as_mut().is_some_and(|focus| focus.keyboard_shown());
                 if let Some(x11) = w.x11.as_mut() {
+                    x11.keyboard = keyboard;
                     match x11.tick(now) {
                         Ok(tick) => {
                             if tick.adopted {
@@ -246,6 +264,7 @@ fn run() -> Result<(), String> {
                                             serde_json::json!({ "visible": visible }));
                                     }
                                 }
+                                w.state.lock().unwrap().overlay_layer = overlay.layer.clone();
                             }
                             if tick.adopt_timeout {
                                 protocol::error("Could not attach the Vulkan video window");
@@ -274,7 +293,9 @@ fn run() -> Result<(), String> {
             if let Some(w) = guard.as_mut() {
                 if let (Some(focus), Some(target)) = (w.focus.as_ref(), w.target_app) {
                     let app = focus.focused_app();
-                    let active = app.is_none() || app == Some(target);
+                    // The gamepad moves over the on-screen keyboard, not the game.
+                    let typing = w.x11.as_ref().is_some_and(|x11| x11.keyboard);
+                    let active = (app.is_none() || app == Some(target)) && !typing;
                     let events = w.input.route.focus(active);
                     input::emit_route_events(events);
                 }
@@ -288,6 +309,7 @@ fn run() -> Result<(), String> {
     if let Some(mut w) = slot.lock().unwrap().take() {
         if let Some(overlay) = w.overlay.as_mut() { overlay.close(); }
         if let Some(x11) = w.x11.as_mut() { x11.close(); }
+        if let Some(pc) = &w.pc { pc.stop(); }
         let _ = w.pipeline.set_state(gst::State::Null);
     }
     Ok(())
@@ -298,36 +320,38 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
     use protocol::Command;
     match command {
         Command::Start { bitrate, width, height, benchmark, capture_diagnostics, renderer, lsfg,
-                         interactive, russian, xbox_palette, compact_stats, volume, console_name, .. } => {
+                         interactive, russian, xbox_palette, compact_stats, volume, console_name, jitter_ms, pc } => {
             start(slot, quit, bitrate, width, height, benchmark, capture_diagnostics, renderer, lsfg,
-                interactive, russian, xbox_palette, compact_stats, volume, console_name);
+                interactive, russian, xbox_palette, compact_stats, volume, console_name, jitter_ms, pc);
         }
         Command::Answer { sdp } => {
-            if let Some(w) = slot.lock().unwrap().as_ref() {
-                webrtc::set_answer(&w.rtc, &sdp);
+            if let Some(rtc) = slot.lock().unwrap().as_ref().and_then(|w| w.rtc.as_ref()) {
+                webrtc::set_answer(rtc, &sdp);
             }
         }
         Command::Ice { candidates } => {
-            if let Some(w) = slot.lock().unwrap().as_ref() {
-                webrtc::add_ice(&w.rtc, &candidates);
+            if let Some(rtc) = slot.lock().unwrap().as_ref().and_then(|w| w.rtc.as_ref()) {
+                webrtc::add_ice(rtc, &candidates);
             }
         }
         Command::Stats => {
             if let Some(w) = slot.lock().unwrap().as_ref() {
                 let queue = w.video.as_ref().and_then(|v| v.queue.clone());
-                let element = w.rtc.lock().unwrap().element.clone();
+                let element = w.rtc.as_ref().map(|rtc| rtc.lock().unwrap().element.clone());
                 let mut st = w.state.lock().unwrap();
-                hud::emit_stats(&mut st, queue.as_ref(), Some(&element));
+                hud::emit_stats(&mut st, queue.as_ref(), element.as_ref());
             }
         }
         Command::Pulse { axis, buttons, duration, trial } => {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 w.input.pulse(axis, buttons, duration, trial);
+                w.send_input(slot);
             }
         }
         Command::Gamepad { axes, buttons, lt, rt } => {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 w.input.set_gamepad(&axes, buttons, lt, rt);
+                w.send_input(slot);
             }
         }
         Command::DiagnosticsToggle => {
@@ -353,6 +377,15 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 let events = w.input.route.close_overlay(true);
                 input::emit_route_events(events);
+            }
+        }
+        Command::Type { text } => {
+            if let Some(pc) = slot.lock().unwrap().as_ref().and_then(|w| w.pc.as_ref()) { pc.text(&text); }
+        }
+        Command::Key { code } => {
+            if let Some(pc) = slot.lock().unwrap().as_ref().and_then(|w| w.pc.as_ref()) {
+                pc.key(code, true, 0);
+                pc.key(code, false, 0);
             }
         }
         Command::InputFocus { active } => {
@@ -385,12 +418,14 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
                 let restore = trial_state.restore_view;
                 drop(st);
                 w.input.pulse(0.9, 0, 230, true);
+                w.send_input(&slot_actuate);
                 if restore {
                     let slot_restore = slot_actuate.clone();
                     glib::timeout_add(std::time::Duration::from_millis(550), move || {
                         let mut guard = slot_restore.lock().unwrap();
                         if let Some(w) = guard.as_mut() {
                             w.input.pulse(-0.9, 0, 230, false);
+                            w.send_input(&slot_restore);
                         }
                         glib::ControlFlow::Continue
                     });
@@ -435,10 +470,11 @@ fn start(
     slot: &Slot, quit: &glib::MainLoop,
     bitrate: u32, width: u32, height: u32, benchmark: bool, capture_diagnostics: bool,
     renderer: String, lsfg: bool, interactive: bool, russian: bool, xbox_palette: bool,
-    compact_stats: bool, volume: u32, console_name: String,
+    compact_stats: bool, volume: u32, console_name: String, jitter_ms: Option<u32>, pc: Option<protocol::Pc>,
 ) {
     LIMIT_KBPS.store(bitrate, std::sync::atomic::Ordering::Relaxed);
-    let jitter: u32 = std::env::var("ALLY_JITTER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    // ALLY_JITTER_MS overrides the setting for diagnostics.
+    let jitter: u32 = std::env::var("ALLY_JITTER_MS").ok().and_then(|v| v.parse().ok()).or(jitter_ms).unwrap_or(20);
     let parent = std::env::var("GREENLIGHT_VIDEO_PARENT_XID").ok().and_then(|v| parse_xid(&v));
     let adopt = renderer == "vulkan" && parent.is_none();
     let mut x11_window = None;
@@ -470,9 +506,11 @@ fn start(
     let start_time = clock::now_ms();
     let transport = Arc::new(Mutex::new(transport::Transport::default()));
     let pipeline = gst::Pipeline::builder().name("greenlight-native").build();
-    let rtc = match webrtc::build(&pipeline, jitter, transport.clone(), capture_diagnostics) {
-        Ok(rtc) => Arc::new(Mutex::new(rtc)),
-        Err(error) => { protocol::error(error); return; }
+    let rtc = if pc.is_some() { None } else {
+        match webrtc::build(&pipeline, jitter, transport.clone(), capture_diagnostics) {
+            Ok(rtc) => Some(Arc::new(Mutex::new(rtc))),
+            Err(error) => { protocol::error(error); return; }
+        }
     };
     let state = Arc::new(Mutex::new(state::State::new(width, height, benchmark, capture_diagnostics, transport.clone())));
     if compact_stats {
@@ -490,6 +528,7 @@ fn start(
                 overlay.russian = russian;
                 overlay.xbox_palette = xbox_palette;
                 overlay.console_name = console_name.clone();
+                overlay.pc = pc.is_some();
                 overlay
             })
     } else {
@@ -502,17 +541,17 @@ fn start(
     }
 
     *slot.lock().unwrap() = Some(Worker {
-        pipeline: pipeline.clone(), rtc: rtc.clone(), state: state.clone(), video: None,
+        pipeline: pipeline.clone(), rtc: rtc.clone(), pc: None, state: state.clone(), video: None,
         x11: x11_window, overlay, focus, target_app,
         input, renderer: renderer.clone(), window, lsfg, volume,
-        tracked: std::collections::HashSet::new(), quit: quit.clone(), start_time, input_timer: false,
-        hud_active: false,
+        tracked: std::collections::HashSet::new(), quit: quit.clone(), start_time, input_retry: false,
+        hud_active: false, bus_watch: None,
     });
 
     // pad-added → branch attachment.
-    {
+    if let Some(rtc) = &rtc {
         let slot = slot.clone();
-        webrtc::wire_signals(&rtc, move |pad| {
+        webrtc::wire_signals(rtc, move |pad| {
             let Some(caps) = pad.current_caps().or_else(|| Some(pad.query_caps(None))) else { return };
             let Some(media) = caps.structure(0).and_then(|s| s.get::<String>("media").ok()) else { return };
             let mut guard = slot.lock().unwrap();
@@ -520,7 +559,7 @@ fn start(
             if w.tracked.contains(&media) { return; }
             w.tracked.insert(media.clone());
             if media == "video" {
-                match pipeline::attach_video(&w.pipeline, pad, w.state.clone(), &w.renderer, w.window, w.lsfg, w.quit.clone()) {
+                match pipeline::attach_video(&w.pipeline, pad, w.state.clone(), &w.renderer, w.window, w.lsfg, w.quit.clone(), true, gamestream::Codec::H264, false) {
                     Ok(branch) => {
                         w.video = Some(branch);
                         if let Some(x11) = w.x11.as_mut() {
@@ -532,14 +571,14 @@ fn start(
                     Err(error) => { protocol::error(error); w.quit.quit(); }
                 }
             } else if media == "audio" {
-                if let Err(error) = pipeline::attach_audio(&w.pipeline, pad, w.volume) {
+                if let Err(error) = pipeline::attach_audio(&w.pipeline, pad, w.volume, true) {
                     protocol::error(error);
                     w.quit.quit();
                 }
             }
         });
     }
-    if benchmark {
+    if let Some(rtc) = rtc.as_ref().filter(|_| benchmark) {
         pipeline::wire_ingress(&rtc.lock().unwrap().element, state.clone());
         if capture_diagnostics {
             pipeline::wire_rtcp(&rtc.lock().unwrap().element, state.clone());
@@ -547,17 +586,22 @@ fn start(
     }
 
     // Bus errors are terminal, exactly like the Python worker.
-    {
-        let quit = quit.clone();
-        let _ = pipeline.bus().unwrap().add_watch_local(move |_bus, message| {
-            if let gst::MessageView::Error(error) = message.view() {
-                protocol::error(error.error().to_string());
-                quit.quit();
-            }
-            glib::ControlFlow::Continue
-        });
+    match pipeline::watch_errors(&pipeline, quit.clone()) {
+        Ok(watch) => if let Some(w) = slot.lock().unwrap().as_mut() { w.bus_watch = Some(watch); },
+        Err(error) => { protocol::error(error); quit.quit(); return; }
     }
 
+    // A PC stream builds its whole pipeline and then plays it; an Xbox stream
+    // plays at once and gets its branches when the tracks arrive.
+    let Some(rtc) = rtc else {
+        let Some(pc) = pc else { return };
+        let jitter = std::time::Duration::from_millis(jitter.into());
+        if let Err(error) = pc::start(slot, &pipeline, pc, width, height, bitrate, jitter, quit.clone()) {
+            protocol::error(error);
+            quit.quit();
+        }
+        return;
+    };
     if let Err(error) = pipeline.set_state(gst::State::Playing) {
         protocol::error(format!("pipeline playing: {error}"));
         quit.quit();
@@ -603,22 +647,69 @@ fn on_ack(slot: &Slot, channels: &handshake::Channels, data: &str, width: u32, h
     let mut guard = slot.lock().unwrap();
     let Some(w) = guard.as_mut() else { return };
     handshake::handshake_ack(channels, width, height, w.start_time);
-    if !w.input_timer {
-        w.input_timer = true;
-        let slot = slot.clone();
+    arm_input(slot, w);
+}
+
+/// Starts sending input: on every gamepad change and on an 8 ms tick.
+#[cfg(target_os = "linux")]
+fn arm_input(slot: &Slot, w: &mut Worker) {
+    if !w.input.armed {
+        w.input.armed = true;
+        let timer_slot = slot.clone();
         glib::timeout_add(std::time::Duration::from_millis(8), move || {
-            let now = clock::now_ms();
-            let mut guard = slot.lock().unwrap();
+            let mut guard = timer_slot.lock().unwrap();
             let Some(w) = guard.as_mut() else { return glib::ControlFlow::Break };
-            let channels = w.rtc.lock().unwrap().channels.clone();
-            let Some(channel) = channels.get("input") else { return glib::ControlFlow::Break };
-            let (continue_timer, events) = w.input.tick(channel, now);
-            input::emit_route_events(events);
-            if let Some(timing) = w.input.last_trial_timing.take() {
-                w.state.lock().unwrap().trial_input_timing = Some(timing);
-            }
-            if continue_timer { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
+            if w.send_input(&timer_slot) { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
         });
+        // A gamepad change goes out at once instead of at the next tick.
+        if let Some((fd, device_alive)) = w.input.device_watch() {
+            let slot = slot.clone();
+            glib::unix_fd_add(fd, glib::IOCondition::IN, move |_, _| {
+                let mut guard = slot.lock().unwrap();
+                // The fd is closed once its device is lost or its worker replaced.
+                if device_alive.strong_count() == 0 { return glib::ControlFlow::Break; }
+                let Some(w) = guard.as_mut() else { return glib::ControlFlow::Break };
+                if w.send_input(&slot) { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Worker {
+    /// Sends the current pad state. Returns false when input is not armed or
+    /// its channel is gone.
+    fn send_input(&mut self, slot: &Slot) -> bool {
+        let tick = if let Some(pc) = &self.pc {
+            self.input.tick(pc.as_ref(), clock::now_ms())
+        } else {
+            let Some(rtc) = &self.rtc else { return false };
+            let channels = rtc.lock().unwrap().channels.clone();
+            let Some(channel) = channels.get("input") else { return false };
+            self.input.tick(channel, clock::now_ms())
+        };
+        match tick {
+            input::Tick::Sent(events) => {
+                input::emit_route_events(events);
+                if let Some(timing) = self.input.last_trial_timing.take() {
+                    self.state.lock().unwrap().trial_input_timing = Some(timing);
+                }
+            }
+            // Send the state this attempt skipped as soon as the gap allows.
+            input::Tick::Deferred if !self.input_retry => {
+                self.input_retry = true;
+                let slot = slot.clone();
+                glib::timeout_add_once(std::time::Duration::from_millis(1), move || {
+                    if let Some(w) = slot.lock().unwrap().as_mut() {
+                        w.input_retry = false;
+                        w.send_input(&slot);
+                    }
+                });
+            }
+            input::Tick::Deferred | input::Tick::Opening => {}
+            input::Tick::Closed => return false,
+        }
+        true
     }
 }
 

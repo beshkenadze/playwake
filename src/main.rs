@@ -5,6 +5,7 @@ mod input;
 mod journal;
 mod lsfg;
 mod media;
+mod pc;
 mod session_store;
 mod xbox;
 
@@ -28,6 +29,8 @@ enum Event {
     Consoles(Arc<xbox::Xbox>, xbox::Result<Vec<xbox::Console>>, bool),
     CachedCloudCatalog(Arc<xbox::Xbox>, Vec<cloud::Game>),
     CloudCatalog(Arc<xbox::Xbox>, xbox::Result<Vec<cloud::Game>>),
+    PcCatalog(pc::Result<pc::Catalog>),
+    PcPaired(pc::Unpaired, pc::Result<()>),
 }
 
 struct DevicePrompt {
@@ -74,6 +77,13 @@ struct RemotePlay {
     cloud_refreshed_at: Option<Instant>,
     cloud_loading: bool,
     cloud_error: Option<String>,
+    pc_catalog: pc::Catalog,
+    pc_loading: bool,
+    pc_error: Option<String>,
+    /// The PC being paired and the PIN to enter on it.
+    pc_pairing: Option<(pc::Unpaired, String)>,
+    /// The game the user chose and the app its start would end on the PC.
+    pc_replace: Option<(pc::Game, pc::Game, deck::Confirm)>,
     reconnect: bool,
     video_ready: bool,
     refreshing: bool,
@@ -138,9 +148,14 @@ impl RemotePlay {
 
     fn start_stream(&mut self, target: media::Target, window: &mut Window) {
         if self.stream.is_some() || self.preview.is_some() || self.sign_in.is_some() { return; }
-        let Some(account) = self.account.clone() else { return; };
+        let account = self.account.clone();
+        if account.is_none() && !matches!(&target, media::Target::Pc(_)) { return; }
         let native_window = x11_window(window);
-        let streaming_tab = if matches!(&target, media::Target::Home(_)) { Tab::Xbox } else { Tab::Cloud };
+        let streaming_tab = match &target {
+            media::Target::Home(_) => Tab::Xbox,
+            media::Target::Cloud(_) => Tab::Cloud,
+            media::Target::Pc(_) => Tab::Pc,
+        };
         self.active_target = Some(target.clone());
         self.video_ready = false;
         self.menu.select_tab(streaming_tab);
@@ -148,7 +163,7 @@ impl RemotePlay {
         if self.restore_windowed { window.toggle_fullscreen(); }
         let cancel = Arc::new(AtomicBool::new(false));
         self.stream = Some(cancel.clone());
-        self.status = "Connecting to Xbox…".into();
+        self.status = if streaming_tab == Tab::Pc { "Connecting to PC…" } else { "Connecting to Xbox…" }.into();
         let tx = self.tx.clone();
         let resolution = self.resolution();
         let mut prefs = self.prefs;
@@ -157,8 +172,12 @@ impl RemotePlay {
         let (controls, rx) = mpsc::channel();
         self.stream_commands = Some(controls);
         thread::spawn(move || {
-            let result = media::play(account, target, resolution, native_window, cancel, run, Some(rx),
-                |event| { let _ = tx.send(Event::Stream(event)); });
+            let notify = |event| { let _ = tx.send(Event::Stream(event)); };
+            let result = match (target, account) {
+                (media::Target::Pc(game), _) => media::play_pc(game, native_window, cancel, prefs, rx, notify),
+                (target, Some(account)) => media::play(account, target, resolution, native_window, cancel, run, Some(rx), notify),
+                (_, None) => Ok(()),
+            };
             let _ = tx.send(Event::StreamEnded(result));
         });
     }
@@ -180,6 +199,21 @@ impl RemotePlay {
                 |event| { let _ = tx.send(Event::Preview(event)); });
             let _ = tx.send(Event::PreviewEnded(result));
         });
+    }
+
+    /// Sends what the user typed to the PC being streamed: Steam's on-screen
+    /// keyboard or a real one. Returns whether the stream took the keystroke.
+    fn type_into_stream(&self, keystroke: &Keystroke) -> bool {
+        if self.stream.is_none() || !self.video_ready || self.overlay_open || self.menu.tab != Tab::Pc { return false; }
+        let held = keystroke.modifiers;
+        if let Some(code) = media::named_key(&keystroke.key) {
+            self.control_stream(media::StreamCommand::Key(code));
+        } else if !(held.control || held.alt || held.platform) {
+            for character in keystroke.key_char.iter().flat_map(|typed| typed.chars()) {
+                self.control_stream(media::StreamCommand::Type(character));
+            }
+        }
+        true
     }
 
     fn control_stream(&self, command: media::StreamCommand) {
@@ -223,6 +257,35 @@ impl RemotePlay {
             let result = cloud::catalog(&account);
             let _ = tx.send(Event::CloudCatalog(account, result));
         });
+    }
+
+    fn refresh_pc(&mut self) {
+        if self.pc_loading { return; }
+        self.pc_loading = true;
+        self.pc_error = None;
+        let tx = self.tx.clone();
+        thread::spawn(move || { let _ = tx.send(Event::PcCatalog(pc::catalog())); });
+    }
+
+    /// Shows a PIN and waits, off the UI thread, for the user to enter it on the PC.
+    fn start_pc_pairing(&mut self, unpaired: pc::Unpaired) {
+        if self.pc_pairing.is_some() { return; }
+        let pin = gamestream::pin();
+        self.pc_pairing = Some((unpaired.clone(), pin.clone()));
+        self.pc_error = None;
+        journal::record("pc_pairing_started", json!({}));
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = pc::pair(&unpaired, &pin);
+            let _ = tx.send(Event::PcPaired(unpaired, result));
+        });
+    }
+
+    fn start_menu_input(&mut self) {
+        if cfg!(target_os = "linux") {
+            let input_events = self.tx.clone();
+            self.menu_player = media::menu_input(move |key| { let _ = input_events.send(Event::Menu(key)); }).ok();
+        }
     }
 
     fn resolution(&self) -> xbox::Resolution {
@@ -279,6 +342,25 @@ impl RemotePlay {
                 }
                 false
             }
+            Action::Pc => {
+                self.menu.select_tab(Tab::Pc);
+                if self.pc_catalog == pc::Catalog::default() { self.refresh_pc(); }
+                false
+            }
+            Action::PcGame(index) => {
+                self.menu.pc_game = index;
+                let unpaired = index.checked_sub(self.pc_catalog.games.len());
+                if let Some(game) = self.pc_catalog.games.get(index).cloned() {
+                    // Ending an app on the PC can cost a running game: ask first.
+                    match self.pc_catalog.running_instead_of(&game).cloned() {
+                        Some(running) => self.pc_replace = Some((game, running, deck::Confirm::opened(Instant::now()))),
+                        None => self.start_stream(media::Target::Pc(game), window),
+                    }
+                } else if let Some(pc) = unpaired.and_then(|index| self.pc_catalog.unpaired.get(index)).cloned() {
+                    self.start_pc_pairing(pc);
+                }
+                false
+            }
             Action::CloudGame(index) => {
                 if let Some(game) = self.cloud_catalog.as_ref().and_then(|catalog| catalog.get(index)) {
                     self.menu.cloud_game = index;
@@ -302,7 +384,11 @@ impl RemotePlay {
                 false
             }
             Action::Refresh => {
-                if self.menu.tab == Tab::Cloud { self.refresh_cloud(); } else { self.refresh_consoles(false); }
+                match self.menu.tab {
+                    Tab::Cloud => self.refresh_cloud(),
+                    Tab::Pc => self.refresh_pc(),
+                    _ => self.refresh_consoles(false),
+                }
                 false
             }
             Action::SignOut => {
@@ -319,7 +405,7 @@ impl RemotePlay {
                     self.cloud_refreshed_at = None;
                     self.cloud_loading = false;
                     self.cloud_error = None;
-                    self.menu = Menu::default();
+                    self.menu = Menu { pc_available: self.menu.pc_available, ..Menu::default() };
                     self.status.clear();
                     journal::record("signed_out", json!({}));
                 } else { self.status = t.t("Не удалось выйти", "Could not sign out").into(); }
@@ -333,7 +419,9 @@ impl RemotePlay {
                 true
             }
             Action::Bitrate => { self.prefs.bitrate_mbps = (self.prefs.bitrate_mbps as isize + 5 * direction).clamp(5,40) as u32; true }
+            Action::Jitter => { self.prefs.jitter_ms = session_store::next_jitter(self.prefs.jitter_ms, direction); true }
             Action::Upscale => { self.prefs.lanczos_upscale = !self.prefs.lanczos_upscale; true }
+            Action::PcHdr => { self.prefs.pc_hdr = !self.prefs.pc_hdr; true }
             Action::Lsfg => {
                 if !self.prefs.lsfg_enabled {
                     if let Err(error) = lsfg::Runtime::discover() {
@@ -366,6 +454,24 @@ impl RemotePlay {
     }
 
     fn menu_key(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pc_replace.is_some() {
+            match key {
+                Key::Accept => {
+                    let deliberate = self.pc_replace.as_mut().is_some_and(|(_, _, confirm)| confirm.press(Instant::now()));
+                    if let Some((game, running, _)) = self.pc_replace.take_if(|_| deliberate) {
+                        self.start_stream(media::Target::Pc(game.ending(&running)), window);
+                    }
+                }
+                Key::Back => self.pc_replace = None,
+                _ => {}
+            }
+            return;
+        }
+        if self.pc_pairing.is_some() {
+            // The PC keeps waiting for the PIN; a late success still pairs.
+            if key == Key::Back { self.pc_pairing = None; }
+            return;
+        }
         if let Some(preview) = &mut self.preview {
             match key {
                 Key::Accept if preview.ready && !preview.cancel.load(Ordering::Relaxed) => {
@@ -454,6 +560,26 @@ impl RemotePlay {
                     }
                 }
             }
+            Event::PcCatalog(result) => {
+                self.pc_loading = false;
+                match result {
+                    Ok(catalog) => {
+                        let tiles = catalog.games.len() + catalog.unpaired.len();
+                        self.menu.pc_game = self.menu.pc_game.min(tiles.saturating_sub(1));
+                        self.pc_catalog = catalog;
+                    }
+                    Err(error) => self.pc_error = Some(error),
+                }
+            }
+            Event::PcPaired(pc, result) => {
+                journal::record("pc_pairing_ended", json!({"success": result.is_ok()}));
+                // An attempt the user left can end while another PC's PIN is shown.
+                if self.pc_pairing.as_ref().is_some_and(|(shown, _)| *shown == pc) {
+                    self.pc_pairing = None;
+                    self.pc_error = result.as_ref().err().cloned();
+                }
+                if result.is_ok() { self.refresh_pc(); }
+            }
             Event::Device(prompt) => {
                 self.menu.browser_cancel = false;
                 self.status = "Waiting for Microsoft confirmation".into();
@@ -512,6 +638,11 @@ impl RemotePlay {
                 self.video_ready = false;
                 if std::mem::take(&mut self.reconnect) {
                     if let Some(target) = self.active_target.take() {
+                        // The PC may run something else by now; a reconnect must not end it.
+                        let target = match target {
+                            media::Target::Pc(game) => media::Target::Pc(game.asking_again()),
+                            other => other,
+                        };
                         let was_windowed = self.restore_windowed;
                         self.start_stream(target, window);
                         self.restore_windowed = was_windowed;
@@ -524,6 +655,8 @@ impl RemotePlay {
                     window.toggle_fullscreen();
                 }
                 self.status = result.err().unwrap_or_else(|| "Stream stopped".into());
+                // Which app the PC runs has changed.
+                if self.menu.tab == Tab::Pc { self.refresh_pc(); }
             }
         }
         if redraw {
@@ -572,16 +705,15 @@ fn main() {
                 }).detach();
                 let mut view = RemotePlay { tx, account: None, consoles: Vec::new(), sign_in: None,
                     stream: None, stream_commands: None, overlay_open: false, overlay_index: 0, restore_windowed: false,
-                    prefs: session_store::load_preferences(), device: None, menu: Menu::default(),
+                    prefs: session_store::load_preferences(), device: None,
+                    menu: Menu { pc_available: cfg!(target_os = "linux"), ..Menu::default() },
                     menu_player: None, keyboard_focus: cx.focus_handle(), active_target: None, preview: None,
                     cloud_catalog: None, cloud_refreshed_at: None, cloud_loading: false, cloud_error: None,
+                    pc_catalog: pc::Catalog::default(), pc_loading: false, pc_error: None, pc_pairing: None, pc_replace: None,
                     reconnect: false, video_ready: false, refreshing: false,
                     status: if media::runtime_available() { String::new() } else { "GStreamer worker missing".into() } };
                 window.focus(&view.keyboard_focus, cx);
-                if cfg!(target_os = "linux") {
-                    let input_events = view.tx.clone();
-                    view.menu_player = media::menu_input(move |key| { let _ = input_events.send(Event::Menu(key)); }).ok();
-                }
+                view.start_menu_input();
                 match saved_account {
                     Ok(Some(xbox)) => view.show_account(xbox),
                     Ok(None) => {}
