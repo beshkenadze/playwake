@@ -232,8 +232,12 @@ pub fn catalog() -> Result<Catalog> {
 pub fn pair(pc: &Unpaired, pin: &str) -> Result<()> {
     let identity = identity(&mut load())?;
     let mut host = Host::new(&pc.address);
-    let id = host.info(&identity)?.unique_id;
     gamestream::pair(&mut host, &identity, pin)?;
+    // The ID names the pairing it replaces, so it is read over the connection
+    // that the new certificate protects, not from a plain answer.
+    let confirmed = host.info(&identity)?;
+    if !confirmed.paired { return Err("The PC did not confirm the pairing".into()); }
+    let id = confirmed.unique_id;
     let certificate = host.certificate.ok_or("The PC sent no certificate")?;
     // Pairing takes as long as the user needs for the PIN, and two PCs can be
     // paired at once: read the saved PCs only now, and one writer at a time.

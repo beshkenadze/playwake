@@ -8,13 +8,15 @@ use rustls::crypto::{WebPkiSupportedAlgorithms, ring::default_provider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, time::{Duration, Instant}};
 
 pub const HTTP_PORT: u16 = 47989;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Starting an app can take the host a long time.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// More than any answer of a host; a peer on the network cannot send more.
+const LARGEST_ANSWER: usize = 4 << 20;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Host {
@@ -110,6 +112,9 @@ impl Host {
     /// Starts the app, or rejoins it when it is the one already running.
     /// Another running app is ended first only when the request names it.
     pub fn launch(&self, identity: &Identity, info: &ServerInfo, request: &Launch) -> Result<Session> {
+        // Only a paired answer came over the pinned connection, and what the
+        // host runs decides whether an app is ended.
+        if !info.paired { return Err("This PC is not paired".into()); }
         let verb = match start(info.current_app, request.app, request.end_other)? {
             Start::Launch => "launch",
             Start::Resume => "resume",
@@ -135,7 +140,8 @@ impl Host {
         Self { address: address.to_owned(), http_port: HTTP_PORT, https_port: 0, certificate: None }
     }
 
-    /// Asks over HTTPS when paired, because only that answer says so.
+    /// Asks over HTTPS when paired. Only that answer is from the PC that was
+    /// paired, so only it can say `paired`; a plain answer never does.
     pub fn info(&mut self, identity: &Identity) -> Result<ServerInfo> {
         if self.certificate.is_none() || self.https_port == 0 {
             let info = self.ask(identity, false)?;
@@ -151,17 +157,7 @@ impl Host {
     fn ask(&self, identity: &Identity, secure: bool) -> Result<ServerInfo> {
         let xml = self.get(identity, secure, "serverinfo", "", Some(REQUEST_TIMEOUT))?;
         check_status(&xml)?;
-        let text = |tag| value(&xml, tag).unwrap_or_default();
-        Ok(ServerInfo {
-            name: text("hostname"),
-            unique_id: text("uniqueid"),
-            mac: text("mac"),
-            app_version: text("appversion"),
-            https_port: text("HttpsPort").parse().unwrap_or(47984),
-            paired: text("PairStatus") == "1",
-            current_app: text("currentgame").parse().unwrap_or(0),
-            codec_support: text("ServerCodecModeSupport").parse().unwrap_or(0),
-        })
+        Ok(server_info(&xml, secure))
     }
 
     pub fn apps(&self, identity: &Identity) -> Result<Vec<App>> {
@@ -194,12 +190,14 @@ impl Host {
         let request = format!(
             "GET /{path}?uniqueid=0123456789ABCDEF&uuid={}{}{query} HTTP/1.1\r\nHost: {}:{port}\r\nConnection: close\r\n\r\n",
             hex::encode(request_id), if query.is_empty() { "" } else { "&" }, self.address);
+        // The timeout is for each read; the deadline is for the whole answer.
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let response = if secure {
             let mut tls = self.tls(identity)?;
             let mut stream = rustls::Stream::new(&mut tls, &mut socket);
-            exchange(&mut stream, &request)
+            exchange(&mut stream, &request, deadline)
         } else {
-            exchange(&mut socket, &request)
+            exchange(&mut socket, &request, deadline)
         }.map_err(|e| format!("Request to {} failed: {e}", self.address))?;
         body(&response)
     }
@@ -261,14 +259,42 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
-fn exchange(stream: &mut (impl Read + Write), request: &str) -> std::io::Result<Vec<u8>> {
+/// What a `serverinfo` answer says. An answer that did not come over the
+/// pinned connection can be from anyone, so it never counts as paired.
+fn server_info(xml: &str, secure: bool) -> ServerInfo {
+    let text = |tag| value(xml, tag).unwrap_or_default();
+    ServerInfo {
+        name: text("hostname"),
+        unique_id: text("uniqueid"),
+        mac: text("mac"),
+        app_version: text("appversion"),
+        https_port: text("HttpsPort").parse().unwrap_or(47984),
+        paired: secure && text("PairStatus") == "1",
+        current_app: text("currentgame").parse().unwrap_or(0),
+        codec_support: text("ServerCodecModeSupport").parse().unwrap_or(0),
+    }
+}
+
+/// Sends the request and reads the answer until the host closes. The answer
+/// must fit in `LARGEST_ANSWER` and be complete by `deadline`.
+fn exchange(stream: &mut (impl Read + Write), request: &str, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind};
     stream.write_all(request.as_bytes())?;
     let mut response = Vec::new();
-    match stream.read_to_end(&mut response) {
-        // Hosts close the connection without a TLS goodbye.
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof && !response.is_empty() => {}
-        Err(error) => return Err(error),
-        Ok(_) => {}
+    let mut part = [0u8; 16 * 1024];
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(Error::new(ErrorKind::TimedOut, "the answer took too long"));
+        }
+        match stream.read(&mut part) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&part[..read]),
+            // Hosts close the connection without a TLS goodbye.
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof && !response.is_empty() => break,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+        if response.len() > LARGEST_ANSWER { return Err(Error::new(ErrorKind::InvalidData, "the answer is too large")); }
     }
     Ok(response)
 }
@@ -318,6 +344,53 @@ mod tests {
         let refused = "<root status_code=\"401\" status_message=\"The client is not authorized\"/>";
         assert_eq!(check_status(refused), Err("The client is not authorized".into()));
         assert!(check_status("<html/>").is_err());
+    }
+
+    /// A peer that takes any request and answers with `parts`, one per read.
+    struct Peer(Vec<Vec<u8>>);
+
+    impl Read for Peer {
+        fn read(&mut self, to: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() { return Ok(0); }
+            let part = self.0.remove(0);
+            to[..part.len()].copy_from_slice(&part);
+            Ok(part.len())
+        }
+    }
+
+    impl Write for Peer {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> { Ok(data.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn an_answer_is_read_whole_but_not_without_end() {
+        let soon = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(exchange(&mut Peer(vec![b"HTTP/1.1 200 OK\r\n".to_vec(), b"\r\nbody".to_vec()]), "GET", soon).unwrap(),
+            b"HTTP/1.1 200 OK\r\n\r\nbody");
+        // A peer that keeps sending is cut off.
+        let flood = vec![vec![0u8; 16 * 1024]; LARGEST_ANSWER / (16 * 1024) + 1];
+        assert_eq!(exchange(&mut Peer(flood), "GET", soon).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // So is a peer that is still sending at the deadline, however little is left.
+        let late = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(exchange(&mut Peer(vec![b"slow".to_vec()]), "GET", late).unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        // Pairing waits for the PIN with no deadline.
+        assert_eq!(exchange(&mut Peer(vec![b"late".to_vec()]), "GET", None).unwrap(), b"late");
+    }
+
+    #[test]
+    fn only_an_answer_over_the_pinned_connection_counts_as_paired() {
+        let xml = "<root status_code=\"200\"><hostname>den</hostname><uniqueid>ABC</uniqueid><PairStatus>1</PairStatus>\
+            <currentgame>7</currentgame></root>";
+        assert!(server_info(xml, true).paired);
+        // Anyone on the network can send this answer in plain.
+        let plain = server_info(xml, false);
+        assert!(!plain.paired);
+        assert_eq!((plain.name.as_str(), plain.unique_id.as_str()), ("den", "ABC"));
+        // Such an answer cannot start, rejoin or end an app; this fails before any request is made.
+        let request = Launch { app: 1, width: 1280, height: 800, fps: 60, hdr: false, host_audio: false, end_other: Some(7) };
+        let refused = Host::new("192.0.2.1").launch(&Identity::generate().unwrap(), &plain, &request);
+        assert_eq!(refused.unwrap_err(), "This PC is not paired");
     }
 
     #[test]
