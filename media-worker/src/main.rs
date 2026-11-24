@@ -29,7 +29,9 @@ mod transport;
 mod trial;
 #[cfg(target_os = "linux")]
 mod pc;
+#[cfg(target_os = "linux")]
 mod present;
+#[cfg(target_os = "linux")]
 mod webrtc;
 #[cfg(target_os = "linux")]
 mod x11;
