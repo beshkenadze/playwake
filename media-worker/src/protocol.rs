@@ -24,6 +24,9 @@ pub struct Pc {
     /// The user wants HDR and the PC can encode it.
     #[serde(default)]
     pub hdr: bool,
+    /// The stream is smaller than the screen and SteamOS scales it up.
+    #[serde(default)]
+    pub scaled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +114,24 @@ pub enum Command {
     },
     Stats,
     Stop,
+    /// The LSFG preview: a made-up scene in the video window, no stream.
+    Preview {
+        width: u32,
+        height: u32,
+        /// The scene's rate; LSFG shows twice as many frames.
+        #[serde(default = "default_preview_fps")]
+        fps: u32,
+        #[serde(default)]
+        lsfg: bool,
+        #[serde(default)]
+        performance: bool,
+        #[serde(default)]
+        flow_scale: String,
+        #[serde(default)]
+        russian: bool,
+        #[serde(default)]
+        xbox_palette: bool,
+    },
 }
 
 fn default_width() -> u32 { 1920 }
@@ -119,6 +140,7 @@ fn default_renderer() -> String { "auto".into() }
 fn default_volume() -> u32 { 100 }
 fn default_console_name() -> String { "Xbox".into() }
 fn default_pulse_duration() -> u64 { 230 }
+fn default_preview_fps() -> u32 { 30 }
 
 pub fn parse(line: &str) -> Option<Command> {
     serde_json::from_str(line).ok()

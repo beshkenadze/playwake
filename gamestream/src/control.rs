@@ -147,6 +147,14 @@ impl Gamepad {
         packet[32..34].copy_from_slice(&0x0055u16.to_le_bytes());
         packet
     }
+
+    /// The packet that unplugs controller 0 on the host: its bit is clear in
+    /// the mask of connected controllers.
+    pub(crate) fn unplug_packet() -> [u8; 34] {
+        let mut packet = Gamepad::default().packet();
+        packet[12..14].copy_from_slice(&0u16.to_le_bytes());
+        packet
+    }
 }
 
 pub const MODIFIER_SHIFT: u8 = 0x01;
@@ -261,5 +269,15 @@ mod tests {
         assert_eq!(&packet[16..20], &[0x00, 0x14, 255, 1]);
         assert_eq!(&packet[20..28], &[0x00, 0x80, 0xff, 0x7f, 1, 0, 0xfe, 0xff]);
         assert_eq!(&packet[28..34], &[0x9c, 0, 0x20, 0, 0x55, 0]);
+    }
+
+    #[test]
+    fn unplugs_controller_zero_with_an_empty_mask() {
+        let (unplug, neutral) = (Gamepad::unplug_packet(), Gamepad::default().packet());
+        assert_eq!(&unplug[12..14], &[0, 0]);
+        assert_eq!(&neutral[12..14], &[1, 0]);
+        // Only the mask differs from a neutral state.
+        assert_eq!(unplug[..12], neutral[..12]);
+        assert_eq!(unplug[14..], neutral[14..]);
     }
 }

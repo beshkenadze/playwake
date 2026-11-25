@@ -96,16 +96,24 @@ pub fn refresh_hud(state: &Arc<Mutex<State>>, webrtc: Option<&gstreamer::Element
         let drops_word = if russian { "проп." } else { "drops" };
         let video_label = if russian { "Видео" } else { "Video" };
         let decode_label = if russian { "Декодер" } else { "Decode" };
-        st.hud_compact_rate = format!("{}p · {} {:.0} FPS · {} {}",
-            height, decode_label, fps, drops_word, drops + sink_drops);
+        let stream_size = match st.scaled_to {
+            Some(((_, screen_height), _)) => format!("{height}p→{screen_height}p"),
+            None => format!("{height}p"),
+        };
+        st.hud_compact_rate = format!("{} · {} {:.0} FPS · {} {}",
+            stream_size, decode_label, fps, drops_word, drops + sink_drops);
         st.hud_compact = format!("{:.1} Mb/s · RTT {} · {} {}",
             mbps, ms(rtt), video_label, ms(client_ms));
         let limit = crate::LIMIT_KBPS.load(std::sync::atomic::Ordering::Relaxed);
-        let latency_line = if russian {
-            format!("Видео: после джиттер-буфера → вход видеовывода {}", ms(client_ms))
-        } else {
-            format!("Video: after jitter buffer → sink input {}", ms(client_ms))
+        // The worker's own presenter measures up to the present call.
+        let latency_line = match (st.present_stages.is_empty(), russian) {
+            (true, true) => format!("Видео: после джиттер-буфера → вход видеовывода {}", ms(client_ms)),
+            (true, false) => format!("Video: after jitter buffer → sink input {}", ms(client_ms)),
+            (false, true) => format!("Видео: приход кадра → передан экрану {}", ms(client_ms)),
+            (false, false) => format!("Video: frame arrival → given to the screen {}", ms(client_ms)),
         };
+        let hdr = st.hdr_peak_nits.map(|nits| if russian { format!("HDR10 · пик кадра ~{nits:.0} нит") }
+            else { format!("HDR10 · frame peak ~{nits:.0} nits") });
         st.hud_metrics = vec![
             format!("Video {}×{} · {:.1} decoded FPS", width, height, fps),
             format!("Viewport {}×{} · {} · LSFG {}", viewport.0, viewport.1, decoder,
@@ -115,6 +123,29 @@ pub fn refresh_hud(state: &Arc<Mutex<State>>, webrtc: Option<&gstreamer::Element
             latency_line,
             format!("Queue {} · queue drops ~{} · sink drops {}", depth, drops, sink_drops),
         ];
+        st.hud_metrics.extend(hdr);
+        if let Some(((screen_width, screen_height), filter)) = st.scaled_to {
+            st.hud_metrics.push(if russian {
+                format!("Поток {width}×{height} → экран {screen_width}×{screen_height} · SteamOS {filter}")
+            } else {
+                format!("Stream {width}×{height} → screen {screen_width}×{screen_height} · SteamOS {filter}")
+            });
+        }
+        if !st.present_stages.is_empty() {
+            let stage = |index: usize| median(st.present_stages.iter().map(|stages| stages[index])).unwrap_or(0.0);
+            let line = format!("Decode {:.1} · wait {:.1} · copy {:.1} · present {:.1} ms",
+                stage(0), stage(1), stage(2), stage(3));
+            st.hud_metrics.push(line);
+        }
+        if let Some(title) = st.preview.clone() {
+            st.hud_compact_rate = title;
+            st.hud_compact = if russian {
+                format!("{height}p · источник {fps:.0} FPS · A сравнить · B назад")
+            } else {
+                format!("{height}p · source {fps:.0} FPS · A compare · B back")
+            };
+            st.hud_metrics.clear();
+        }
     }
     protocol::event("hud-stats", json!({
         "width": width,

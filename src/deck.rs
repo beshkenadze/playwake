@@ -1,4 +1,4 @@
-use super::{DevicePrompt, RemotePlay, Window, assets, login_qr};
+use super::{DevicePrompt, PcDialog, RemotePlay, Window, assets, login_qr};
 use crate::session_store::{Language as Locale, Preferences};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -46,6 +46,8 @@ pub enum Key {
     Right,
     Accept,
     Back,
+    /// X: quits the app the PC runs.
+    Quit,
     Settings,
     Refresh,
     PreviousTab,
@@ -61,6 +63,7 @@ impl Key {
             "right" => Self::Right,
             "accept" | "enter" | "return" => Self::Accept,
             "back" | "escape" => Self::Back,
+            "quit" | "delete" => Self::Quit,
             "settings" => Self::Settings,
             "refresh" => Self::Refresh,
             "previous-tab" => Self::PreviousTab,
@@ -78,7 +81,19 @@ pub enum Action {
     Play(usize),
     CloudGame(usize),
     Pc,
+    /// A tile of the PC list.
+    PcHost(usize),
+    PcAdd,
+    /// Back from a PC's apps to the PC list.
+    PcList,
+    /// An app of the open PC.
     PcGame(usize),
+    /// Quit the app the PC runs, after asking.
+    PcQuit(usize),
+    /// Asks before closing Playwake.
+    AskExit,
+    /// Switches the video settings between Xbox and PC.
+    VideoTarget,
     SignIn,
     Browser,
     Cancel,
@@ -91,6 +106,8 @@ pub enum Action {
     Bitrate,
     Jitter,
     Upscale,
+    PcBitrate,
+    PcStreamHeight,
     PcHdr,
     Lsfg,
     LsfgPerformance,
@@ -143,13 +160,27 @@ pub struct Menu {
     pub editing_value: bool,
     pub console: usize,
     pub cloud_game: usize,
+    /// The selected tile of the PC list; the last one adds a PC.
+    pub pc: usize,
+    /// The ID of the PC whose apps are shown instead of the PC list.
+    pub pc_open: Option<String>,
     pub pc_game: usize,
     pub pc_available: bool,
     pub browser_cancel: bool,
     pub confirming_sign_out: bool,
+    /// The video settings shown: a PC's instead of an Xbox's.
+    pub video_pc: bool,
 }
 
 impl Menu {
+    /// Shows the other device's video settings. The rows below the switch
+    /// change, so the selection goes back to the switch.
+    pub fn switch_video_target(&mut self) {
+        self.video_pc = !self.video_pc;
+        self.editing_value = false;
+        if self.row.is_some() { self.row = Some(0); }
+    }
+
     pub fn select_tab(&mut self, tab: Tab) {
         self.tab = tab;
         self.focused_tab = None;
@@ -162,6 +193,20 @@ impl Menu {
         self.focused_tab = None;
         self.row = None;
         self.editing_value = false;
+    }
+
+    pub fn open_pc(&mut self, id: &str) {
+        self.pc_open = Some(id.to_owned());
+        self.pc_game = 0;
+    }
+
+    /// Keeps the PC tab's selections inside a new catalog. A PC that is gone
+    /// or no longer paired closes, and the PC list shows again.
+    pub fn follow_pcs(&mut self, catalog: &crate::pc::Catalog) {
+        self.pc_open.take_if(|id| catalog.paired(id).is_none());
+        self.pc = self.pc.min(catalog.pcs.len());
+        let apps = self.pc_open.as_deref().map_or(0, |id| catalog.apps(id).len());
+        self.pc_game = self.pc_game.min(apps.saturating_sub(1));
     }
 
     pub fn navigate(
@@ -196,9 +241,11 @@ impl Menu {
             return None;
         }
 
+        let back = if self.tab == Tab::Pc && self.pc_open.is_some() { Action::PcList } else { Action::Home };
         let library = match self.tab {
             Tab::Cloud => Some(&mut self.cloud_game),
-            Tab::Pc => Some(&mut self.pc_game),
+            Tab::Pc if self.pc_open.is_some() => Some(&mut self.pc_game),
+            Tab::Pc => Some(&mut self.pc),
             _ => None,
         };
         if let Some(game) = library {
@@ -210,7 +257,8 @@ impl Menu {
                 Left => *game = game.saturating_sub(1),
                 Right => *game = (*game + 1).min(last),
                 Accept => return consoles.get((*game).min(last)).copied().and_then(run),
-                Back => return run(Action::Home),
+                Quit if self.tab == Tab::Pc && self.pc_open.is_some() => return run(Action::PcQuit((*game).min(last))),
+                Back => return run(back),
                 _ => {}
             }
             return None;
@@ -223,6 +271,7 @@ impl Menu {
                 Left => self.console = self.console.saturating_sub(1),
                 Right => self.console = self.console.saturating_add(1).min(last),
                 Accept => return consoles.get(self.console.min(last)).copied().and_then(run),
+                Back => return run(Action::AskExit),
                 _ => {}
             }
             return None;
@@ -269,7 +318,7 @@ impl Action {
     fn adjustable(self) -> bool {
         matches!(
             self,
-            Self::Resolution | Self::Bitrate | Self::Jitter | Self::Volume | Self::Language | Self::Palette
+            Self::Resolution | Self::Bitrate | Self::PcBitrate | Self::PcStreamHeight | Self::Jitter | Self::Volume | Self::Language | Self::Palette
         )
     }
 }
@@ -288,6 +337,8 @@ const CARD: u32 = 0x2c2c2e;
 const LINE: u32 = 0x393b3b;
 const TEXT: u32 = 0xececec;
 const MUTED: u32 = 0xa1a1a6;
+const WARNING: u32 = 0xf5b041;
+const WARNING_CARD: u32 = 0x3a2c14;
 
 fn colors(prefs: Preferences) -> (u32, u32) {
     if prefs.xbox_palette {
@@ -314,6 +365,8 @@ struct Row {
     hint: &'static str,
     value: String,
     action: Option<Action>,
+    /// Something the user has to fix, drawn in the warning colour.
+    warning: bool,
 }
 
 impl Row {
@@ -328,11 +381,34 @@ impl Row {
             hint,
             value: value.into(),
             action,
+            warning: false,
         }
+    }
+
+    fn warning(label: &'static str, hint: &'static str) -> Self {
+        Self { warning: true, ..Self::new(label, hint, "", None) }
     }
 }
 
-fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize) -> Vec<Row> {
+fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize,
+    lsfg_missing: Option<crate::lsfg::Missing>, video_pc: bool) -> Vec<Row> {
+    use crate::lsfg::Missing;
+    // Without its parts LSFG cannot be turned on; a warning says what to install.
+    let lsfg_fix = match lsfg_missing {
+        None => "",
+        Some(Missing::Platform) => t.t("Только на Linux с Vulkan", "Linux with Vulkan only"),
+        Some(Missing::Parts { dll: true, layer: true }) => t.t(
+            "Установите слой Vulkan lsfg-vk 2.x (lsfg-vk.dev) и ветку lsfg-vk у Lossless Scaling: Steam → Свойства → Бета-версии",
+            "Install the lsfg-vk 2.x Vulkan layer (lsfg-vk.dev) and Lossless Scaling's lsfg-vk branch: Steam → Properties → Betas"),
+        Some(Missing::Parts { dll: true, .. }) => t.t(
+            "Переключите Lossless Scaling на ветку lsfg-vk: Steam → Свойства → Бета-версии",
+            "Switch Lossless Scaling to its lsfg-vk branch: Steam → Properties → Betas"),
+        Some(Missing::Parts { .. }) => t.t(
+            "Установите слой Vulkan lsfg-vk 2.x (lsfg-vk.dev)",
+            "Install the lsfg-vk 2.x Vulkan layer (lsfg-vk.dev)"),
+    };
+    let lsfg_ready = lsfg_missing.is_none();
+    let when_ready = |action: Action| lsfg_ready.then_some(action);
     use self::Action::*;
     let on = |value| {
         if value {
@@ -369,12 +445,15 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 signed_in.then_some(Refresh),
             ),
         ],
-        1 => vec![
+        // The video settings of an Xbox or of a PC, as the switch on top
+        // shows, then the ones both share.
+        1 => [Row::new(t.t("Настройки для", "Settings for"), "", "", Some(VideoTarget))].into_iter()
+            .chain(if !video_pc { vec![
             Row::new(
-                t.t("Запрашиваемое разрешение", "Requested resolution"),
+                t.t("Разрешение", "Resolution"),
                 t.t(
-                    "Фактический размер потока выбирает Xbox",
-                    "Xbox picks the actual stream size",
+                    "Xbox принимает только 720p, 1080p и 1440p, итоговый размер выбирает сама Xbox",
+                    "Xbox takes only 720p, 1080p and 1440p and picks the final size itself",
                 ),
                 format!("‹  {}p  ›", p.height),
                 Some(Resolution),
@@ -385,6 +464,7 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 format!("‹  {} {}  ›", p.bitrate_mbps, t.t("Мбит/с", "Mbps")),
                 Some(Bitrate),
             ),
+            // A PC's sound and picture play as they arrive, without this buffer.
             Row::new(
                 t.t("Буфер джиттера", "Jitter buffer"),
                 t.t("Меньше — ниже задержка, больше — плавнее на Wi-Fi · со следующего подключения",
@@ -392,13 +472,32 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 format!("‹  {} {}  ›", p.jitter_ms, t.t("мс", "ms")),
                 Some(Jitter),
             ),
+            ] } else { vec![
             Row::new(
-                t.t("HDR со стрима ПК", "HDR from a PC"),
+                t.t("Разрешение", "Resolution"),
+                t.t("ПК подстраивает свой дисплей под любое. Меньше экрана — растягивает SteamOS фильтром из его настроек (FSR, NIS…), больше — уменьшает Playwake · со следующего подключения",
+                    "The PC sets its display to any of them. Below the screen, SteamOS scales it up with the filter set there (FSR, NIS…); above it, Playwake scales it down · applies on reconnect"),
+                if p.pc_stream_height == 0 {
+                    format!("‹  {} · {}p  ›", t.t("Экран", "Screen"), crate::pc::Panel::of(crate::device::current()).height)
+                } else { format!("‹  {}p  ›", p.pc_stream_height) },
+                Some(PcStreamHeight),
+            ),
+            Row::new(
+                t.t("Битрейт", "Bitrate"),
+                t.t("Выше — чётче картинка, но нужен быстрый Wi-Fi · со следующего подключения",
+                    "Higher is sharper but needs fast Wi-Fi · applies on reconnect"),
+                format!("‹  {} {}  ›", p.pc_bitrate_mbps, t.t("Мбит/с", "Mbps")),
+                Some(PcBitrate),
+            ),
+            Row::new(
+                "HDR",
                 t.t("На HDR-экране, если ПК кодирует HDR · со следующего подключения",
                     "On an HDR screen when the PC encodes HDR · applies on reconnect"),
                 on(p.pc_hdr),
                 Some(PcHdr),
             ),
+            ] })
+            .chain([
             Row::new(
                 t.t("Апскейлинг", "Upscaling"),
                 t.t("Для видео меньше экрана · со следующего подключения",
@@ -406,38 +505,33 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 if p.lanczos_upscale { "Lanczos" } else { t.t("Вписать", "Fit") },
                 Some(Upscale),
             ),
-            Row::new(
-                t.t("Полноэкранный режим", "Fullscreen"),
-                "",
-                t.t("Во время стрима", "While streaming"),
-                None,
-            ),
-        ],
-        2 => vec![
-            Row::new(
-                "LSFG 2×",
-                t.t(
-                    "Применяется при следующем подключении",
-                    "Applies on the next connection",
-                ),
-                on(p.lsfg_enabled),
-                Some(Lsfg),
-            ),
+        ]).collect(),
+        2 => lsfg_missing.map(|_| Row::warning(
+            t.t("LSFG не установлен", "LSFG is not installed"), lsfg_fix)).into_iter().chain([
+            Row {
+                warning: !lsfg_ready,
+                ..Row::new(
+                    "LSFG 2×",
+                    if lsfg_ready { t.t("Применяется при следующем подключении", "Applies on the next connection") } else { "" },
+                    if lsfg_ready { on(p.lsfg_enabled) } else { t.t("Не установлено", "Not installed") },
+                    when_ready(Lsfg),
+                )
+            },
             Row::new(
                 t.t("Режим LSFG", "LSFG mode"),
                 "",
                 if p.lsfg_performance { t.t("Производительность", "Performance") }
                 else { t.t("Качество", "Quality") },
-                Some(LsfgPerformance),
+                when_ready(LsfgPerformance),
             ),
-            Row::new("Flow Scale", "", p.lsfg_flow_scale(), Some(LsfgFlowScale)),
+            Row::new("Flow Scale", "", p.lsfg_flow_scale(), when_ready(LsfgFlowScale)),
             Row::new(
                 t.t("Предпросмотр LSFG", "LSFG preview"),
                 t.t("Сравнить движение и FPS вывода", "Compare motion and presentation FPS"),
                 t.t("Открыть", "Open"),
-                Some(LsfgPreview),
+                when_ready(LsfgPreview),
             ),
-        ],
+        ]).collect(),
         3 => vec![
             Row::new(
                 t.t("Громкость стрима", "Stream volume"),
@@ -464,6 +558,19 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                     "Tap both buttons together",
                 ),
                 "View + Menu",
+                None,
+            ),
+            Row::new(
+                t.t("Завершить стрим", "End stream"),
+                t.t("Вместе нажмите View и Menu и, удерживая их, нажмите LB и RB",
+                    "Press View and Menu together, hold them, and press LB and RB"),
+                "View + Menu + LB + RB",
+                None,
+            ),
+            Row::new(
+                t.t("Статистика стрима", "Stream statistics"),
+                t.t("Зажмите LB, RB и X, затем нажмите View", "Hold LB, RB and X, then press View"),
+                "View + LB + RB + X",
                 None,
             ),
             Row::new(
@@ -531,6 +638,8 @@ pub fn setting_actions(v: &RemotePlay) -> Vec<Action> {
         v.account.is_some(),
         v.consoles.len(),
         v.menu.section,
+        v.lsfg_missing,
+        v.menu.video_pc,
     )
     .into_iter()
     .filter_map(|row| row.action)
@@ -548,8 +657,13 @@ pub fn order(v: &RemotePlay) -> Vec<Action> {
         return vec![Action::Cancel];
     }
     if v.menu.tab == Tab::Pc {
-        let tiles = v.pc_catalog.games.len() + v.pc_catalog.unpaired.len();
-        return if tiles == 0 { vec![Action::Refresh] } else { (0..tiles).map(Action::PcGame).collect() };
+        return match &v.menu.pc_open {
+            Some(id) => match v.pc_catalog.apps(id).len() {
+                0 => vec![Action::Refresh],
+                apps => (0..apps).map(Action::PcGame).collect(),
+            },
+            None => (0..v.pc_catalog.pcs.len()).map(Action::PcHost).chain([Action::PcAdd]).collect(),
+        };
     }
     if v.account.is_none() {
         return vec![Action::SignIn];
@@ -635,6 +749,9 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             .child(div().text_color(rgb(MUTED)).child(dialog_choice("pc-pairing-cancel", t.t("B Отмена", "B Cancel"), Key::Back, unit, cx)))
             .into_any_element();
     }
+    if let Some(dialog) = &v.pc_dialog {
+        return pc_dialog(v, dialog, &t, accent, unit, cx);
+    }
     let native_stream = v.stream.is_some() && super::x11_window(window).is_some();
     if native_stream && v.video_ready {
         // The video window covers this one; it still takes what is typed.
@@ -709,7 +826,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
     let mut hints = vec![
         ("◀▶", t.t("Выбор", "Move")),
         ("A", t.t("Выбрать", "Select")),
-        ("B", t.t("Назад", "Back")),
+        // On the home screen B closes Playwake, after asking.
+        ("B", if v.menu.tab == Tab::Xbox { t.t("Выход", "Exit") } else { t.t("Назад", "Back") }),
     ];
     if v.menu.editing_value {
         hints = vec![
@@ -725,12 +843,22 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             ("LB/RB", t.t("Вкладки", "Tabs")),
         ];
     } else if v.menu.tab != Tab::Settings && (v.account.is_some() || v.menu.tab == Tab::Pc) && v.stream.is_none() {
+        let pc_list = v.menu.tab == Tab::Pc && v.menu.pc_open.is_none();
         hints = vec![
             (if v.menu.tab == Tab::Xbox { "◀▶" } else { "↔↕" }, t.t("Выбор", "Move")),
-            ("A", t.t("Играть", "Play")),
+            ("A", if pc_list { t.t("Открыть", "Open") } else { t.t("Играть", "Play") }),
             ("Y", t.t("Обновить", "Refresh")),
             ("LB/RB", t.t("Вкладки", "Tabs")),
         ];
+        if v.menu.tab == Tab::Pc && !pc_list {
+            let running = v.menu.pc_open.as_deref()
+                .and_then(|id| v.pc_catalog.apps(id).get(v.menu.pc_game).map(|game| game.running)).unwrap_or(false);
+            if running {
+                hints[1].1 = t.t("Продолжить", "Resume");
+                hints.insert(2, ("X", t.t("Завершить", "Quit")));
+            }
+            hints.push(("B", t.t("К списку ПК", "PC list")));
+        }
     } else if native_stream {
         hints = vec![("B", t.t("Отмена", "Cancel"))];
     } else if v.menu.tab == Tab::Settings {
@@ -825,7 +953,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                     div()
                         .text_size(s(38.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(t.t("Подключение к Xbox", "Connecting to Xbox")),
+                        .child(if v.menu.tab == Tab::Pc { t.t("Подключение к ПК", "Connecting to PC") }
+                            else { t.t("Подключение к Xbox", "Connecting to Xbox") }),
                 )
                 .child(div().text_color(rgb(MUTED)).child(v.status.clone()))
                 .child(
@@ -939,6 +1068,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             v.account.is_some(),
             v.consoles.len(),
             v.menu.section,
+            v.lsfg_missing,
+            v.menu.video_pc,
         );
         let side = div()
             .w(s(295.))
@@ -991,7 +1122,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             )
             .children(current_rows.into_iter().enumerate().map(|(i, row)| {
                 let inner = div()
-                    .bg(rgb(CARD))
+                    .bg(rgb(if row.warning && row.value.is_empty() { WARNING_CARD } else { CARD }))
+                    .when(row.warning && row.value.is_empty(), |d| d.border(s(2.)).border_color(rgb(WARNING)))
                     .rounded(s(10.))
                     .min_h(s(62.))
                     .px(s(18.))
@@ -1000,23 +1132,33 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                     .items_center()
                     .justify_between()
                     .gap(s(16.))
-                    .child(div().flex().flex_col().child(row.label).when(
-                        !row.hint.is_empty(),
-                        |d| {
-                            d.child(
-                                div()
-                                    .text_size(s(14.))
-                                    .text_color(rgb(MUTED))
-                                    .child(row.hint),
-                            )
-                        },
-                    ))
-                    .child(
+                    .child(div().flex_1().min_w_0().flex().flex_col().gap(s(4.))
+                        .child(div().when(row.warning && row.value.is_empty(), |d| d
+                            .text_color(rgb(WARNING)).font_weight(FontWeight::SEMIBOLD))
+                            .child(row.label))
+                        .when(!row.hint.is_empty(), |d| {
+                            d.child(if row.warning {
+                                div().text_size(s(17.)).text_color(rgb(TEXT))
+                            } else {
+                                div().text_size(s(14.)).text_color(rgb(MUTED))
+                            }.child(row.hint))
+                        }))
+                    .child(if row.action == Some(Action::VideoTarget) {
+                        // Both choices, the active one filled.
+                        div().flex_none().flex().gap(s(6.)).children([("Xbox", false), (t.t("ПК", "PC"), true)].map(|(label, pc)| {
+                            let active = v.menu.video_pc == pc;
+                            div().px(s(18.)).py(s(6.)).rounded(s(8.))
+                                .bg(rgb(if active { accent } else { CANVAS }))
+                                .text_color(rgb(if active { CANVAS } else { MUTED }))
+                                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                .child(label)
+                        }))
+                    } else {
                         div()
                             .flex_none()
-                            .text_color(rgb(if row.action.is_some() { TEXT } else { MUTED }))
-                            .child(row.value),
-                    );
+                            .text_color(rgb(if row.warning { WARNING } else if row.action.is_some() { TEXT } else { MUTED }))
+                            .child(row.value)
+                    });
                 if let Some(command) = row.action {
                     let selected = v.menu.row == Some(active_index) && v.menu.focused_tab.is_none();
                     active_index += 1;
@@ -1041,26 +1183,36 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             .when(!v.status.is_empty(), |el| {
                 el.child(
                     div()
-                        .text_size(s(14.))
-                        .text_color(rgb(MUTED))
+                        .text_size(s(17.))
+                        .text_color(rgb(WARNING))
                         .child(v.status.clone()),
                 )
             });
         body = body.child(div().size_full().flex().child(side).child(content));
     } else if v.menu.tab == Tab::Pc {
-        let several = v.pc_catalog.several_pcs();
-        let pair = t.t("Сопрячь", "Pair");
-        let running = t.t("запущено", "running");
-        let labels: Vec<String> = v.pc_catalog.games.iter().map(|game| game.label(several, running))
-            .chain(v.pc_catalog.unpaired.iter().map(|pc| format!("{pair}: {}", pc.name)))
-            .collect();
-        let names = labels.iter().map(String::as_str).collect();
+        use crate::pc::Computer;
+        let open = v.menu.pc_open.as_deref().and_then(|id| v.pc_catalog.paired(id));
+        let labels: Vec<String> = match open {
+            Some(pc) => v.pc_catalog.apps(pc.id()).iter().map(|game| game.name.clone()).collect(),
+            None => v.pc_catalog.pcs.iter().map(|computer| match computer {
+                Computer::Paired(pc) => pc.name.clone(),
+                Computer::Unpaired(pc) => format!("{}: {}", t.t("Сопрячь", "Pair"), pc.name),
+                Computer::Offline(pc) => format!("{} · {}", pc.name, t.t("не в сети", "offline")),
+            }).chain([t.t("Добавить ПК по адресу", "Add a PC by address").to_owned()]).collect(),
+        };
+        let loading = v.pc_loading.then(|| t.t("Поиск ПК…", "Looking for PCs…"));
+        let none_found = open.is_none() && v.pc_catalog.pcs.is_empty() && loading.is_none();
         body = body.child(library(v, Library {
-            id: "pc-game", title: t.t("Игры с ПК", "PC games"), names, selected: v.menu.pc_game,
-            loading: v.pc_loading.then(|| t.t("Поиск ПК…", "Looking for PCs…")),
-            error: v.pc_error.as_deref(),
-            empty: t.t("ПК с Sunshine в сети не найдены.", "No PC with Sunshine found on the network."),
-            refresh: t.t("Обновить список", "Refresh list"), play: Action::PcGame,
+            id: if open.is_some() { "pc-game" } else { "pc" },
+            title: open.map_or(t.t("ПК", "PCs"), |pc| pc.name.as_str()),
+            names: labels.iter().map(String::as_str).collect(),
+            selected: if open.is_some() { v.menu.pc_game } else { v.menu.pc },
+            loading,
+            error: v.pc_error.as_deref().or(none_found.then(||
+                t.t("ПК с Sunshine в сети не найдены.", "No PC with Sunshine found on the network."))),
+            empty: t.t("На этом ПК нет приложений.", "This PC has no apps."),
+            refresh: t.t("Обновить список", "Refresh list"),
+            running: open.and_then(|pc| v.pc_catalog.apps(pc.id()).iter().position(|game| game.running)),
         }, accent, unit, cx));
     } else if v.account.is_none() {
         let waiting = v.sign_in.is_some();
@@ -1124,7 +1276,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             }),
             error: v.cloud_error.as_deref(),
             empty: t.t("Для этого аккаунта нет доступных облачных игр.", "No cloud games are available for this account."),
-            refresh: t.t("Обновить каталог", "Refresh library"), play: Action::CloudGame,
+            refresh: t.t("Обновить каталог", "Refresh library"),
+            running: None,
         }, accent, unit, cx));
     } else {
         let heading = div()
@@ -1312,26 +1465,100 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         .into_any_element()
 }
 
-/// A paged grid of game names: the cloud catalog or the apps of a PC.
+/// What a key asks of a PC dialog.
+#[derive(Debug, PartialEq)]
+pub enum PcStep {
+    Close,
+    QuitApp,
+    Add,
+    Exit,
+}
+
+/// The step a key asks of a PC dialog, or `None` to keep it, maybe changed.
+pub fn pc_dialog_step(dialog: &mut PcDialog, key: Key) -> Option<PcStep> {
+    match (dialog, key) {
+        (_, Key::Back) => Some(PcStep::Close),
+        (PcDialog::Quit(_), Key::Accept) => Some(PcStep::QuitApp),
+        (PcDialog::Exit, Key::Accept) => Some(PcStep::Exit),
+        (PcDialog::Address(address), Key::Accept) if !address.is_empty() => Some(PcStep::Add),
+        _ => None,
+    }
+}
+
+/// Adds a typed character of a host name or an IP address, or removes one on
+/// backspace. Returns whether the keystroke edited the address.
+pub fn edit_address(address: &mut String, key: &str, typed: Option<&str>) -> bool {
+    if key == "backspace" {
+        address.pop();
+        return true;
+    }
+    match typed {
+        Some(text) if !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || ".:-".contains(c)) => {
+            address.push_str(text);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn pc_dialog(v: &RemotePlay, dialog: &PcDialog, t: &Text, accent: u32, unit: f32, cx: &mut Context<RemotePlay>) -> AnyElement {
+    let s = |p| px(p * unit);
+    let screen = div().id("pc-dialog").size_full().bg(rgb(CANVAS)).text_color(rgb(TEXT)).track_focus(&v.keyboard_focus)
+        .flex().flex_col().items_center().justify_center().gap(s(18.))
+        .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
+            if !view.type_into_address(&ev.keystroke) && let Some(key) = Key::parse(ev.keystroke.key.as_str()) {
+                view.menu_key(key, window, cx);
+            }
+            cx.notify();
+        }));
+    let choices = |accept: &'static str, back: &'static str, cx: &mut Context<RemotePlay>| div().flex().gap(s(24.))
+        .text_color(rgb(accent))
+        .child(dialog_choice("pc-dialog-accept", accept, Key::Accept, unit, cx))
+        .child(dialog_choice("pc-dialog-back", back, Key::Back, unit, cx));
+    match dialog {
+        PcDialog::Exit => screen
+            .child(div().text_size(s(30.)).child(t.t("Выйти из Playwake?", "Exit Playwake?")))
+            .child(choices(t.t("A Выйти", "A Exit"), t.t("B Отмена", "B Cancel"), cx)),
+        PcDialog::Quit(game) => screen
+            .child(div().text_size(s(30.)).child(format!("{} {}?", t.t("Завершить", "Quit"), game.name)))
+            .child(div().max_w(s(820.)).text_center().text_color(rgb(MUTED)).child(t.t(
+                "Несохранённый прогресс в игре будет потерян.", "Unsaved progress in a game will be lost.")))
+            .child(choices(t.t("A Завершить", "A Quit"), t.t("B Отмена", "B Cancel"), cx)),
+        PcDialog::Address(address) => screen
+            .child(div().text_size(s(30.)).child(t.t("Добавить ПК по адресу", "Add a PC by address")))
+            .child(div().text_color(rgb(MUTED)).child(t.t(
+                "Введите IP-адрес или имя ПК с Sunshine.", "Enter the IP address or name of the PC with Sunshine.")))
+            .child(div().min_w(s(420.)).px(s(18.)).py(s(12.)).bg(rgb(CARD)).rounded(s(10.)).text_size(s(26.))
+                .child(format!("{address}▏")))
+            .child(div().text_color(rgb(MUTED)).child(t.t("Клавиатура Steam: Steam + X", "Steam keyboard: Steam + X")))
+            .child(choices(t.t("A Добавить", "A Add"), t.t("B Отмена", "B Cancel"), cx)),
+    }
+    .into_any_element()
+}
+
+/// A paged grid of names: the cloud catalog, the PCs, or the apps of a PC.
+/// Each tile does what `order` gives for it.
 struct Library<'a> {
     id: &'static str,
-    title: &'static str,
+    title: &'a str,
     names: Vec<&'a str>,
     selected: usize,
     loading: Option<&'static str>,
     error: Option<&'a str>,
     empty: &'static str,
     refresh: &'static str,
-    play: fn(usize) -> Action,
+    /// The app the PC runs, which offers resume and quit on its tile.
+    running: Option<usize>,
 }
 
 fn library(v: &RemotePlay, list: Library, accent: u32, unit: f32, cx: &mut Context<RemotePlay>) -> Div {
     let s = |p| px(p * unit);
     let games = &list.names;
+    let actions = order(v);
     let start = (list.selected / LIBRARY_PAGE) * LIBRARY_PAGE;
     let end = (start + LIBRARY_PAGE).min(games.len());
     let mut page = div().p(s(38.)).size_full().flex().flex_col().gap(s(16.))
-        .child(div().text_size(s(34.)).font_weight(FontWeight::SEMIBOLD).child(list.title));
+        .child(div().text_size(s(34.)).font_weight(FontWeight::SEMIBOLD).child(list.title.to_owned()));
     if let Some(loading) = list.loading {
         page = page.child(loading);
     }
@@ -1349,9 +1576,21 @@ fn library(v: &RemotePlay, list: Library, accent: u32, unit: f32, cx: &mut Conte
     for (row, chunk) in games[start..end].chunks(LIBRARY_COLUMNS).enumerate() {
         page = page.child(div().flex().gap(s(14.)).children(chunk.iter().enumerate().map(|(column, name)| {
             let index = start + row * LIBRARY_COLUMNS + column;
-            let card = div().w(s(335.)).h(s(76.)).px(s(14.)).flex().items_center()
+            let card = div().w(s(335.)).h(s(76.)).px(s(14.)).flex().flex_col().justify_center().gap(s(6.))
                 .bg(rgb(CARD)).rounded(s(10.)).text_size(s(18.)).child(name.to_string());
-            action((list.id, index), card, (list.play)(index),
+            let card = if list.running == Some(index) {
+                let t = Text(v.prefs.russian());
+                let chip = |label: &'static str| div().px(s(10.)).py(s(3.)).rounded(s(8.)).bg(rgb(LINE)).text_size(s(15.)).child(label);
+                card.child(div().flex().gap(s(8.))
+                    .child(chip(t.t("▶ A Продолжить", "▶ A Resume")))
+                    .child(chip(t.t("■ X Завершить", "■ X Quit")).id(("pc-quit", index)).cursor_pointer()
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            cx.stop_propagation();
+                            view.activate(Action::PcQuit(index), 1, window, cx);
+                            cx.notify();
+                        }))))
+            } else { card };
+            action((list.id, index), card, actions.get(index).copied().unwrap_or(Action::Refresh),
                 list.selected == index && v.menu.focused_tab.is_none(), accent, unit, cx)
         })));
     }
@@ -1462,12 +1701,93 @@ mod navigation_tests {
     fn the_pc_grid_moves_by_columns_and_starts_the_selected_game() {
         let mut menu = Menu::default();
         menu.select_tab(Tab::Pc);
+        menu.open_pc("den");
         let games: Vec<Action> = (0..5).map(Action::PcGame).collect();
         menu.navigate(Key::Down, &[], &games);
         menu.navigate(Key::Right, &[], &games);
         assert_eq!(menu.pc_game, 4);
         assert_eq!(menu.cloud_game, 0);
         assert_eq!(menu.navigate(Key::Accept, &[], &games), Some((Action::PcGame(4), 1)));
-        assert_eq!(menu.navigate(Key::Back, &[], &games), Some((Action::Home, 1)));
+    }
+
+    #[test]
+    fn the_jitter_buffer_is_offered_for_an_xbox_only() {
+        let actions = |pc| super::rows(crate::session_store::Preferences::default(), &super::Text(false), false, 0, 1, None, pc)
+            .into_iter().filter_map(|row| row.action).collect::<Vec<_>>();
+        assert!(actions(false).contains(&Action::Jitter));
+        assert!(!actions(true).contains(&Action::Jitter));
+        assert!(actions(true).contains(&Action::PcHdr));
+    }
+
+    #[test]
+    fn switching_the_video_settings_leaves_no_row_being_edited() {
+        let mut menu = Menu { row: Some(3), editing_value: true, ..Menu::default() };
+        menu.switch_video_target();
+        assert!(menu.video_pc);
+        assert_eq!((menu.row, menu.editing_value), (Some(0), false));
+    }
+
+    #[test]
+    fn back_leaves_a_pcs_apps_for_the_pc_list_and_keeps_its_selection() {
+        let mut menu = Menu::default();
+        menu.select_tab(Tab::Pc);
+        let pcs = [Action::PcHost(0), Action::PcHost(1), Action::PcAdd];
+        menu.navigate(Key::Right, &[], &pcs);
+        assert_eq!(menu.navigate(Key::Accept, &[], &pcs), Some((Action::PcHost(1), 1)));
+        menu.open_pc("den");
+        let apps = [Action::PcGame(0), Action::PcGame(1)];
+        menu.navigate(Key::Right, &[], &apps);
+        assert_eq!((menu.pc, menu.pc_game), (1, 1));
+        assert_eq!(menu.navigate(Key::Back, &[], &apps), Some((Action::PcList, 1)));
+        menu.pc_open = None;
+        assert_eq!(menu.navigate(Key::Back, &[], &pcs), Some((Action::Home, 1)));
+        // Back on the home screen asks before closing Playwake.
+        menu.select_tab(Tab::Xbox);
+        assert_eq!(menu.navigate(Key::Back, &[], &[]), Some((Action::AskExit, 1)));
+        // X on an app of a PC asks to quit it.
+        menu.select_tab(Tab::Pc);
+        menu.open_pc("den");
+        assert_eq!(menu.navigate(Key::Quit, &[], &apps), Some((Action::PcQuit(menu.pc_game), 1)));
+        // A stream started from the grid returns to it.
+        menu.open_pc("den");
+        menu.select_tab(Tab::Pc);
+        assert_eq!(menu.pc_open.as_deref(), Some("den"));
+    }
+
+    #[test]
+    fn a_new_catalog_closes_a_pc_that_is_gone_and_keeps_the_selections_inside() {
+        let mut menu = Menu { pc: 5, pc_game: 7, ..Menu::default() };
+        menu.pc_open = Some("den".into());
+        let den = crate::pc::Catalog::one_pc("den", &["Desktop", "Hades"]);
+        menu.follow_pcs(&den);
+        assert_eq!((menu.pc_open.as_deref(), menu.pc, menu.pc_game), (Some("den"), 1, 1));
+        menu.follow_pcs(&crate::pc::Catalog::default());
+        assert_eq!((menu.pc_open, menu.pc, menu.pc_game), (None, 0, 0));
+    }
+
+    #[test]
+    fn quitting_the_app_or_playwake_asks_first() {
+        use super::{PcDialog, PcStep, pc_dialog_step};
+        let game = crate::pc::Catalog::one_pc("den", &["Hades"]).games[0].clone();
+        // Both open with another button than A, so A answers at once.
+        let mut exit = PcDialog::Exit;
+        assert_eq!(pc_dialog_step(&mut exit, Key::Accept), Some(PcStep::Exit));
+        assert_eq!(pc_dialog_step(&mut exit, Key::Back), Some(PcStep::Close));
+        let mut quit = PcDialog::Quit(game);
+        assert_eq!(pc_dialog_step(&mut quit, Key::Accept), Some(PcStep::QuitApp));
+        let mut address = PcDialog::Address(String::new());
+        assert_eq!(pc_dialog_step(&mut address, Key::Accept), None);
+        address = PcDialog::Address("192.0.2.10".into());
+        assert_eq!(pc_dialog_step(&mut address, Key::Accept), Some(PcStep::Add));
+    }
+
+    #[test]
+    fn typing_an_address_takes_host_characters_and_backspace() {
+        let mut address = String::new();
+        for typed in ["1", "9", "2", ".", "a"] { assert!(super::edit_address(&mut address, typed, Some(typed))); }
+        assert!(!super::edit_address(&mut address, "space", Some(" ")));
+        assert!(!super::edit_address(&mut address, "enter", None));
+        assert!(super::edit_address(&mut address, "backspace", None));
+        assert_eq!(address, "192.");
     }
 }

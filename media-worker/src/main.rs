@@ -32,6 +32,8 @@ mod pc;
 #[cfg(target_os = "linux")]
 mod present;
 #[cfg(target_os = "linux")]
+mod scene;
+#[cfg(target_os = "linux")]
 mod webrtc;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -52,6 +54,15 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
 type Slot = Arc<Mutex<Option<Worker>>>;
+
+/// What a worker shows.
+#[cfg(target_os = "linux")]
+enum Source {
+    Xbox,
+    Pc(protocol::Pc),
+    /// The LSFG preview's scene at this rate, with the HUD's title.
+    Scene { fps: u32, title: String },
+}
 
 #[cfg(target_os = "linux")]
 struct Worker {
@@ -76,6 +87,8 @@ struct Worker {
     start_time: f64,
     input_retry: bool,
     hud_active: bool,
+    /// Shows the LSFG preview's scene instead of a stream.
+    preview: bool,
     /// Removes the pipeline's error watch when dropped, so it lives here.
     bus_watch: Option<gst::bus::BusWatchGuard>,
 }
@@ -218,8 +231,34 @@ fn run() -> Result<(), String> {
                     x11.keyboard = keyboard;
                     match x11.tick(now) {
                         Ok(tick) => {
+                            // The video window has the keyboard focus: what is
+                            // typed goes to the PC, as the app sent it before.
+                            if w.preview {
+                                for (keysym, _) in &tick.keys {
+                                    match keysym {
+                                        0xff0d | 0xff8d => protocol::event("preview-toggle", serde_json::json!({})),
+                                        0xff1b => protocol::event("preview-back", serde_json::json!({})),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if let Some(pc) = w.pc.as_ref().filter(|_| !w.input.route.overlay) {
+                                for (keysym, text) in &tick.keys {
+                                    if let Some(code) = x11::virtual_key(*keysym) {
+                                        pc.key(code, true, 0);
+                                        pc.key(code, false, 0);
+                                    } else if !text.is_empty() {
+                                        pc.text(text);
+                                    }
+                                }
+                            }
                             if tick.adopted {
                                 protocol::event("vulkan-window-embedded", serde_json::json!({}));
+                            }
+                            if x11.fixed {
+                                let screen = x11.screen();
+                                let filter = w.focus.as_ref().and_then(|focus| focus.scaling_filter()).unwrap_or("Linear");
+                                w.state.lock().unwrap().scaled_to = screen.map(|screen| (screen, filter));
                             }
                             if let Some((width, height)) = tick.size_changed {
                                 protocol::event("video-surface", serde_json::json!({ "width": width, "height": height }));
@@ -323,8 +362,20 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
     match command {
         Command::Start { bitrate, width, height, benchmark, capture_diagnostics, renderer, lsfg,
                          interactive, russian, xbox_palette, compact_stats, volume, console_name, jitter_ms, pc } => {
+            let source = match pc { Some(pc) => Source::Pc(pc), None => Source::Xbox };
             start(slot, quit, bitrate, width, height, benchmark, capture_diagnostics, renderer, lsfg,
-                interactive, russian, xbox_palette, compact_stats, volume, console_name, jitter_ms, pc);
+                interactive, russian, xbox_palette, compact_stats, volume, console_name, jitter_ms, source);
+        }
+        Command::Preview { width, height, fps, lsfg, performance, flow_scale, russian, xbox_palette } => {
+            let title = match (lsfg, performance, russian) {
+                (false, _, true) => "LSFG выкл.".to_string(),
+                (false, _, false) => "LSFG off".to_string(),
+                (true, true, _) => format!("LSFG 2× Performance · Flow Scale {flow_scale}"),
+                (true, false, true) => format!("LSFG 2× Качество · Flow Scale {flow_scale}"),
+                (true, false, false) => format!("LSFG 2× Quality · Flow Scale {flow_scale}"),
+            };
+            start(slot, quit, 20000, width, height, false, false, "vulkan".into(), lsfg,
+                true, russian, xbox_palette, true, 100, "Playwake".into(), None, Source::Scene { fps, title });
         }
         Command::Answer { sdp } => {
             if let Some(rtc) = slot.lock().unwrap().as_ref().and_then(|w| w.rtc.as_ref()) {
@@ -462,7 +513,6 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
             }
         }
         Command::Stop => quit.quit(),
-        _ => {}
     }
 }
 
@@ -472,7 +522,7 @@ fn start(
     slot: &Slot, quit: &glib::MainLoop,
     bitrate: u32, width: u32, height: u32, benchmark: bool, capture_diagnostics: bool,
     renderer: String, lsfg: bool, interactive: bool, russian: bool, xbox_palette: bool,
-    compact_stats: bool, volume: u32, console_name: String, jitter_ms: Option<u32>, pc: Option<protocol::Pc>,
+    compact_stats: bool, volume: u32, console_name: String, jitter_ms: Option<u32>, source: Source,
 ) {
     LIMIT_KBPS.store(bitrate, std::sync::atomic::Ordering::Relaxed);
     // ALLY_JITTER_MS overrides the setting for diagnostics.
@@ -483,7 +533,8 @@ fn start(
     // Always create our own child (inside the GPUI parent when embedded):
     // ximagesink paints for the default visual, the GPUI parent is ARGB32.
     let window = if std::env::var_os("DISPLAY").is_some() {
-        match x11::X11Window::create(width, height, parent, adopt) {
+        let fixed = matches!(&source, Source::Pc(pc) if pc.scaled);
+        match x11::X11Window::create(width, height, parent, adopt, fixed, renderer == "vulkan") {
             Ok(mut created) => {
                 if !adopt && std::env::var("GREENLIGHT_GAMESCOPE_FOCUS").as_deref() == Ok("1") {
                     created.assist_gamescope_focus();
@@ -508,7 +559,7 @@ fn start(
     let start_time = clock::now_ms();
     let transport = Arc::new(Mutex::new(transport::Transport::default()));
     let pipeline = gst::Pipeline::builder().name("greenlight-native").build();
-    let rtc = if pc.is_some() { None } else {
+    let rtc = if !matches!(source, Source::Xbox) { None } else {
         match webrtc::build(&pipeline, jitter, transport.clone(), capture_diagnostics) {
             Ok(rtc) => Some(Arc::new(Mutex::new(rtc))),
             Err(error) => { protocol::error(error); return; }
@@ -521,7 +572,9 @@ fn start(
     }
 
     let mut input = input::Input::new(start_time);
-    input.connect_gamepad();
+    let preview = matches!(source, Source::Scene { .. });
+    // The app takes the gamepad during the preview.
+    if !preview { input.connect_gamepad(); }
     if let Some(x) = x11_window.as_ref() { x.sync(); }
     let overlay = if interactive {
         x11_window.as_ref()
@@ -530,7 +583,7 @@ fn start(
                 overlay.russian = russian;
                 overlay.xbox_palette = xbox_palette;
                 overlay.console_name = console_name.clone();
-                overlay.pc = pc.is_some();
+                overlay.pc = matches!(source, Source::Pc(_));
                 overlay
             })
     } else {
@@ -540,6 +593,7 @@ fn start(
         let mut st = state.lock().unwrap();
         st.lsfg = lsfg;
         st.russian = russian;
+        if let Source::Scene { title, .. } = &source { st.preview = Some(title.clone()); }
     }
 
     *slot.lock().unwrap() = Some(Worker {
@@ -547,7 +601,7 @@ fn start(
         x11: x11_window, overlay, focus, target_app,
         input, renderer: renderer.clone(), window, lsfg, volume,
         tracked: std::collections::HashSet::new(), quit: quit.clone(), start_time, input_retry: false,
-        hud_active: false, bus_watch: None,
+        hud_active: false, preview, bus_watch: None,
     });
 
     // pad-added → branch attachment.
@@ -596,9 +650,13 @@ fn start(
     // A PC stream builds its whole pipeline and then plays it; an Xbox stream
     // plays at once and gets its branches when the tracks arrive.
     let Some(rtc) = rtc else {
-        let Some(pc) = pc else { return };
-        let jitter = std::time::Duration::from_millis(jitter.into());
-        if let Err(error) = pc::start(slot, &pipeline, pc, width, height, bitrate, jitter, quit.clone()) {
+        let started = match source {
+            Source::Pc(pc) => pc::start(slot, &pipeline, pc, width, height, bitrate,
+                std::time::Duration::from_millis(jitter.into()), quit.clone()),
+            Source::Scene { fps, .. } => scene::start(slot, &pipeline, width, height, fps, russian, quit.clone()),
+            Source::Xbox => Ok(()),
+        };
+        if let Err(error) = started {
             protocol::error(error);
             quit.quit();
         }
@@ -774,7 +832,7 @@ fn menu_input_mode() {
                 match event.event_type() {
                     evdev::EventType::KEY if event.value() == 1 => {
                         key = match event.code() {
-                            304 => Some("accept"), 305 => Some("back"), 308 => Some("refresh"),
+                            304 => Some("accept"), 305 => Some("back"), 307 => Some("quit"), 308 => Some("refresh"),
                             310 => Some("previous-tab"), 311 => Some("next-tab"), 315 => Some("settings"),
                             544 => Some("up"), 545 => Some("down"), 546 => Some("left"), 547 => Some("right"),
                             _ => None,

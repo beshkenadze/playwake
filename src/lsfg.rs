@@ -9,10 +9,41 @@ pub struct Runtime {
     layer_dir: PathBuf,
 }
 
+/// What LSFG lacks on this device.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Missing {
+    /// Not Linux with Vulkan.
+    Platform,
+    /// `dll`: Lossless Scaling is not on its lsfg-vk branch. `layer`: the
+    /// lsfg-vk 2.x Vulkan layer is not installed.
+    Parts { dll: bool, layer: bool },
+}
+
+impl Missing {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Platform => "LSFG requires Linux with Vulkan",
+            Self::Parts { dll: true, layer: true } =>
+                "Install the lsfg-vk 2.x Vulkan layer and Lossless Scaling from the Steam lsfg-vk branch",
+            Self::Parts { dll: true, .. } => "Install Lossless Scaling from the Steam lsfg-vk branch or set ALLY_LSFG_DLL",
+            Self::Parts { .. } => "Install the lsfg-vk 2.x Vulkan layer or set ALLY_LSFG_LAYER_DIR",
+        }
+    }
+}
+
+/// What LSFG lacks here, if anything.
+pub fn missing() -> Option<Missing> {
+    Runtime::find().err()
+}
+
 impl Runtime {
     pub fn discover() -> Result<Self> {
+        Self::find().map_err(|missing| missing.message().into())
+    }
+
+    fn find() -> std::result::Result<Self, Missing> {
         if !cfg!(target_os = "linux") {
-            return Err("LSFG requires Linux with Vulkan".into());
+            return Err(Missing::Platform);
         }
 
         let home = env::var_os("HOME").map(PathBuf::from);
@@ -21,8 +52,7 @@ impl Runtime {
             .or_else(|| home.as_ref().map(|root| {
                 root.join(".local/share/Steam/steamapps/common/Lossless Scaling/lsfg-vk.dll")
             }))
-            .filter(|path| fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0))
-            .ok_or("Install Lossless Scaling from the Steam lsfg-vk branch or set ALLY_LSFG_DLL")?;
+            .filter(|path| fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0));
 
         let configured = env::var_os("ALLY_LSFG_LAYER_DIR").map(PathBuf::from);
         let layer_dir = if let Some(path) = configured {
@@ -36,9 +66,16 @@ impl Runtime {
             directories.extend(["/usr/local/share/vulkan/implicit_layer.d", "/usr/share/vulkan/implicit_layer.d"]
                 .into_iter().map(PathBuf::from));
             directories.into_iter().find(|path| installed_layer(path))
-        }.ok_or("Install the lsfg-vk 2.x Vulkan layer or set ALLY_LSFG_LAYER_DIR")?;
+        };
 
-        Ok(Self { dll, layer_dir })
+        Self::from_parts(dll, layer_dir)
+    }
+
+    fn from_parts(dll: Option<PathBuf>, layer_dir: Option<PathBuf>) -> std::result::Result<Self, Missing> {
+        match (dll, layer_dir) {
+            (Some(dll), Some(layer_dir)) => Ok(Self { dll, layer_dir }),
+            (dll, layer_dir) => Err(Missing::Parts { dll: dll.is_none(), layer: layer_dir.is_none() }),
+        }
     }
 
     pub fn configure(&self, command: &mut Command, prefs: Preferences) -> Result<()> {
@@ -69,4 +106,29 @@ fn installed_layer(dir: &std::path::Path) -> bool {
     layer["name"].as_str() == Some("VK_LAYER_LSFGVK_frame_generation")
         && layer["library_path"].as_str()
             .is_some_and(|library| (!library.contains('/') && !library.is_empty()) || dir.join(library).is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_every_missing_part() {
+        let some = || Some(PathBuf::from("/x"));
+        assert!(Runtime::from_parts(some(), some()).is_ok());
+        assert_eq!(Runtime::from_parts(None, some()).err(), Some(Missing::Parts { dll: true, layer: false }));
+        assert_eq!(Runtime::from_parts(some(), None).err(), Some(Missing::Parts { dll: false, layer: true }));
+        assert_eq!(Runtime::from_parts(None, None).err(), Some(Missing::Parts { dll: true, layer: true }));
+    }
+
+    #[test]
+    fn takes_only_the_2x_layer_not_the_older_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = |name: &str| format!(r#"{{"layer":{{"name":"{name}","library_path":"liblsfg-vk.so"}}}}"#);
+        // lsfg-vk 1.x names its layer differently and has another manifest file.
+        fs::write(dir.path().join("VkLayer_LS_frame_generation.json"), manifest("VK_LAYER_LS_frame_generation")).unwrap();
+        assert!(!installed_layer(dir.path()));
+        fs::write(dir.path().join(MANIFEST), manifest("VK_LAYER_LSFGVK_frame_generation")).unwrap();
+        assert!(installed_layer(dir.path()));
+    }
 }

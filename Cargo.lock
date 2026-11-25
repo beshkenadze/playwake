@@ -2048,6 +2048,7 @@ dependencies = [
  "rsa",
  "rustls",
  "sha2 0.11.1",
+ "socket2",
  "x509-cert",
 ]
 

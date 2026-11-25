@@ -131,7 +131,11 @@ pub fn menu_input(send: impl Fn(crate::deck::Key) + Send + 'static) -> Result<Pl
 }
 
 fn launch(window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, prefs: Preferences, interactive: bool) -> Result<Player> {
-    let mut cmd = worker_command()?;
+    launch_with(worker_command()?, window, lsfg, prefs, interactive)
+}
+
+fn launch_with(mut cmd: Command, window: Option<VideoWindow>, lsfg: Option<&lsfg::Runtime>, prefs: Preferences,
+               interactive: bool) -> Result<Player> {
     if let Some(lsfg) = lsfg {
         lsfg.configure(&mut cmd, prefs)?;
     } else if interactive {
@@ -195,6 +199,10 @@ pub enum StreamEvent {
     VideoReady,
     Overlay(bool),
     OverlayKey(OverlayKey),
+    /// The gamepad's quit chord.
+    Quit,
+    /// The gamepad's statistics chord.
+    ToggleStats,
 }
 
 pub enum OverlayKey { Left, Right, Activate, Back, Select(usize) }
@@ -239,8 +247,9 @@ pub fn play_pc(game: crate::pc::Game, window: Option<VideoWindow>, cancel: Arc<A
     let enable_lsfg = prefs.lsfg_enabled && window.is_some();
     let lsfg = if enable_lsfg { Some(lsfg::Runtime::discover()?) } else { None };
     let vulkan = enable_lsfg || env::var("ALLY_VIDEO_RENDERER").as_deref() == Ok("vulkan");
-    let panel = crate::pc::Panel::of(crate::device::current());
-    journal::record("stream_requested", json!({"provider":"pc","bitrate_limit_kbps": prefs.bitrate_mbps * 1000,
+    // A smaller stream than the screen is scaled up by SteamOS.
+    let panel = crate::pc::Panel::of(crate::device::current()).scaled_to(prefs.pc_stream_height).for_lsfg(enable_lsfg);
+    journal::record("stream_requested", json!({"provider":"pc","bitrate_limit_kbps": prefs.pc_bitrate_mbps * 1000,
         "jitter_ms": prefs.jitter_ms,
         "width": panel.width, "height": panel.height, "fps": panel.fps}));
     let mut player = launch(window, lsfg.as_ref(), prefs, true)?;
@@ -253,7 +262,7 @@ pub fn play_pc(game: crate::pc::Game, window: Option<VideoWindow>, cancel: Arc<A
             }
         }
     });
-    command(&mut player, json!({"action":"start","bitrate":prefs.bitrate_mbps * 1000,"jitter_ms":prefs.jitter_ms,"width":panel.width,
+    command(&mut player, json!({"action":"start","bitrate":prefs.pc_bitrate_mbps * 1000,"jitter_ms":prefs.jitter_ms,"width":panel.width,
         "height":panel.height,"renderer":if vulkan { "vulkan" } else { "auto" },"lsfg":enable_lsfg,"interactive":true,
         "lanczos_upscale":window.is_some() && prefs.lanczos_upscale,
         "russian":prefs.russian(),"xbox_palette":prefs.xbox_palette,"compact_stats":prefs.compact_stats,
@@ -271,6 +280,8 @@ pub fn play_pc(game: crate::pc::Game, window: Option<VideoWindow>, cancel: Arc<A
                 Some("stream-overlay-key") => {
                     if let Some(key) = OverlayKey::read(&event) { notify(StreamEvent::OverlayKey(key)); }
                 }
+                Some("stream-quit") => notify(StreamEvent::Quit),
+                Some("stream-stats") => notify(StreamEvent::ToggleStats),
                 Some("video") if !video => {
                     video = true;
                     notify(StreamEvent::VideoReady);
@@ -296,10 +307,15 @@ fn left(status: std::io::Result<std::process::ExitStatus>) -> Result<()> {
     if status.is_ok_and(|status| status.success()) { Ok(()) } else { Err("The media worker stopped unexpectedly".into()) }
 }
 
-pub fn preview(window: VideoWindow, resolution: Resolution, prefs: Preferences, cancel: Arc<AtomicBool>,
+pub fn preview(window: VideoWindow, prefs: Preferences, cancel: Arc<AtomicBool>,
                notify: impl Fn(PreviewEvent)) -> Result<()> {
     let runtime = prefs.lsfg_enabled.then(lsfg::Runtime::discover).transpose()?;
-    let mut player = launch(Some(window), runtime.as_ref(), prefs, true)?;
+    // As a stream with LSFG, with or without it: Vulkan draws to the X11
+    // window itself. The GPU decodes, so the CPU has time to draw the scene.
+    let mut cmd = worker_command()?;
+    cmd.env("DISABLE_GAMESCOPE_WSI", "1").env("GST_VULKAN_WINDOW", "xcb")
+        .env_remove("ALLY_DECODER").env_remove("ALLY_DECODER_OPTS");
+    let mut player = launch_with(cmd, Some(window), runtime.as_ref(), prefs, true)?;
     let output = player.0.stdout.take().ok_or("Missing GStreamer output pipe")?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -308,8 +324,10 @@ pub fn preview(window: VideoWindow, resolution: Resolution, prefs: Preferences, 
                 && tx.send(event).is_err() { break; }
         }
     });
-    let (width, height) = resolution.dimensions();
-    command(&mut player, json!({"action":"preview","width":width,"height":height,"lsfg":prefs.lsfg_enabled,
+    // The screen's size at half its rate, as a PC stream with LSFG sends; LSFG doubles it.
+    let panel = crate::pc::Panel::of(crate::device::current());
+    let (width, height, fps) = (panel.width, panel.height, panel.fps / 2);
+    command(&mut player, json!({"action":"preview","width":width,"height":height,"fps":fps,"lsfg":prefs.lsfg_enabled,
         "performance":prefs.lsfg_performance,"flow_scale":prefs.lsfg_flow_scale(),"russian":prefs.russian(),
         "xbox_palette":prefs.xbox_palette}))?;
     journal::record("lsfg_preview_started", json!({"width":width,"height":height,"lsfg":prefs.lsfg_enabled,
@@ -518,6 +536,8 @@ pub fn play(account: Arc<Xbox>, target: Target, resolution: Resolution, window: 
                     Some("stream-overlay-key") => {
                         if let Some(key) = OverlayKey::read(&event) { notify(StreamEvent::OverlayKey(key)); }
                     }
+                    Some("stream-quit") => notify(StreamEvent::Quit),
+                    Some("stream-stats") => notify(StreamEvent::ToggleStats),
                     Some("stream-diagnostics") => journal::record("stream_diagnostics", json!({
                         "enabled": event.get("enabled").and_then(Value::as_bool),
                     })),

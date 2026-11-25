@@ -40,6 +40,16 @@ fn decoders(codec: Codec, preferred: Option<&str>) -> Result<Vec<String>, String
     Ok(choices)
 }
 
+/// The audio branch's depayloader and sink options. Only PulseAudio's sink
+/// has the buffer sizes; the fallback sink would refuse them.
+fn audio_output(rtp: bool, sink: &str) -> (&'static str, &'static str) {
+    match (rtp, sink) {
+        (true, _) => ("rtpopusdepay ! ", "sync=true"),
+        (false, "pulsesink") => ("", "sync=false buffer-time=100000 latency-time=10000"),
+        (false, _) => ("", "sync=false"),
+    }
+}
+
 pub fn choose_decoder(codec: Codec) -> Result<(String, String), String> {
     let choices = decoders(codec, std::env::var("ALLY_DECODER").ok().as_deref())?;
     let name = choices.iter()
@@ -123,7 +133,7 @@ pub fn attach_video(
     let queue = bin.by_name("video_queue");
     let renderer_name = sink.factory().map(|f| f.name().to_string()).unwrap_or_default();
     if deep {
-        present_frames(&sink, window_id.ok_or("A 10-bit stream needs the video window")?, state.clone(), quit.clone())?;
+        present_frames(&sink, window_id.ok_or("A 10-bit stream needs the video window")?, state.clone(), quit.clone(), lsfg)?;
     } else if let Some(xid) = window_id {
         let overlay = sink.clone().dynamic_cast::<gstreamer_video::VideoOverlay>()
             .map_err(|_| "sink does not implement VideoOverlay")?;
@@ -268,17 +278,14 @@ pub fn attach_video(
     let sink_for_probe = sink.clone();
     let has_stats = sink.factory().is_some_and(|f| f.find_property("stats").is_some());
     let quit_for_lsfg = quit.clone();
-    let lsfg_checked = std::sync::atomic::AtomicBool::new(!lsfg);
+    // The worker's own presenter checks once it has made its Vulkan instance.
+    let lsfg_checked = std::sync::atomic::AtomicBool::new(!lsfg || deep);
     sink.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
         let Some(buffer) = info.buffer() else { return gst::PadProbeReturn::Ok };
         let now = clock::now_ms();
         if !lsfg_checked.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let loaded = std::fs::read_to_string("/proc/self/maps")
-                .is_ok_and(|maps| maps.contains("liblsfg-vk-layer.so"));
-            if loaded {
-                protocol::event("lsfg-ready", json!({}));
-            } else {
-                protocol::error("The lsfg-vk 2.x layer was not loaded by Vulkan");
+            if let Err(error) = lsfg_loaded() {
+                protocol::error(error);
                 quit_for_lsfg.quit();
                 return gst::PadProbeReturn::Drop;
             }
@@ -296,7 +303,8 @@ pub fn attach_video(
                 timing.sink_at = Some(now);
                 (timing.post_jitter_at > 0.0).then(|| now - timing.post_jitter_at)
             });
-            if hud_enabled {
+            // The worker's own presenter measures up to its present call instead.
+            if hud_enabled && !deep {
                 if let Some(ms) = latency.filter(|ms| *ms >= 0.0 && *ms < 10_000.0) {
                     st.hud_video_latency.push_back(ms);
                     while st.hud_video_latency.len() > 60 { st.hud_video_latency.pop_front(); }
@@ -328,30 +336,116 @@ pub fn attach_video(
     Ok(branch)
 }
 
-/// Shows every frame that reaches `sink` in the window `xid` with the
-/// worker's own presenter. A frame that cannot be shown ends the worker.
-fn present_frames(sink: &gst::Element, xid: u64, state: Arc<Mutex<State>>, quit: glib::MainLoop) -> Result<(), String> {
+/// Holds the newest value for a taker that can be slower than the giver.
+struct Latest<T> {
+    slot: Mutex<Option<T>>,
+    given: std::sync::Condvar,
+}
+
+impl<T> Latest<T> {
+    fn new() -> Self {
+        Self { slot: Mutex::new(None), given: std::sync::Condvar::new() }
+    }
+
+    /// Puts `value` in place of one that was not taken. Returns whether
+    /// there was one.
+    fn put(&self, value: T) -> bool {
+        let replaced = self.slot.lock().unwrap().replace(value).is_some();
+        self.given.notify_one();
+        replaced
+    }
+
+    /// Takes the value, waiting up to `limit` for one.
+    fn take(&self, limit: std::time::Duration) -> Option<T> {
+        let (mut slot, _) = self.given.wait_timeout_while(self.slot.lock().unwrap(), limit, |slot| slot.is_none()).unwrap();
+        slot.take()
+    }
+}
+
+/// Shows the frames that reach `sink` in the window `xid` with the worker's
+/// own presenter, on a thread of its own. Showing a frame can wait for the
+/// screen. Frames that come in a burst after a network stall must not each
+/// take that wait, or the picture stays behind for good: the newest frame
+/// replaces one that is not shown yet. A frame that cannot be shown ends the
+/// worker.
+/// Whether Vulkan loaded the lsfg-vk layer into the worker.
+fn lsfg_loaded() -> Result<(), String> {
+    if std::fs::read_to_string("/proc/self/maps").is_ok_and(|maps| maps.contains("liblsfg-vk-layer.so")) {
+        protocol::event("lsfg-ready", json!({}));
+        Ok(())
+    } else {
+        Err("The lsfg-vk 2.x layer was not loaded by Vulkan".into())
+    }
+}
+
+fn present_frames(sink: &gst::Element, xid: u64, state: Arc<Mutex<State>>, quit: glib::MainLoop, lsfg: bool) -> Result<(), String> {
     let sink = sink.clone().downcast::<gstreamer_app::AppSink>().map_err(|_| "the 10-bit sink is not an appsink")?;
-    // Made by the thread that brings the frames, which is the only one to use it.
-    let presenter = Mutex::new(None::<crate::present::Presenter>);
+    let latest = Arc::new(Latest::new());
+    let (decoded, stale) = (latest.clone(), state.clone());
     sink.set_callbacks(gstreamer_app::AppSinkCallbacks::builder().new_sample(move |sink| {
         let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-        let show = || -> Result<(), String> {
-            let info = gstreamer_video::VideoInfo::from_caps(sample.caps().ok_or("frame without a format")?)
-                .map_err(|error| format!("frame format: {error}"))?;
-            let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(sample.buffer().ok_or("empty frame")?, &info)
-                .map_err(|error| format!("frame: {error}"))?;
-            let (display, layer) = { let state = state.lock().unwrap(); (state.hdr_display, state.overlay_layer.clone()) };
-            let mut presenter = presenter.lock().unwrap();
-            if presenter.is_none() { *presenter = Some(crate::present::Presenter::new(xid)?); }
-            presenter.as_mut().unwrap().show(&frame, display, layer)
-        };
-        show().map(|()| gst::FlowSuccess::Ok).map_err(|error| {
-            protocol::error(error);
-            quit.quit();
-            gst::FlowError::Error
-        })
+        if decoded.put((sample, sink.current_running_time())) { stale.lock().unwrap().sink_dropped += 1; }
+        Ok(gst::FlowSuccess::Ok)
     }).build());
+    // The thread lasts as long as the worker, which plays one stream; it must
+    // not be what keeps the sink alive.
+    let sink = sink.downgrade();
+    std::thread::Builder::new().name("present".into()).spawn(move || {
+        let mut presenter = None::<crate::present::Presenter>;
+        let mut peak_read = std::time::Instant::now();
+        loop {
+            // The wait for the screen comes first, so the frame taken after it is the newest.
+            if let Some(Err(error)) = presenter.as_mut().map(|presenter| presenter.ready()) {
+                protocol::error(error);
+                quit.quit();
+                break;
+            }
+            let sample = latest.take(std::time::Duration::from_millis(500));
+            let Some(sink) = sink.upgrade() else { break };
+            let Some((sample, decoded_at)) = sample else { continue };
+            let taken_at = sink.current_running_time();
+            let mut steps = [0.0; 2];
+            let mut show = || -> Result<(), String> {
+                let info = gstreamer_video::VideoInfo::from_caps(sample.caps().ok_or("frame without a format")?)
+                    .map_err(|error| format!("frame format: {error}"))?;
+                let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(sample.buffer().ok_or("empty frame")?, &info)
+                    .map_err(|error| format!("frame: {error}"))?;
+                let (display, layer) = { let state = state.lock().unwrap(); (state.hdr_display, state.overlay_layer.clone()) };
+                if presenter.is_none() {
+                    presenter = Some(crate::present::Presenter::new(xid)?);
+                    // Vulkan loads the layer with the presenter, not before.
+                    if lsfg { lsfg_loaded()?; }
+                }
+                presenter.as_mut().unwrap().show(&frame, display, layer)?;
+                steps = presenter.as_ref().unwrap().steps;
+                // Once a second is enough for the stats.
+                if peak_read.elapsed() >= std::time::Duration::from_secs(1) {
+                    peak_read = std::time::Instant::now();
+                    state.lock().unwrap().hdr_peak_nits = crate::present::hdr_peak(&frame);
+                }
+                Ok(())
+            };
+            if let Err(error) = show() {
+                protocol::error(error);
+                quit.quit();
+                break;
+            }
+            // A frame is stamped with the pipeline's time when it arrives, so
+            // the time since then is how long it took to reach the screen.
+            let arrived = sample.buffer().and_then(|buffer| buffer.pts());
+            if let (Some(arrived), Some(decoded), Some(taken), Some(now)) = (arrived, decoded_at, taken_at, sink.current_running_time()) {
+                let between = |from: gst::ClockTime, to: gst::ClockTime| (to.nseconds() as f64 - from.nseconds() as f64) / 1e6;
+                let ms = between(arrived, now);
+                let mut state = state.lock().unwrap();
+                if state.hud_enabled && (0.0..10_000.0).contains(&ms) {
+                    state.hud_video_latency.push_back(ms);
+                    while state.hud_video_latency.len() > 60 { state.hud_video_latency.pop_front(); }
+                    state.present_stages.push_back([between(arrived, decoded), between(decoded, taken), steps[0], steps[1]]);
+                    while state.present_stages.len() > 60 { state.present_stages.pop_front(); }
+                }
+            }
+        }
+    }).map_err(|error| format!("presenter thread: {error}"))?;
     Ok(())
 }
 
@@ -369,9 +463,15 @@ pub fn watch_errors(pipeline: &gst::Pipeline, quit: glib::MainLoop) -> Result<gs
 
 pub fn attach_audio(pipeline: &gst::Pipeline, pad: &gst::Pad, volume: u32, rtp: bool) -> Result<(), String> {
     let sink = if gst::ElementFactory::find("pulsesink").is_some() { "pulsesink" } else { "autoaudiosink" };
-    let depay = if rtp { "rtpopusdepay ! " } else { "" };
+    // RTP from an Xbox has passed a jitter buffer and plays by its clock. A PC
+    // sends bare packets stamped on arrival: played by the clock, a sound
+    // server that takes 90 ms at a time (more over Bluetooth) finds most of
+    // them late and drops them. They are played as they come instead, and a
+    // backlog over 100 ms is dropped so the delay cannot grow.
+    let (depay, output) = audio_output(rtp, sink);
+    let backlog = if rtp { "" } else { "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 leaky=downstream ! " };
     let description = format!(
-        "{depay}opusdec ! audioconvert ! audioresample ! volume volume={} ! {sink} sync=true",
+        "{depay}opusdec ! audioconvert ! audioresample ! volume volume={} ! {backlog}{sink} {output}",
         volume as f64 / 100.0);
     let bin = gst::parse::bin_from_description(&description, true)
         .map_err(|e| format!("audio branch: {e}"))?;
@@ -423,10 +523,36 @@ pub fn wire_ingress(webrtc: &gst::Element, state: Arc<Mutex<State>>) {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_fallback_audio_sink_gets_no_pulseaudio_options() {
+        assert!(super::audio_output(false, "pulsesink").1.contains("buffer-time"));
+        assert_eq!(super::audio_output(false, "autoaudiosink").1, "sync=false");
+        assert_eq!(super::audio_output(true, "autoaudiosink"), ("rtpopusdepay ! ", "sync=true"));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn a_slow_taker_gets_the_newest_value_only() {
+        let latest = Latest::new();
+        assert_eq!(latest.take(Duration::ZERO), None::<u32>);
+        // Three frames come in a burst before the first is shown: two are late.
+        assert_eq!([latest.put(1), latest.put(2), latest.put(3)], [false, true, true]);
+        assert_eq!(latest.take(Duration::ZERO), Some(3));
+        assert_eq!(latest.take(Duration::ZERO), None);
+        // A taker that waits is woken by the next value.
+        let latest = Arc::new(latest);
+        let giver = latest.clone();
+        let given = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(30)); giver.put(4) });
+        let waiting = std::time::Instant::now();
+        assert_eq!(latest.take(Duration::from_secs(5)), Some(4));
+        // Woken, not timed out.
+        assert!(waiting.elapsed() < Duration::from_secs(2));
+        assert!(!given.join().unwrap());
+    }
 
     #[test]
     fn a_preferred_decoder_goes_first_only_for_its_own_codec() {

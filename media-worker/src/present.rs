@@ -49,6 +49,59 @@ fn colour_matrix((kr, kb): (f32, f32), full_range: bool) -> [[f32; 4]; 4] {
     ]
 }
 
+/// The light a PQ signal of 0 to 1 stands for, in nits.
+fn pq_nits(signal: f32) -> f32 {
+    let part = signal.clamp(0.0, 1.0).powf(1.0 / 78.84375);
+    10000.0 * ((part - 0.8359375).max(0.0) / (18.8515625 - 18.6875 * part)).powf(1.0 / 0.1593017578125)
+}
+
+/// What the shader makes of one pixel's samples: R'G'B'.
+fn to_rgb(matrix: [[f32; 4]; 4], sampled: [f32; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|row| matrix[0][row] * sampled[0] + matrix[1][row] * sampled[1] + matrix[2][row] * sampled[2] + matrix[3][row])
+}
+
+/// The matrix for a picture of this colorimetry.
+fn picture_matrix(colorimetry: &gst_video::VideoColorimetry) -> [[f32; 4]; 4] {
+    let weights = match colorimetry.matrix() {
+        gst_video::VideoColorMatrix::Bt2020 => BT2020,
+        gst_video::VideoColorMatrix::Bt601 => BT601,
+        _ => BT709,
+    };
+    colour_matrix(weights, colorimetry.range() == gst_video::VideoColorRange::Range0_255)
+}
+
+/// The light of the brightest colour channel in a P010 picture, as PQ light in
+/// nits, from every fourth pixel of every fourth row. It tells an HDR picture
+/// from SDR content inside an HDR signal, which stays at the SDR white level.
+/// Luma alone would show a saturated highlight far too dark.
+fn brightest(luma: &[u8], luma_stride: usize, chroma: &[u8], chroma_stride: usize, width: usize, height: usize,
+    matrix: [[f32; 4]; 4]) -> f32 {
+    let sample = |plane: &[u8], at: usize| plane.get(at..at + 2)
+        .map(|bytes| f32::from(u16::from_le_bytes([bytes[0], bytes[1]])) / 65535.0);
+    let mut peak = 0f32;
+    for row in (0..height).step_by(4) {
+        for column in (0..width).step_by(4) {
+            // One Cb and Cr pair serves two pixels of two rows.
+            let pair = (row / 2) * chroma_stride + (column / 2) * 4;
+            let (Some(y), Some(cb), Some(cr)) = (sample(luma, row * luma_stride + column * 2), sample(chroma, pair),
+                sample(chroma, pair + 2)) else { continue };
+            peak = to_rgb(matrix, [y, cb, cr]).into_iter().fold(peak, f32::max);
+        }
+    }
+    pq_nits(peak)
+}
+
+/// The peak light of a frame in nits if the frame is PQ, which is HDR.
+pub fn hdr_peak(frame: &gst_video::VideoFrameRef<&gstreamer::BufferRef>) -> Option<f32> {
+    let info = frame.info();
+    let colorimetry = info.colorimetry();
+    if info.format() != gst_video::VideoFormat::P01010le
+        || colorimetry.transfer() != gst_video::VideoTransferFunction::Smpte2084 { return None; }
+    let stride = frame.plane_stride();
+    Some(brightest(frame.plane_data(0).ok()?, stride[0] as usize, frame.plane_data(1).ok()?, stride[1] as usize,
+        info.width() as usize, info.height() as usize, picture_matrix(&colorimetry)))
+}
+
 /// Where a picture goes in a window: as large as fits, centred, in its shape.
 fn fit(picture: (u32, u32), window: (u32, u32)) -> (f32, f32, f32, f32) {
     let (pw, ph, ww, wh) = (picture.0 as f32, picture.1 as f32, window.0 as f32, window.1 as f32);
@@ -158,6 +211,11 @@ pub struct Presenter {
     sheet_shows: Option<Arc<Layer>>,
     /// The host display whose description the swapchain carries.
     described: Option<HdrDisplay>,
+    /// The swapchain image taken for the next frame.
+    held: Option<u32>,
+    /// How long the last frame took, in milliseconds: the copy of the picture,
+    /// then the draw and present calls.
+    pub steps: [f64; 2],
 }
 
 // Everything here is used from the one thread that shows the frames.
@@ -250,7 +308,7 @@ impl Presenter {
             let overlay_fragment = shader(include_bytes!("../shaders/overlay.frag.spv"))?;
             Ok(Self { xlib, display, window: window as xlib::Window, _entry: entry, instance, surfaces, surface, gpu, device, queue, swapchains,
                 hdr_metadata, pool, commands, fence, acquired, sampler, set_layout, layout, descriptors, set, overlay_set,
-                vertex, fragment, overlay_fragment, target: None, picture: None, sheet: None, sheet_shows: None, described: None })
+                vertex, fragment, overlay_fragment, target: None, picture: None, sheet: None, sheet_shows: None, described: None, held: None, steps: [0.0; 2] })
         }
     }
 
@@ -266,6 +324,14 @@ impl Presenter {
     unsafe fn drop_target(&mut self, keep_swapchain: bool) -> vk::SwapchainKHR {
         let Some(target) = self.target.take() else { return vk::SwapchainKHR::null() };
         unsafe {
+            // An image taken for the next frame goes with its swapchain, but
+            // it signals the semaphore. A submission that only waits for the
+            // semaphore takes that signal, so the semaphore can be used again.
+            if self.held.take().is_some() {
+                let (waits, stages) = ([self.acquired], [vk::PipelineStageFlags::ALL_COMMANDS]);
+                let _ = self.device.queue_submit(self.queue, &[vk::SubmitInfo::default().wait_semaphores(&waits)
+                    .wait_dst_stage_mask(&stages)], vk::Fence::null());
+            }
             let _ = self.device.device_wait_idle();
             for framebuffer in target.framebuffers { self.device.destroy_framebuffer(framebuffer, None); }
             for drawn in target.drawn { self.device.destroy_semaphore(drawn, None); }
@@ -472,6 +538,34 @@ impl Presenter {
         self.described = Some(display);
     }
 
+    /// Waits until a frame can be drawn at once: the GPU has finished the last
+    /// one and a swapchain image is free. A free image can take until the
+    /// screen's next refresh. Call this before choosing the frame to show, so
+    /// that the frame shown is the newest and did not age in the wait.
+    pub fn ready(&mut self) -> Result<()> {
+        unsafe {
+            self.device.wait_for_fences(&[self.fence], true, 1_000_000_000).map_err(failed("finish the last frame"))?;
+            if let (None, Some(pq)) = (self.held, self.target.as_ref().map(|target| target.pq)) {
+                self.held = Some(self.acquire(pq)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the next swapchain image. The window changes size when Steam's
+    /// keyboard opens; then the swapchain is remade.
+    unsafe fn acquire(&mut self, pq: bool) -> Result<u32> {
+        for _ in 0..3 {
+            let swapchain = self.target.as_ref().ok_or("no swapchain")?.swapchain;
+            match unsafe { self.swapchains.acquire_next_image(swapchain, 1_000_000_000, self.acquired, vk::Fence::null()) } {
+                Ok((image, _)) => return Ok(image),
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => unsafe { self.retarget(pq)? },
+                Err(error) => return Err(failed("take a swapchain image")(error)),
+            }
+        }
+        Err("The video window keeps changing".into())
+    }
+
     /// Shows one P010 frame, with the overlay's picture above it if there is
     /// one. `display` is the host's HDR display, once known.
     pub fn show(&mut self, frame: &gst_video::VideoFrameRef<&gstreamer::BufferRef>, display: Option<HdrDisplay>,
@@ -480,13 +574,9 @@ impl Presenter {
         if info.format() != gst_video::VideoFormat::P01010le { return Err(format!("unexpected picture format {:?}", info.format())); }
         let colorimetry = info.colorimetry();
         let pq = colorimetry.transfer() == gst_video::VideoTransferFunction::Smpte2084;
-        let weights = match colorimetry.matrix() {
-            gst_video::VideoColorMatrix::Bt2020 => BT2020,
-            gst_video::VideoColorMatrix::Bt601 => BT601,
-            _ => BT709,
-        };
-        let matrix = colour_matrix(weights, colorimetry.range() == gst_video::VideoColorRange::Range0_255);
+        let matrix = picture_matrix(&colorimetry);
         let size = (info.width(), info.height());
+        let (synced, copied);
         unsafe {
             self.device.wait_for_fences(&[self.fence], true, 1_000_000_000).map_err(failed("finish the last frame"))?;
             if self.picture.as_ref().is_none_or(|picture| picture.size != size) {
@@ -510,17 +600,11 @@ impl Presenter {
             if self.target.as_ref().is_none_or(|target| target.pq != pq) { self.retarget(pq)?; }
             if let Some(display) = display { self.describe(display); }
 
-            // The window changes size when Steam's keyboard opens; then the swapchain is remade.
-            let mut index = None;
-            for _ in 0..3 {
-                let swapchain = self.target.as_ref().ok_or("no swapchain")?.swapchain;
-                match self.swapchains.acquire_next_image(swapchain, 1_000_000_000, self.acquired, vk::Fence::null()) {
-                    Ok((image, _)) => { index = Some(image); break }
-                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.retarget(pq)?,
-                    Err(error) => return Err(failed("take a swapchain image")(error)),
-                }
-            }
-            let index = index.ok_or("The video window keeps changing")?;
+            // The image stays held until its frame is submitted, so that an
+            // error before that leaves the semaphore to `drop_target`.
+            let index = match self.held { Some(index) => index, None => self.acquire(pq)? };
+            self.held = Some(index);
+            synced = std::time::Instant::now();
             let picture = self.picture.as_ref().ok_or("no picture")?;
             let target = self.target.as_ref().ok_or("no swapchain")?;
 
@@ -535,6 +619,7 @@ impl Presenter {
                 offset += plane.bytes() as usize;
             }
 
+            copied = std::time::Instant::now();
             self.device.reset_fences(&[self.fence]).map_err(failed("reset the fence"))?;
             self.device.begin_command_buffer(self.commands,
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
@@ -594,6 +679,7 @@ impl Presenter {
             self.device.queue_submit(self.queue, &[vk::SubmitInfo::default().wait_semaphores(&waits)
                 .wait_dst_stage_mask(&stages).command_buffers(&buffers).signal_semaphores(&signals)], self.fence)
                 .map_err(failed("draw the frame"))?;
+            self.held = None;
             let (swapchains, indices) = ([target.swapchain], [index]);
             match self.swapchains.queue_present(self.queue, &vk::PresentInfoKHR::default().wait_semaphores(&signals)
                 .swapchains(&swapchains).image_indices(&indices)) {
@@ -603,6 +689,8 @@ impl Presenter {
                 Err(error) => return Err(failed("show the frame")(error)),
             }
         }
+        let ms = |from: std::time::Instant, to: std::time::Instant| (to - from).as_secs_f64() * 1e3;
+        self.steps = [ms(synced, copied), ms(copied, std::time::Instant::now())];
         Ok(())
     }
 }
@@ -641,8 +729,7 @@ mod tests {
 
     /// What the shader computes for the 10-bit codes of one pixel.
     fn rgb(matrix: [[f32; 4]; 4], codes: [u32; 3]) -> [f32; 3] {
-        let sampled = codes.map(|code| (code * 64) as f32 / 65535.0);
-        [0, 1, 2].map(|row| matrix[0][row] * sampled[0] + matrix[1][row] * sampled[1] + matrix[2][row] * sampled[2] + matrix[3][row])
+        to_rgb(matrix, codes.map(|code| (code * 64) as f32 / 65535.0))
     }
 
     fn close(left: [f32; 3], right: [f32; 3]) -> bool {
@@ -659,6 +746,35 @@ mod tests {
         // Rec. 709 puts the same red at other codes.
         assert!(close(rgb(colour_matrix(BT709, false), [250, 409, 960]), [1.0, 0.0, 0.0]));
         assert!(close(rgb(colour_matrix(BT709, true), [1023, 512, 512]), [1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn pq_codes_give_their_light_and_sdr_white_stays_far_below_hdr_highlights() {
+        let near = |nits: f32, expected: f32| (nits - expected).abs() < expected * 0.02;
+        assert!(near(pq_nits(0.5081), 100.0));
+        assert!(near(pq_nits(0.5807), 203.0));
+        assert!(near(pq_nits(0.7518), 1000.0));
+        assert_eq!(pq_nits(1.0), 10000.0);
+        assert_eq!(pq_nits(0.0), 0.0);
+        // A 16x8 picture of video-range grey of 203 nits. Its luma rows are
+        // 40 bytes apart and its chroma rows 48.
+        let (mut luma, mut chroma) = (vec![0u8; 40 * 8], vec![0u8; 48 * 4]);
+        let put = |plane: &mut [u8], stride: usize, row: usize, sample: usize, code: u16| {
+            plane[row * stride + sample * 2..][..2].copy_from_slice(&(code << 6).to_le_bytes());
+        };
+        for row in 0..8 { for column in 0..16 { put(&mut luma, 40, row, column, 573); } }
+        for row in 0..4 { for sample in 0..16 { put(&mut chroma, 48, row, sample, 512); } }
+        let matrix = colour_matrix(BT2020, false);
+        let peak = |luma: &[u8], chroma: &[u8]| brightest(luma, 40, chroma, 48, 16, 8, matrix);
+        assert!(near(peak(&luma, &chroma), 203.0));
+        // A white pixel of 1000 nits (64 + 0.7518 * 876 = 723) in the second sampled row.
+        put(&mut luma, 40, 4, 8, 723);
+        assert!(near(peak(&luma, &chroma), 1000.0));
+        // A pure red pixel of 1000 nits there instead: its luma alone is dark.
+        put(&mut luma, 40, 4, 8, 237);
+        put(&mut chroma, 48, 2, 8, 418);
+        put(&mut chroma, 48, 2, 9, 849);
+        assert!(near(peak(&luma, &chroma), 1000.0));
     }
 
     #[test]

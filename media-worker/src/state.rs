@@ -56,9 +56,20 @@ pub struct State {
     pub hud_compact: String,
     pub hud_compact_rate: String,
     pub hud_video_latency: VecDeque<f64>,
+    /// Where the worker's own presenter spends a frame's time, in
+    /// milliseconds: decoding, waiting for the present thread, the copy of
+    /// the picture, the draw and present calls.
+    pub present_stages: VecDeque<[f64; 4]>,
+    /// A stream smaller than the screen: the screen's size and the filter
+    /// SteamOS scales it up with.
+    pub scaled_to: Option<((u32, u32), &'static str)>,
+    /// The LSFG preview's title; the HUD then shows the preview's lines.
+    pub preview: Option<String>,
     pub hud_enabled: bool,
     /// The host's HDR display, once a PC stream has described it.
     pub hdr_display: Option<gamestream::HdrDisplay>,
+    /// The peak light of the picture in nits while the stream is HDR.
+    pub hdr_peak_nits: Option<f32>,
     /// The overlay's picture, when the video sink draws the overlay itself.
     pub overlay_layer: Option<std::sync::Arc<crate::overlay::Layer>>,
     pub hud_metrics: Vec<String>,
@@ -100,6 +111,7 @@ impl State {
         self.hud_compact = "—".into();
         self.hud_compact_rate = "—".into();
         self.hud_video_latency.clear();
+        self.present_stages.clear();
         self.hud_metrics.clear();
     }
 
@@ -160,8 +172,12 @@ impl Default for State {
             hud_compact: String::new(),
             hud_compact_rate: "—".into(),
             hud_video_latency: VecDeque::new(),
+            present_stages: VecDeque::new(),
+            scaled_to: None,
+            preview: None,
             hud_enabled: false,
             hdr_display: None,
+            hdr_peak_nits: None,
             overlay_layer: None,
             hud_metrics: Vec::new(),
             lsfg: false,

@@ -76,7 +76,8 @@ pub fn start(slot: &Slot, pipeline: &gst::Pipeline, pc: protocol::Pc, width: u32
             let request = Launch { app: pc.app, width, height, fps: pc.fps, hdr, host_audio: false,
                 end_other: pc.end_other };
             let session = host.launch(&identity, &info, &request)?;
-            let config = Config { width, height, fps: pc.fps, bitrate_kbps, codec, hdr };
+            // Full range only where the worker's own presenter converts the picture.
+            let config = Config { width, height, fps: pc.fps, bitrate_kbps, codec, hdr, full_range: hdr };
             let (stream, events) = Stream::start(&host, &session, &config)?;
             let stream = Arc::new(stream);
             {

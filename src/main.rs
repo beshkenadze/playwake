@@ -31,6 +31,36 @@ enum Event {
     CloudCatalog(Arc<xbox::Xbox>, xbox::Result<Vec<cloud::Game>>),
     PcCatalog(pc::Result<pc::Catalog>),
     PcPaired(pc::Unpaired, pc::Result<()>),
+    /// A PC was added by its address, or the app it ran was quit.
+    PcChanged(pc::Result<()>),
+    /// Time to try again a PC stream that broke off.
+    RetryStream,
+}
+
+/// How many times a PC stream that broke off is started again before the
+/// error is shown, and the pause before each try: a Wi-Fi link that drops
+/// for a few seconds comes back by then, and the game still runs on the PC.
+const STREAM_RETRIES: u32 = 3;
+const STREAM_RETRY_PAUSE: Duration = Duration::from_secs(3);
+/// A stream that played this long broke off rather than failed to start, so
+/// it gets its tries anew.
+const STREAM_STABLE: Duration = Duration::from_secs(30);
+
+/// Whether a PC stream that ended with an error is started again: not one
+/// the user stopped, and only one that played or is already being retried.
+fn tries_again(cancelled: bool, had_video: bool, retries: u32) -> bool {
+    !cancelled && (had_video || retries > 0) && retries < STREAM_RETRIES
+}
+
+/// A PC tab dialog in front of the menu.
+enum PcDialog {
+    /// Asks before quitting the app, which can lose unsaved progress. It
+    /// opens with X or a tap, so A answers it at once.
+    Quit(pc::Game),
+    /// Asks before closing Playwake. It opens with B, so A answers it at once.
+    Exit,
+    /// The address typed for a PC that the search does not find.
+    Address(String),
 }
 
 struct DevicePrompt {
@@ -68,6 +98,8 @@ struct RemotePlay {
     overlay_index: usize,
     restore_windowed: bool,
     prefs: Preferences,
+    /// What LSFG lacks on this device; it stays off until that is installed.
+    lsfg_missing: Option<lsfg::Missing>,
     menu: Menu,
     menu_player: Option<media::Player>,
     keyboard_focus: FocusHandle,
@@ -84,8 +116,15 @@ struct RemotePlay {
     pc_pairing: Option<(pc::Unpaired, String)>,
     /// The game the user chose and the app its start would end on the PC.
     pc_replace: Option<(pc::Game, pc::Game, deck::Confirm)>,
+    pc_dialog: Option<PcDialog>,
     reconnect: bool,
+    /// A PC stream that broke off, waiting to be started again.
+    retry: Option<media::Target>,
+    /// Tries made since a stream last played for STREAM_STABLE.
+    retries: u32,
     video_ready: bool,
+    /// When the current stream first showed video.
+    video_at: Option<Instant>,
     refreshing: bool,
     device: Option<DevicePrompt>,
     status: String,
@@ -158,12 +197,15 @@ impl RemotePlay {
         };
         self.active_target = Some(target.clone());
         self.video_ready = false;
+        self.video_at = None;
         self.menu.select_tab(streaming_tab);
         self.restore_windowed = native_window.is_some() && !window.is_fullscreen();
         if self.restore_windowed { window.toggle_fullscreen(); }
         let cancel = Arc::new(AtomicBool::new(false));
         self.stream = Some(cancel.clone());
-        self.status = if streaming_tab == Tab::Pc { "Connecting to PC…" } else { "Connecting to Xbox…" }.into();
+        let t = deck::Text(self.prefs.russian());
+        self.status = if streaming_tab == Tab::Pc { t.t("Подключение к ПК…", "Connecting to PC…") }
+            else { t.t("Подключение к Xbox…", "Connecting to Xbox…") }.into();
         let tx = self.tx.clone();
         let resolution = self.resolution();
         let mut prefs = self.prefs;
@@ -192,10 +234,9 @@ impl RemotePlay {
         let cancel = Arc::new(AtomicBool::new(false));
         self.preview = Some(Preview { cancel: cancel.clone(), prefs, ready: false, compare: false });
         self.status.clear();
-        let resolution = self.resolution();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = media::preview(window, resolution, prefs, cancel,
+            let result = media::preview(window, prefs, cancel,
                 |event| { let _ = tx.send(Event::Preview(event)); });
             let _ = tx.send(Event::PreviewEnded(result));
         });
@@ -281,6 +322,32 @@ impl RemotePlay {
         });
     }
 
+    /// Runs a change to the PCs off the UI thread, then lists them again.
+    fn change_pcs(&mut self, status: &str, change: impl FnOnce() -> pc::Result<()> + Send + 'static) {
+        self.pc_error = None;
+        self.status = status.into();
+        let tx = self.tx.clone();
+        thread::spawn(move || { let _ = tx.send(Event::PcChanged(change())); });
+    }
+
+    /// Edits the address being typed. Returns whether the keystroke was text.
+    fn type_into_address(&mut self, keystroke: &Keystroke) -> bool {
+        let Some(PcDialog::Address(address)) = &mut self.pc_dialog else { return false };
+        deck::edit_address(address, &keystroke.key, keystroke.key_char.as_deref())
+    }
+
+    /// Takes a step of the open PC dialog; every step closes or replaces it.
+    fn pc_step(&mut self, step: deck::PcStep) {
+        let t = deck::Text(self.prefs.russian());
+        match (step, self.pc_dialog.take()) {
+            (deck::PcStep::QuitApp, Some(PcDialog::Quit(game))) =>
+                self.change_pcs(t.t("Завершение приложения…", "Quitting the app…"), move || pc::quit(&game)),
+            (deck::PcStep::Add, Some(PcDialog::Address(address))) =>
+                self.change_pcs(t.t("Проверка адреса…", "Checking the address…"), move || pc::add(&address)),
+            _ => {}
+        }
+    }
+
     fn start_menu_input(&mut self) {
         if cfg!(target_os = "linux") {
             let input_events = self.tx.clone();
@@ -320,8 +387,21 @@ impl RemotePlay {
         }
     }
 
+    /// Looks again for what LSFG needs, as the user may have installed it
+    /// since, and turns LSFG off while something is missing.
+    fn check_lsfg(&mut self) {
+        self.lsfg_missing = lsfg::missing();
+        if self.lsfg_missing.is_some() { self.prefs.lsfg_enabled = false; }
+    }
+
     fn activate(&mut self, action: Action, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
         journal::record("deck_action", json!({"action": format!("{action:?}")}));
+        if matches!(action, Action::Settings | Action::Section(_)) { self.check_lsfg(); }
+        // The user chose something else; a stream waiting to be tried again is not wanted.
+        if self.retry.take().is_some() {
+            self.retries = 0;
+            if std::mem::take(&mut self.restore_windowed) && window.is_fullscreen() { window.toggle_fullscreen(); }
+        }
         let t = deck::Text(self.prefs.russian());
         let save = match action {
             Action::Settings | Action::Home => {
@@ -347,20 +427,43 @@ impl RemotePlay {
                 if self.pc_catalog == pc::Catalog::default() { self.refresh_pc(); }
                 false
             }
-            Action::PcGame(index) => {
-                self.menu.pc_game = index;
-                let unpaired = index.checked_sub(self.pc_catalog.games.len());
-                if let Some(game) = self.pc_catalog.games.get(index).cloned() {
-                    // Ending an app on the PC can cost a running game: ask first.
-                    match self.pc_catalog.running_instead_of(&game).cloned() {
-                        Some(running) => self.pc_replace = Some((game, running, deck::Confirm::opened(Instant::now()))),
-                        None => self.start_stream(media::Target::Pc(game), window),
-                    }
-                } else if let Some(pc) = unpaired.and_then(|index| self.pc_catalog.unpaired.get(index)).cloned() {
-                    self.start_pc_pairing(pc);
+            Action::PcHost(index) => {
+                self.menu.pc = index;
+                match self.pc_catalog.pcs.get(index).cloned() {
+                    Some(pc::Computer::Paired(pc)) => self.menu.open_pc(pc.id()),
+                    Some(pc::Computer::Unpaired(pc)) => self.start_pc_pairing(pc),
+                    Some(pc::Computer::Offline(_)) => self.refresh_pc(),
+                    None => {}
                 }
                 false
             }
+            Action::PcAdd => {
+                self.menu.pc = self.pc_catalog.pcs.len();
+                self.pc_dialog = Some(PcDialog::Address(String::new()));
+                false
+            }
+            Action::PcList => { self.menu.pc_open = None; false }
+            Action::PcGame(index) => {
+                self.menu.pc_game = index;
+                match self.menu.pc_open.as_deref().and_then(|id| self.pc_catalog.choose(id, index)) {
+                    Some(pc::Choice::Running(game)) => self.start_stream(media::Target::Pc(game), window),
+                    // Ending an app on the PC can cost a running game: ask first.
+                    Some(pc::Choice::Replace(game, running)) =>
+                        self.pc_replace = Some((game, running, deck::Confirm::opened(Instant::now()))),
+                    Some(pc::Choice::Start(game)) => self.start_stream(media::Target::Pc(game), window),
+                    None => {}
+                }
+                false
+            }
+            Action::PcQuit(index) => {
+                self.menu.pc_game = index;
+                if let Some(pc::Choice::Running(game)) = self.menu.pc_open.as_deref().and_then(|id| self.pc_catalog.choose(id, index)) {
+                    self.pc_dialog = Some(PcDialog::Quit(game));
+                }
+                false
+            }
+            Action::VideoTarget => { self.menu.switch_video_target(); false }
+            Action::AskExit => { self.pc_dialog = Some(PcDialog::Exit); false }
             Action::CloudGame(index) => {
                 if let Some(game) = self.cloud_catalog.as_ref().and_then(|catalog| catalog.get(index)) {
                     self.menu.cloud_game = index;
@@ -421,6 +524,12 @@ impl RemotePlay {
             Action::Bitrate => { self.prefs.bitrate_mbps = (self.prefs.bitrate_mbps as isize + 5 * direction).clamp(5,40) as u32; true }
             Action::Jitter => { self.prefs.jitter_ms = session_store::next_jitter(self.prefs.jitter_ms, direction); true }
             Action::Upscale => { self.prefs.lanczos_upscale = !self.prefs.lanczos_upscale; true }
+            Action::PcBitrate => { self.prefs.pc_bitrate_mbps = session_store::next_pc_bitrate(self.prefs.pc_bitrate_mbps, direction); true }
+            Action::PcStreamHeight => {
+                let screen = pc::Panel::of(device::current()).height;
+                self.prefs.pc_stream_height = session_store::next_pc_stream_height(self.prefs.pc_stream_height, direction, screen);
+                true
+            }
             Action::PcHdr => { self.prefs.pc_hdr = !self.prefs.pc_hdr; true }
             Action::Lsfg => {
                 if !self.prefs.lsfg_enabled {
@@ -464,6 +573,14 @@ impl RemotePlay {
                 }
                 Key::Back => self.pc_replace = None,
                 _ => {}
+            }
+            return;
+        }
+        if let Some(dialog) = &mut self.pc_dialog {
+            match deck::pc_dialog_step(dialog, key) {
+                Some(deck::PcStep::Exit) => cx.quit(),
+                Some(step) => self.pc_step(step),
+                None => {}
             }
             return;
         }
@@ -564,8 +681,7 @@ impl RemotePlay {
                 self.pc_loading = false;
                 match result {
                     Ok(catalog) => {
-                        let tiles = catalog.games.len() + catalog.unpaired.len();
-                        self.menu.pc_game = self.menu.pc_game.min(tiles.saturating_sub(1));
+                        self.menu.follow_pcs(&catalog);
                         self.pc_catalog = catalog;
                     }
                     Err(error) => self.pc_error = Some(error),
@@ -580,6 +696,13 @@ impl RemotePlay {
                 }
                 if result.is_ok() { self.refresh_pc(); }
             }
+            Event::PcChanged(result) => {
+                self.status.clear();
+                match result {
+                    Ok(()) => self.refresh_pc(),
+                    Err(error) => self.pc_error = Some(error),
+                }
+            }
             Event::Device(prompt) => {
                 self.menu.browser_cancel = false;
                 self.status = "Waiting for Microsoft confirmation".into();
@@ -592,7 +715,17 @@ impl RemotePlay {
                 self.device = None;
                 if let Err(error) = result { self.status = error; }
             }
-            Event::Stream(media::StreamEvent::VideoReady) => self.video_ready = true,
+            Event::Stream(media::StreamEvent::VideoReady) => {
+                self.video_ready = true;
+                self.video_at.get_or_insert_with(Instant::now);
+            }
+            Event::RetryStream => {
+                if let Some(target) = self.retry.take() {
+                    let was_windowed = self.restore_windowed;
+                    self.start_stream(target, window);
+                    self.restore_windowed = was_windowed;
+                }
+            }
             Event::Preview(media::PreviewEvent::Ready) => {
                 if let Some(preview) = &mut self.preview { preview.ready = true; }
             }
@@ -630,9 +763,14 @@ impl RemotePlay {
                 }
             }
             Event::Stream(media::StreamEvent::OverlayKey(_)) => {}
+            Event::Stream(media::StreamEvent::Quit) => self.stop_stream(),
+            Event::Stream(media::StreamEvent::ToggleStats) => self.control_stream(media::StreamCommand::ToggleDiagnostics),
             Event::StreamEnded(result) => {
                 journal::record("stream_ended", json!({"success": result.is_ok()}));
-                self.stream = None;
+                let had_video = self.video_ready;
+                if self.video_at.take().is_some_and(|at| at.elapsed() >= STREAM_STABLE) { self.retries = 0; }
+                // A stream the user stopped is not tried again, whatever error came with it.
+                let cancelled = self.stream.take().is_some_and(|cancel| cancel.load(Ordering::Relaxed));
                 self.stream_commands = None;
                 self.overlay_open = false;
                 self.video_ready = false;
@@ -650,6 +788,23 @@ impl RemotePlay {
                         return;
                     }
                 }
+                // A PC stream that broke off after it played, or a try that
+                // failed, is started again: the game still runs on the PC.
+                if let (Err(error), Some(media::Target::Pc(game))) = (&result, &self.active_target)
+                    && tries_again(cancelled, had_video, self.retries)
+                {
+                    self.retries += 1;
+                    journal::record("stream_retry", json!({"attempt": self.retries, "error": error}));
+                    self.retry = Some(media::Target::Pc(game.clone().asking_again()));
+                    self.active_target = None;
+                    self.status = deck::Text(self.prefs.russian()).t("Связь с ПК прервалась · переподключение", "Lost the PC · reconnecting")
+                        .to_string() + &format!(" {}/{STREAM_RETRIES}…", self.retries);
+                    let tx = self.tx.clone();
+                    thread::spawn(move || { thread::sleep(STREAM_RETRY_PAUSE); let _ = tx.send(Event::RetryStream); });
+                    cx.notify();
+                    return;
+                }
+                self.retries = 0;
                 self.active_target = None;
                 if std::mem::take(&mut self.restore_windowed) && window.is_fullscreen() {
                     window.toggle_fullscreen();
@@ -705,14 +860,15 @@ fn main() {
                 }).detach();
                 let mut view = RemotePlay { tx, account: None, consoles: Vec::new(), sign_in: None,
                     stream: None, stream_commands: None, overlay_open: false, overlay_index: 0, restore_windowed: false,
-                    prefs: session_store::load_preferences(), device: None,
+                    prefs: session_store::load_preferences(), lsfg_missing: None, device: None,
                     menu: Menu { pc_available: cfg!(target_os = "linux"), ..Menu::default() },
                     menu_player: None, keyboard_focus: cx.focus_handle(), active_target: None, preview: None,
                     cloud_catalog: None, cloud_refreshed_at: None, cloud_loading: false, cloud_error: None,
                     pc_catalog: pc::Catalog::default(), pc_loading: false, pc_error: None, pc_pairing: None, pc_replace: None,
-                    reconnect: false, video_ready: false, refreshing: false,
+                    pc_dialog: None, reconnect: false, retry: None, retries: 0, video_ready: false, video_at: None, refreshing: false,
                     status: if media::runtime_available() { String::new() } else { "GStreamer worker missing".into() } };
                 window.focus(&view.keyboard_focus, cx);
+                view.check_lsfg();
                 view.start_menu_input();
                 match saved_account {
                     Ok(Some(xbox)) => view.show_account(xbox),
@@ -757,4 +913,19 @@ fn probe(run: media::Run) -> xbox::Result<()> {
         }));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::{STREAM_RETRIES, tries_again};
+
+    #[test]
+    fn a_stream_the_user_stopped_is_not_tried_again() {
+        assert!(tries_again(false, true, 0));
+        assert!(!tries_again(true, true, 0));
+        assert!(!tries_again(true, false, 1));
+        // A stream that never played is not retried, and tries run out.
+        assert!(!tries_again(false, false, 0));
+        assert!(!tries_again(false, true, STREAM_RETRIES));
+    }
 }

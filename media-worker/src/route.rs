@@ -4,6 +4,10 @@
 
 pub const VIEW_MENU: u16 = 8 | 4;
 pub const GUIDE: u16 = 2;
+const BUMPERS: u16 = 4096 | 8192;
+/// Moonlight's gamepad chords: exactly these buttons held, in any order.
+pub const QUIT_CHORD: u16 = VIEW_MENU | BUMPERS;
+pub const STATS_CHORD: u16 = 8 | BUMPERS | 64;
 /// Both chord buttons must arrive inside this window to count as a tap.
 pub const CHORD_WINDOW_MS: f64 = 90.0;
 /// A replayed tap stays pressed this long, one input tick, however fast the
@@ -17,6 +21,8 @@ pub enum RouteEvent {
     GuidePulse(bool),
     Rearmed,
     Focus(bool),
+    Quit,
+    ToggleStats,
 }
 
 #[derive(Debug, PartialEq)]
@@ -108,6 +114,11 @@ impl Route {
             return (Routed::neutral(), events);
         }
         if self.overlay {
+            if pressed != 0 && buttons == QUIT_CHORD {
+                events.extend(self.close_overlay(false));
+                events.push(RouteEvent::Quit);
+                return (Routed::neutral(), events);
+            }
             for (bit, key) in [(1024 | 256, "left"), (2048 | 512, "right"), (16, "activate"), (32, "back")] {
                 if pressed & bit != 0 {
                     events.push(RouteEvent::OverlayKey(key));
@@ -137,6 +148,22 @@ impl Route {
                 events.push(RouteEvent::Rearmed);
             }
             return (Routed::neutral(), events);
+        }
+        // A View or Menu press that already reached the game cannot start a
+        // chord. After a chord, the game gets nothing until the pad is idle.
+        if pressed != 0 && !self.passthrough {
+            let chord = match buttons {
+                QUIT_CHORD => Some(RouteEvent::Quit),
+                STATS_CHORD => Some(RouteEvent::ToggleStats),
+                _ => None,
+            };
+            if let Some(event) = chord {
+                self.reset_chord();
+                self.replay = None;
+                self.release_gate = true;
+                events.push(event);
+                return (Routed::neutral(), events);
+            }
         }
 
         let chord = buttons & VIEW_MENU;
@@ -441,6 +468,68 @@ mod tests {
         r.route(axes(), 4, 0, 0, 90.0);
         let (out, _) = r.route(axes(), 4 | 8, 0, 0, 100.0);
         assert_eq!(out.buttons, 4 | 8);
+    }
+
+    #[test]
+    fn view_and_menu_with_both_bumpers_quit_instead_of_opening_the_overlay() {
+        let mut r = Route::default();
+        let (out, _) = r.route(axes(), BUMPERS, 0, 0, 0.0);
+        assert_eq!(out.buttons, BUMPERS);
+        let (out, ev) = r.route(axes(), QUIT_CHORD, 0, 0, 10.0);
+        assert_eq!(out, Routed::neutral());
+        assert_eq!(ev, vec![RouteEvent::Quit]);
+        assert!(!r.overlay);
+    }
+
+    #[test]
+    fn bumpers_pressed_in_the_overlay_complete_the_quit_chord() {
+        let mut r = Route::default();
+        r.route(axes(), VIEW_MENU, 0, 0, 0.0);
+        assert!(r.overlay);
+        let (out, ev) = r.route(axes(), QUIT_CHORD, 0, 0, 200.0);
+        assert_eq!(out, Routed::neutral());
+        assert_eq!(ev, vec![RouteEvent::Overlay(false), RouteEvent::Quit]);
+    }
+
+    #[test]
+    fn the_stats_chord_toggles_once_and_sends_nothing_until_the_pad_is_idle() {
+        let mut r = Route::default();
+        r.route(axes(), BUMPERS | 64, 0, 0, 0.0);
+        let (out, ev) = r.route(axes(), STATS_CHORD, 0, 0, 10.0);
+        assert_eq!(out, Routed::neutral());
+        assert_eq!(ev, vec![RouteEvent::ToggleStats]);
+        // Held for many ticks, it toggles once; View is never replayed as a tap.
+        let (out, ev) = r.route(axes(), STATS_CHORD, 0, 0, 500.0);
+        assert_eq!(out, Routed::neutral());
+        assert!(ev.is_empty());
+        // Letting go of View first does not send the buttons still held.
+        let (out, ev) = r.route(axes(), BUMPERS | 64, 0, 0, 510.0);
+        assert_eq!(out, Routed::neutral());
+        assert!(ev.is_empty());
+        let (out, ev) = r.route([0; 4], 0, 0, 0, 520.0);
+        assert_eq!(out, Routed::neutral());
+        assert_eq!(ev, vec![RouteEvent::Rearmed]);
+        assert_eq!(r.route(axes(), 16, 0, 0, 530.0).0.buttons, 16);
+    }
+
+    #[test]
+    fn a_chord_drops_a_tap_still_being_replayed() {
+        let mut r = Route::default();
+        r.route(axes(), 4, 0, 0, 0.0);
+        assert_eq!(r.route(axes(), 0, 0, 0, 30.0).0.buttons, 4);
+        assert_eq!(r.route(axes(), STATS_CHORD, 0, 0, 31.0).1, vec![RouteEvent::ToggleStats]);
+        assert_eq!(r.route([0; 4], 0, 0, 0, 34.0).1, vec![RouteEvent::Rearmed]);
+        assert_eq!(r.route([0; 4], 0, 0, 0, 36.0).0.buttons, 0);
+    }
+
+    #[test]
+    fn a_view_press_the_game_already_got_does_not_complete_a_chord() {
+        let mut r = Route::default();
+        r.route(axes(), 8, 0, 0, 0.0);
+        assert_eq!(r.route(axes(), 8, 0, 0, 90.0).0.buttons, 8);
+        let (out, ev) = r.route(axes(), STATS_CHORD, 0, 0, 100.0);
+        assert_eq!(out.buttons, STATS_CHORD);
+        assert!(ev.is_empty());
     }
 
     #[test]

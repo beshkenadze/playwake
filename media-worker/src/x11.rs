@@ -29,6 +29,10 @@ pub struct X11Window {
     pub keyboard: bool,
     /// Where the video window was last put.
     placed: Option<(i32, i32, u32, u32)>,
+    /// Keeps its size for SteamOS to scale up.
+    pub fixed: bool,
+    /// Windows of this process taken inside the video window: the Vulkan sink's.
+    embedded: Vec<xlib::Window>,
 }
 
 /// Where the video goes while an on-screen keyboard covers the lower half of
@@ -40,6 +44,8 @@ fn above_keyboard((x, y, width, height): (i32, i32, u32, u32)) -> (i32, i32, u32
 
 pub struct Tick {
     pub size_changed: Option<(u32, u32)>,
+    /// Keys pressed in the video window: the X keysym and the text it types.
+    pub keys: Vec<(u64, String)>,
     pub adopted: bool,
     pub adopt_timeout: bool,
     pub buttons: Vec<(u32, u32, i32, i32)>,
@@ -56,7 +62,14 @@ extern "C" fn x_error_handler(_display: *mut xlib::Display, event: *mut xlib::XE
 }
 
 impl X11Window {
-    pub fn create(width: u32, height: u32, parent: Option<u64>, adopt: bool) -> Result<Self, String> {
+    /// The video window is a normal window of the app, not one that floats
+    /// above it: Gamescope shows HDR and scales with SteamOS's filter only
+    /// for the window it counts as the app. It takes the keyboard focus, so
+    /// it reads the keys itself. A `fixed` window keeps `width` x `height`
+    /// for SteamOS to scale up; otherwise it covers the app window.
+    /// `vulkan`: the Vulkan sink shows the video; it makes a window of its
+    /// own, which this one takes inside.
+    pub fn create(width: u32, height: u32, parent: Option<u64>, adopt: bool, fixed: bool, vulkan: bool) -> Result<Self, String> {
         let xlib = xlib::Xlib::open().map_err(|e| format!("libX11: {e}"))?;
         unsafe { (xlib.XSetErrorHandler)(Some(x_error_handler)); }
         unsafe {
@@ -80,16 +93,14 @@ impl X11Window {
                 if matched == 0 { return Err("no 24-bit TrueColor visual".into()); }
                 let mut attrs: xlib::XSetWindowAttributes = std::mem::zeroed();
                 attrs.colormap = (xlib.XDefaultColormap)(display, screen);
-                attrs.override_redirect = 1;
                 let xid = (xlib.XCreateWindow)(display, root, 0, 0, width, height, 0,
-                    24, xlib::InputOutput as u32, info.visual,
-                    xlib::CWColormap | xlib::CWOverrideRedirect, &mut attrs);
+                    24, xlib::InputOutput as u32, info.visual, xlib::CWColormap, &mut attrs);
                 if xid == 0 { return Err("XCreateWindow failed".into()); }
                 (xlib.XStoreName)(display, xid, b"Greenlight Native Video\0".as_ptr() as *const i8);
                 (xlib.XSetWMProtocols)(display, xid, &mut delete_atom, 1);
                 (xlib.XSelectInput)(display, xid,
-                    xlib::ExposureMask | xlib::ButtonPressMask | xlib::StructureNotifyMask);
-                if parent_xid != root {
+                    xlib::ExposureMask | xlib::ButtonPressMask | xlib::StructureNotifyMask | xlib::KeyPressMask);
+                if parent_xid != root && !fixed {
                     let mut pr: xlib::Window = 0;
                     let mut px: i32 = 0; let mut py: i32 = 0;
                     let mut pw: u32 = 0; let mut ph: u32 = 0; let mut pb: u32 = 0; let mut pd: u32 = 0;
@@ -100,12 +111,12 @@ impl X11Window {
                 }
                 (xlib.XMapRaised)(display, xid);
                 let _ = wm_protocols;
-                (xid, parent_xid, None)
+                let res_conn = if vulkan { Some(x11rb::connect(None).map_err(|e| format!("X11 res connect: {e}"))?.0) } else { None };
+                (xid, parent_xid, res_conn)
             };
             (xlib.XFlush)(display);
             (xlib.XSync)(display, 0);
-            let known_children = if adopt {
-                let conn = res_conn.as_ref().unwrap();
+            let known_children = if let Some(conn) = res_conn.as_ref() {
                 conn.query_tree(root as u32).map_err(|e| format!("X11 tree: {e}"))?.reply()
                     .map_err(|e| format!("X11 tree reply: {e}"))?.children.into_iter().collect()
             } else {
@@ -114,8 +125,57 @@ impl X11Window {
             Ok(Self {
                 xlib, display, xid, parent: parent_xid, size: (width, height), delete_atom,
                 deleted: false, adopt, adopted: false, adopt_started: None, known_children,
-                res_conn, root, baselayer_previous: None, keyboard: false, placed: None,
+                res_conn, root, baselayer_previous: None, keyboard: false, placed: None, fixed,
+                embedded: Vec::new(),
             })
+        }
+    }
+
+    /// The size of the app window, which covers the screen.
+    pub fn screen(&self) -> Option<(u32, u32)> {
+        if self.parent == 0 { return None; }
+        unsafe {
+            let mut root: xlib::Window = 0;
+            let (mut x, mut y, mut w, mut h, mut b, mut d) = (0, 0, 0u32, 0u32, 0u32, 0u32);
+            ((self.xlib.XGetGeometry)(self.display, self.parent, &mut root, &mut x, &mut y, &mut w, &mut h, &mut b, &mut d) != 0)
+                .then_some((w, h))
+        }
+    }
+
+    /// Takes a window this process made at the top level into the video
+    /// window, under the overlay: GStreamer's Vulkan sink makes one of its own
+    /// instead of drawing into the window it is given.
+    fn embed_own_windows(&mut self) -> Result<(), String> {
+        let Some(conn) = self.res_conn.as_ref() else { return Ok(()) };
+        let children = conn.query_tree(self.root as u32).map_err(|e| format!("X11 tree: {e}"))?.reply()
+            .map_err(|e| format!("X11 tree reply: {e}"))?.children;
+        let new: Vec<u32> = children.into_iter().filter(|child| self.known_children.insert(*child)).collect();
+        let Some(conn) = self.res_conn.as_ref() else { return Ok(()) };
+        for child in new {
+            if child as xlib::Window == self.xid || !self.owns_window(conn, child) { continue; }
+            self.embedded.push(child as xlib::Window);
+            unsafe {
+                (self.xlib.XReparentWindow)(self.display, child as xlib::Window, self.xid, 0, 0);
+                (self.xlib.XLowerWindow)(self.display, child as xlib::Window);
+                (self.xlib.XMapWindow)(self.display, child as xlib::Window);
+                (self.xlib.XFlush)(self.display);
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives the windows taken inside the video window its size.
+    fn fit_embedded(&self) {
+        for &child in &self.embedded {
+            unsafe {
+                let (mut r, mut x, mut y, mut w, mut h, mut b, mut d) = (0, 0, 0, 0u32, 0u32, 0u32, 0u32);
+                if (self.xlib.XGetGeometry)(self.display, child, &mut r, &mut x, &mut y, &mut w, &mut h, &mut b, &mut d) != 0
+                    && (x, y, w, h) != (0, 0, self.size.0, self.size.1)
+                {
+                    (self.xlib.XMoveResizeWindow)(self.display, child, 0, 0, self.size.0, self.size.1);
+                    (self.xlib.XFlush)(self.display);
+                }
+            }
         }
     }
 
@@ -124,7 +184,7 @@ impl X11Window {
     }
 
     pub fn tick(&mut self, now: f64) -> Result<Tick, String> {
-        let mut tick = Tick { size_changed: None, adopted: false, adopt_timeout: false,
+        let mut tick = Tick { size_changed: None, keys: Vec::new(), adopted: false, adopt_timeout: false,
             buttons: Vec::new(), exposes: Vec::new() };
         unsafe {
             while (self.xlib.XPending)(self.display) > 0 {
@@ -142,6 +202,16 @@ impl X11Window {
                     xlib::Expose => {
                         let expose: xlib::XExposeEvent = event.into();
                         tick.exposes.push(expose.window as u32);
+                    }
+                    xlib::KeyPress => {
+                        let mut key: xlib::XKeyEvent = event.into();
+                        let mut text = [0u8; 32];
+                        let mut keysym: xlib::KeySym = 0;
+                        let length = (self.xlib.XLookupString)(&mut key, text.as_mut_ptr() as *mut i8, text.len() as i32,
+                            &mut keysym, std::ptr::null_mut());
+                        let typed = if key.state & (xlib::ControlMask | xlib::Mod1Mask) != 0 { String::new() }
+                            else { typed_text(keysym as u64, &text[..length.max(0) as usize]) };
+                        tick.keys.push((keysym as u64, typed));
                     }
                     _ => {}
                 }
@@ -180,6 +250,9 @@ impl X11Window {
             return Ok(tick);
         }
         if self.xid == 0 { return Ok(tick); }
+        self.embed_own_windows()?;
+        self.fit_embedded();
+        if self.fixed { return Ok(tick); }
         let target = unsafe {
             let mut root: xlib::Window = 0;
             let mut x: i32 = 0; let mut y: i32 = 0;
@@ -322,6 +395,17 @@ impl GamescopeFocus {
         self.steam_overlay.and_then(|window| self.cardinal(window, atom)) == Some(KEYBOARD_SHOWN)
     }
 
+    /// The filter SteamOS scales the focused app with, as Gamescope reports it.
+    pub fn scaling_filter(&self) -> Option<&'static str> {
+        let atom = |name: &[u8]| self.connection.intern_atom(true, name).ok()?.reply().ok().map(|reply| reply.atom)
+            .filter(|atom| *atom != 0);
+        if atom(b"GAMESCOPE_FSR_FEEDBACK").and_then(|atom| self.cardinal(self.root, atom)) == Some(1) {
+            return Some("FSR");
+        }
+        let wanted = atom(b"GAMESCOPE_NEW_SCALING_FILTER").and_then(|atom| self.cardinal(self.root, atom));
+        Some(scaling_filter_name(wanted.unwrap_or(0)))
+    }
+
     pub fn focused_app(&self) -> Option<u32> {
         let atom = self.atom?;
         let reply = self.connection.get_property(false, self.root, atom,
@@ -345,5 +429,73 @@ mod tests {
         assert_eq!(above_keyboard((10, 20, 1280, 800)), (330, 20, 640, 400));
         // A window too small to halve still has a size.
         assert_eq!(above_keyboard((0, 0, 1, 1)), (0, 0, 1, 1));
+    }
+}
+
+/// The text a key typed. XLookupString gives Latin-1 bytes, and nothing for a
+/// character outside Latin-1, which an X keysym then carries as Unicode.
+pub fn typed_text(keysym: u64, latin1: &[u8]) -> String {
+    match keysym {
+        0x0100_0000..=0x0110_ffff => char::from_u32((keysym - 0x0100_0000) as u32).map(String::from).unwrap_or_default(),
+        _ => latin1.iter().map(|&byte| byte as char).collect(),
+    }
+}
+
+/// Gamescope's name for its scaling filter number.
+pub fn scaling_filter_name(filter: u32) -> &'static str {
+    match filter {
+        1 => "Nearest",
+        2 => "FSR",
+        3 => "NIS",
+        4 => "Integer",
+        5 => "Sharp",
+        _ => "Linear",
+    }
+}
+
+/// The Windows virtual-key code of a key that types no text, by its X keysym.
+pub fn virtual_key(keysym: u64) -> Option<u8> {
+    Some(match keysym {
+        0xff08 => 0x08,
+        0xff09 => 0x09,
+        0xff0d | 0xff8d => 0x0d,
+        0xff1b => 0x1b,
+        0xff55 => 0x21,
+        0xff56 => 0x22,
+        0xff57 => 0x23,
+        0xff50 => 0x24,
+        0xff51 => 0x25,
+        0xff52 => 0x26,
+        0xff53 => 0x27,
+        0xff54 => 0x28,
+        0xffff => 0x2e,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod key_tests {
+    #[test]
+    fn named_keys_get_the_codes_the_app_sends() {
+        assert_eq!(super::virtual_key(0xff0d), Some(0x0d));
+        assert_eq!(super::virtual_key(0xff08), Some(0x08));
+        assert_eq!(super::virtual_key(0xff54), Some(0x28));
+        assert_eq!(super::virtual_key(0x61), None);
+    }
+
+    #[test]
+    fn typed_text_keeps_accents_and_unicode_letters() {
+        assert_eq!(super::typed_text(0xe9, &[0xe9]), "é");
+        assert_eq!(super::typed_text(0x61, b"a"), "a");
+        // Cyrillic "я" as a Unicode keysym.
+        assert_eq!(super::typed_text(0x0100_044f, &[]), "я");
+    }
+
+    #[test]
+    fn names_gamescopes_scaling_filters() {
+        assert_eq!(super::scaling_filter_name(2), "FSR");
+        assert_eq!(super::scaling_filter_name(3), "NIS");
+        assert_eq!(super::scaling_filter_name(0), "Linear");
+        assert_eq!(super::scaling_filter_name(99), "Linear");
     }
 }

@@ -79,8 +79,8 @@ fn description(address: &SocketAddr, config: &Config, video_port: u16) -> String
         ("x-nv-vqos[0].bitStreamFormat", codec),
         ("x-nv-video[0].dynamicRangeMode", u32::from(config.hdr)),
         ("x-nv-video[0].maxNumReferenceFrames", 1),
-        // Rec. 709, limited range.
-        ("x-nv-video[0].encoderCscMode", 2),
+        // Rec. 709, which the host replaces by Rec. 2020 for HDR; the low bit is full range.
+        ("x-nv-video[0].encoderCscMode", 2 | u32::from(config.full_range)),
         ("x-nv-audio.surround.numChannels", 2),
         ("x-nv-audio.surround.channelMask", 3),
         ("x-nv-audio.surround.AudioQuality", 0),
@@ -139,9 +139,10 @@ mod tests {
 
     #[test]
     fn describes_the_stream_the_way_the_host_parses_it() {
-        let config = Config { width: 1920, height: 1080, fps: 60, bitrate_kbps: 20000, codec: Codec::H264, hdr: false };
-        let text = description(&"192.168.1.159:48010".parse().unwrap(), &config, 47998);
-        assert!(text.starts_with("v=0\r\no=android 0 14 IN IPv4 192.168.1.159\r\n"));
+        let mut config = Config { width: 1920, height: 1080, fps: 60, bitrate_kbps: 20000, codec: Codec::H264, hdr: false,
+            full_range: false };
+        let text = description(&"192.0.2.10:48010".parse().unwrap(), &config, 47998);
+        assert!(text.starts_with("v=0\r\no=android 0 14 IN IPv4 192.0.2.10\r\n"));
         // One trailing space, which the host strips, then CRLF.
         assert!(text.contains("a=x-nv-video[0].clientViewportWd:1920 \r\n"));
         assert!(text.contains("a=x-nv-vqos[0].bw.maximumBitrateKbps:16000 \r\n"));
@@ -151,5 +152,9 @@ mod tests {
         assert!(text.ends_with("t=0 0\r\nm=video 47998  \r\n"));
         // The host rejects a request over 2048 bytes; the headers need room too.
         assert!(text.len() < 1500);
+        assert!(text.contains("a=x-nv-video[0].encoderCscMode:2 \r\n"));
+        config.full_range = true;
+        assert!(description(&"192.0.2.10:48010".parse().unwrap(), &config, 47998)
+            .contains("a=x-nv-video[0].encoderCscMode:3 \r\n"));
     }
 }

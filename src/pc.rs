@@ -5,7 +5,7 @@ use crate::{device::Device, session_store};
 use gamestream::{Host, Identity};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{sync::Mutex, thread, time::Duration};
+use std::{sync::{Mutex, MutexGuard}, thread, time::Duration};
 
 pub type Result<T> = gamestream::Result<T>;
 
@@ -35,6 +35,10 @@ impl Saved {
         }
         asked
     }
+
+    fn add_address(&mut self, address: &str) {
+        if !self.addresses.iter().any(|known| known == address) { self.addresses.push(address.to_owned()); }
+    }
 }
 
 /// A paired PC.
@@ -51,8 +55,18 @@ pub struct Pc {
 /// A PC on the network that Playwake is not paired with.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Unpaired {
+    id: String,
     pub name: String,
     pub address: String,
+}
+
+/// A PC as the PC tab lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Computer {
+    Paired(Pc),
+    Unpaired(Unpaired),
+    /// A paired PC that did not answer: it is off or on another network.
+    Offline(Pc),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,8 +84,19 @@ pub struct Game {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Catalog {
+    /// The apps of the paired PCs that answered.
     pub games: Vec<Game>,
-    pub unpaired: Vec<Unpaired>,
+    pub pcs: Vec<Computer>,
+}
+
+/// What choosing an app does, as in Moonlight's app grid.
+#[derive(Debug, PartialEq)]
+pub enum Choice {
+    /// The PC runs it: offer to resume or quit it.
+    Running(Game),
+    /// Starting it ends the other app the PC runs: ask first.
+    Replace(Game, Game),
+    Start(Game),
 }
 
 /// What the stream is sized for. The PC sets its display from these.
@@ -94,15 +119,29 @@ impl Panel {
         };
         Self { width, height, fps }
     }
+
+    /// The stream `height` pixels high in this screen's shape, or the screen
+    /// itself for 0. The width is a multiple of 8, which video encoders want.
+    pub fn scaled_to(self, height: u32) -> Self {
+        if height == 0 || height == self.height { return self; }
+        let width = ((height as f64 * self.width as f64 / self.height as f64 / 8.0).round() as u32) * 8;
+        Self { width, height, ..self }
+    }
+
+    /// LSFG shows two frames for each one sent, so the PC sends half the
+    /// screen's rate; more would be thrown away before they are shown.
+    pub fn for_lsfg(self, lsfg: bool) -> Self {
+        if lsfg { Self { fps: self.fps / 2, ..self } } else { self }
+    }
+}
+
+impl Pc {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 impl Game {
-    /// The tile text; the PC is named when the catalog spans several.
-    pub fn label(&self, several_pcs: bool, running: &str) -> String {
-        let name = if several_pcs { format!("{} · {}", self.name, self.pc.name) } else { self.name.clone() };
-        if self.running { format!("{name} · {running}") } else { name }
-    }
-
     pub fn pc(&self) -> &str {
         &self.pc.name
     }
@@ -125,18 +164,51 @@ impl Game {
             "address": self.pc.address, "certificate": self.pc.certificate,
             "client_key": saved.key, "client_certificate": saved.certificate,
             "app": self.app, "fps": panel.fps, "end_other": self.end_other, "hdr": hdr && self.hdr,
+            // Only a smaller stream is left to SteamOS to scale up.
+            "scaled": panel.height < Panel::of(crate::device::current()).height,
         })
     }
 }
 
 impl Catalog {
     /// Another app that runs on the PC of `game`. Starting `game` would end it.
-    pub fn running_instead_of(&self, game: &Game) -> Option<&Game> {
+    fn running_instead_of(&self, game: &Game) -> Option<&Game> {
         self.games.iter().find(|other| other.running && other.pc.id == game.pc.id && other.app != game.app)
     }
 
-    pub fn several_pcs(&self) -> bool {
-        self.games.iter().any(|game| game.pc != self.games[0].pc)
+    /// The paired PC with this ID, if it answered.
+    pub fn paired(&self, id: &str) -> Option<&Pc> {
+        self.pcs.iter().find_map(|computer| match computer {
+            Computer::Paired(pc) if pc.id == id => Some(pc),
+            _ => None,
+        })
+    }
+
+    /// The apps of the PC with this ID.
+    pub fn apps(&self, id: &str) -> Vec<&Game> {
+        self.games.iter().filter(|game| game.pc.id == id).collect()
+    }
+
+    pub fn choose(&self, id: &str, index: usize) -> Option<Choice> {
+        let game = (*self.apps(id).get(index)?).clone();
+        Some(if game.running {
+            Choice::Running(game)
+        } else if let Some(running) = self.running_instead_of(&game) {
+            Choice::Replace(game, running.clone())
+        } else {
+            Choice::Start(game)
+        })
+    }
+}
+
+#[cfg(test)]
+impl Catalog {
+    /// One paired PC that answered with these apps; its ID is its name.
+    pub fn one_pc(name: &str, apps: &[&str]) -> Self {
+        let pc = Pc { id: name.into(), name: name.into(), address: String::new(), certificate: String::new() };
+        let games = apps.iter().zip(1..).map(|(title, app)| Game { name: (*title).into(), pc: pc.clone(), app,
+            running: false, hdr: false, end_other: None }).collect();
+        Self { games, pcs: vec![Computer::Paired(pc)] }
     }
 }
 
@@ -172,7 +244,7 @@ fn identity(saved: &mut Saved) -> Result<Identity> {
 fn ask(address: &str, paired: &[Pc], identity: &Identity) -> Option<std::result::Result<(Pc, Vec<Game>), Unpaired>> {
     let mut host = Host::new(address);
     let info = host.info(identity).ok()?;
-    let unpaired = Unpaired { name: info.name.clone(), address: address.to_owned() };
+    let unpaired = Unpaired { id: info.unique_id.clone(), name: info.name.clone(), address: address.to_owned() };
     let Some(known) = paired.iter().find(|pc| pc.id == info.unique_id) else { return Some(Err(unpaired)) };
     host.certificate = Some(known.certificate.clone());
     // Only the paired answer says which app runs.
@@ -186,32 +258,47 @@ fn ask(address: &str, paired: &[Pc], identity: &Identity) -> Option<std::result:
     Some(Ok((pc, games)))
 }
 
-/// Takes the answers of all addresses into a catalog and brings the saved PCs
-/// up to date. A PC that answers at several addresses counts once. Returns
-/// whether a saved PC changed.
-fn collect(answers: Vec<std::result::Result<(Pc, Vec<Game>), Unpaired>>, saved: &mut [Pc]) -> (Catalog, bool) {
+/// Takes the answers of all addresses into a catalog. A PC that answers at
+/// several addresses counts once, as paired if one answer says so; a saved PC
+/// that does not answer is offline.
+fn collect(answers: Vec<std::result::Result<(Pc, Vec<Game>), Unpaired>>, saved: &[Pc]) -> Catalog {
     let mut catalog = Catalog::default();
     let mut seen = Vec::new();
-    let mut changed = false;
-    for answer in answers {
-        match answer {
-            Ok((pc, games)) => {
-                if seen.contains(&pc.id) { continue; }
-                seen.push(pc.id.clone());
-                catalog.games.extend(games);
-                if let Some(known) = saved.iter_mut().find(|known| known.id == pc.id && **known != pc) {
-                    *known = pc;
-                    changed = true;
-                }
-            }
-            Err(unpaired) => catalog.unpaired.push(unpaired),
-        }
+    let (paired, unpaired): (Vec<_>, Vec<_>) = answers.into_iter().partition(std::result::Result::is_ok);
+    for (pc, games) in paired.into_iter().flatten() {
+        if seen.contains(&pc.id) { continue; }
+        seen.push(pc.id.clone());
+        catalog.games.extend(games);
+        catalog.pcs.push(Computer::Paired(pc));
     }
-    (catalog, changed)
+    for pc in unpaired.into_iter().filter_map(std::result::Result::err) {
+        if seen.contains(&pc.id) { continue; }
+        seen.push(pc.id.clone());
+        catalog.pcs.push(Computer::Unpaired(pc));
+    }
+    catalog.pcs.extend(saved.iter().filter(|pc| !seen.contains(&pc.id)).cloned().map(Computer::Offline));
+    catalog
 }
 
-/// The paired PCs' games and the unpaired PCs found on the network. A PC that
-/// is off is left out.
+/// Brings the saved PCs to the name and address they answered from, and
+/// keeps the rest, such as a pairing renewed meanwhile. Returns whether one
+/// changed.
+fn follow(saved: &mut [Pc], pcs: &[Computer]) -> bool {
+    let mut changed = false;
+    for pc in pcs {
+        let Computer::Paired(pc) = pc else { continue };
+        let moved = |known: &&mut Pc| known.id == pc.id && (known.name != pc.name || known.address != pc.address);
+        if let Some(known) = saved.iter_mut().find(moved) {
+            known.name = pc.name.clone();
+            known.address = pc.address.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The paired PCs and their games, the unpaired PCs found on the network, and
+/// the paired PCs that did not answer.
 pub fn catalog() -> Result<Catalog> {
     let mut saved = load();
     let identity = identity(&mut saved)?;
@@ -223,8 +310,11 @@ pub fn catalog() -> Result<Catalog> {
             .collect();
         asked.into_iter().filter_map(|answer| answer.join().ok().flatten()).collect()
     });
-    let (catalog, changed) = collect(answers, &mut saved.hosts);
-    if changed { store(&saved)?; }
+    let catalog = collect(answers, &saved.hosts);
+    // A PC may have been paired or added while the PCs were asked.
+    let _saving = saving();
+    let mut current = load();
+    if follow(&mut current.hosts, &catalog.pcs) { store(&current)?; }
     Ok(catalog)
 }
 
@@ -241,11 +331,47 @@ pub fn pair(pc: &Unpaired, pin: &str) -> Result<()> {
     let certificate = host.certificate.ok_or("The PC sent no certificate")?;
     // Pairing takes as long as the user needs for the PIN, and two PCs can be
     // paired at once: read the saved PCs only now, and one writer at a time.
-    static SAVING: Mutex<()> = Mutex::new(());
-    let _saving = SAVING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _saving = saving();
     let mut saved = load();
     remember(&mut saved.hosts, Pc { id, name: pc.name.clone(), address: pc.address.clone(), certificate });
     store(&saved)
+}
+
+fn saving() -> MutexGuard<'static, ()> {
+    static SAVING: Mutex<()> = Mutex::new(());
+    SAVING.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Remembers the address of a PC that the search does not find, once a PC
+/// with Sunshine answers there.
+pub fn add(address: &str) -> Result<()> {
+    let identity = identity(&mut load())?;
+    Host::new(address).info(&identity).map_err(|_| format!("No PC with Sunshine answered at {address}"))?;
+    let _saving = saving();
+    let mut saved = load();
+    saved.add_address(address);
+    store(&saved)
+}
+
+/// Ends `game` on its PC, and nothing else the PC may run by now.
+pub fn quit(game: &Game) -> Result<()> {
+    let identity = identity(&mut load())?;
+    let mut host = Host::new(&game.pc.address);
+    host.certificate = Some(game.pc.certificate.clone());
+    let info = host.info(&identity)?;
+    if !info.paired { return Err("This PC is not paired".into()); }
+    if ends(info.current_app, game.app)? { host.cancel(&identity)?; }
+    Ok(())
+}
+
+/// Whether quitting `app` ends what the PC runs: nothing to end when it runs
+/// nothing, and another app is not the one the user agreed to quit.
+fn ends(running: u32, app: u32) -> Result<bool> {
+    match running {
+        0 => Ok(false),
+        running if running == app => Ok(true),
+        _ => Err("The PC runs another app now".into()),
+    }
 }
 
 /// Adds a newly paired PC, in place of an earlier pairing with the same PC.
@@ -266,24 +392,30 @@ mod tests {
     fn a_given_address_is_asked_like_a_found_one_and_only_once() {
         let saved: Saved = serde_json::from_value(json!({"key": "", "certificate": "",
             "hosts": [{"id": "den", "name": "den", "address": "10.0.0.1", "certificate": ""}],
-            "addresses": ["192.168.1.159", "10.0.0.1"]})).unwrap();
-        assert_eq!(saved.asked(["192.168.1.159".to_owned(), "10.0.0.7".to_owned()]),
-            ["10.0.0.1", "192.168.1.159", "10.0.0.7"]);
+            "addresses": ["192.0.2.10", "10.0.0.1"]})).unwrap();
+        assert_eq!(saved.asked(["192.0.2.10".to_owned(), "10.0.0.7".to_owned()]),
+            ["10.0.0.1", "192.0.2.10", "10.0.0.7"]);
         // A file written before the addresses existed still loads.
-        let old: Saved = serde_json::from_value(json!({"key": "", "certificate": ""})).unwrap();
+        let mut old: Saved = serde_json::from_value(json!({"key": "", "certificate": ""})).unwrap();
         assert!(old.asked([]).is_empty());
+        // An added address is kept once and asked from then on.
+        old.add_address("192.0.2.10");
+        old.add_address("192.0.2.10");
+        assert_eq!(old.addresses, ["192.0.2.10"]);
+        assert_eq!(old.asked([]), ["192.0.2.10"]);
     }
 
     #[test]
     fn starting_a_game_would_end_only_another_app_on_the_same_pc() {
         let app = |name: &str, pc: &str, app: u32, running: bool| Game { app, running, ..game(name, pc) };
-        let catalog = Catalog { unpaired: Vec::new(), games: vec![
+        let catalog = Catalog { pcs: Vec::new(), games: vec![
             app("Desktop", "den", 1, false), app("Big Picture", "den", 2, true), app("Desktop", "attic", 1, false)] };
-        let name = |game: &Game| catalog.running_instead_of(game).map(|other| other.name.as_str());
-        assert_eq!(name(&catalog.games[0]), Some("Big Picture"));
-        // Rejoining the running app, or a game on a PC that runs nothing, ends nothing.
-        assert_eq!(name(&catalog.games[1]), None);
-        assert_eq!(name(&catalog.games[2]), None);
+        let (den, attic) = (&catalog.games[0], &catalog.games[2]);
+        assert_eq!(catalog.choose("id-den", 0), Some(Choice::Replace(den.clone(), catalog.games[1].clone())));
+        // The running app offers resume and quit; a PC that runs nothing just starts.
+        assert_eq!(catalog.choose("id-den", 1), Some(Choice::Running(catalog.games[1].clone())));
+        assert_eq!(catalog.choose("id-attic", 0), Some(Choice::Start(attic.clone())));
+        assert_eq!(catalog.choose("id-attic", 1), None);
         let panel = Panel { width: 1, height: 1, fps: 60 };
         // The consent names the app it was given for, and a reconnect drops it.
         let agreed = catalog.games[0].clone().ending(&catalog.games[1]);
@@ -311,33 +443,62 @@ mod tests {
 
     #[test]
     fn a_paired_pc_is_followed_to_its_new_address_and_counted_once() {
-        let mut saved = vec![paired("den", "10.0.0.1"), paired("attic", "10.0.0.2")];
+        let saved = vec![paired("den", "10.0.0.1"), paired("attic", "10.0.0.2")];
         let moved = paired("den", "10.0.0.9");
         let games = |pc: &Pc| vec![Game { pc: pc.clone(), ..game("Desktop", "den") }];
-        // The den PC answers on two network interfaces; the attic PC is off.
+        let new = || Unpaired { id: "id-new".into(), name: "new".into(), address: "10.0.0.3".into() };
+        // The den and new PCs answer on two network interfaces, den without its
+        // pairing on one of them; the attic PC is off.
         let answers = vec![
+            Err(Unpaired { id: "id-den".into(), ..new() }),
             Ok((moved.clone(), games(&moved))),
             Ok((paired("den", "10.0.0.10"), games(&paired("den", "10.0.0.10")))),
-            Err(Unpaired { name: "new".into(), address: "10.0.0.3".into() }),
+            Err(new()),
+            Err(Unpaired { address: "10.0.0.11".into(), ..new() }),
         ];
-        let (catalog, changed) = collect(answers, &mut saved);
-        assert!(changed);
+        let catalog = collect(answers, &saved);
         assert_eq!(catalog.games, games(&moved));
-        assert_eq!(catalog.unpaired, [Unpaired { name: "new".into(), address: "10.0.0.3".into() }]);
-        assert_eq!(saved, [moved.clone(), paired("attic", "10.0.0.2")]);
+        assert_eq!(catalog.pcs, [Computer::Paired(moved.clone()), Computer::Unpaired(new()),
+            Computer::Offline(paired("attic", "10.0.0.2"))]);
+        // A paired PC that answers without its pairing is not offline too.
+        let revoked = Unpaired { id: "id-attic".into(), ..new() };
+        assert_eq!(collect(vec![Err(revoked.clone())], &saved).pcs,
+            [Computer::Unpaired(revoked), Computer::Offline(paired("den", "10.0.0.1"))]);
+        // The saved PC follows its new address; a pairing renewed during the
+        // search keeps its new certificate.
+        let mut current = saved.clone();
+        current[0].certificate = "renewed".into();
+        assert!(follow(&mut current, &catalog.pcs));
+        assert_eq!(current, [Pc { certificate: "renewed".into(), ..moved.clone() }, paired("attic", "10.0.0.2")]);
         // Nothing to save when the PC answers where it was.
-        assert!(!collect(vec![Ok((moved.clone(), games(&moved)))], &mut saved).1);
+        assert!(!follow(&mut current, &catalog.pcs));
     }
 
     #[test]
-    fn names_the_pc_only_when_there_are_several() {
-        let mut catalog = Catalog { games: vec![game("Desktop", "den"), game("Hades", "den")], unpaired: Vec::new() };
-        assert!(!catalog.several_pcs());
-        assert_eq!(catalog.games[0].label(catalog.several_pcs(), "running"), "Desktop");
-        catalog.games.push(Game { running: true, ..game("Desktop", "attic") });
-        assert!(catalog.several_pcs());
-        assert_eq!(catalog.games[2].label(catalog.several_pcs(), "running"), "Desktop · attic · running");
-        assert!(!Catalog::default().several_pcs());
+    fn quitting_ends_only_the_app_the_user_chose() {
+        assert_eq!(ends(7, 7), Ok(true));
+        assert_eq!(ends(0, 7), Ok(false));
+        assert!(ends(9, 7).is_err());
+    }
+
+    #[test]
+    fn lsfg_halves_the_rate_the_pc_sends() {
+        let panel = Panel { width: 1280, height: 800, fps: 90 };
+        assert_eq!(panel.for_lsfg(true).fps, 45);
+        assert_eq!(panel.for_lsfg(false).fps, 90);
+    }
+
+    #[test]
+    fn an_app_grid_shows_one_pc_and_marks_the_running_app() {
+        let mut catalog = Catalog { games: vec![game("Desktop", "den"), Game { running: true, ..game("Hades", "den") },
+            game("Desktop", "attic")], pcs: vec![Computer::Paired(paired("den", "10.0.0.1")), Computer::Offline(paired("attic", "10.0.0.2"))] };
+        let apps: Vec<(&str, bool)> = catalog.apps("id-den").iter().map(|game| (game.name.as_str(), game.running)).collect();
+        assert_eq!(apps, [("Desktop", false), ("Hades", true)]);
+        // Only a PC that answered with its pairing can be opened.
+        assert!(catalog.paired("id-den").is_some());
+        assert!(catalog.paired("id-attic").is_none());
+        catalog.pcs.clear();
+        assert!(catalog.paired("id-den").is_none());
     }
 
     #[test]
@@ -346,6 +507,17 @@ mod tests {
         assert_eq!(panel("ROG Ally"), Panel { width: 1920, height: 1080, fps: 120 });
         assert_eq!(panel("Steam Deck OLED"), Panel { width: 1280, height: 800, fps: 90 });
         assert_eq!(panel("Gamepad"), Panel { width: 1920, height: 1080, fps: 60 });
+    }
+
+    #[test]
+    fn a_smaller_stream_keeps_the_screens_shape() {
+        let deck = Panel { width: 1280, height: 800, fps: 90 };
+        assert_eq!(deck.scaled_to(720), Panel { width: 1152, height: 720, fps: 90 });
+        assert_eq!(deck.scaled_to(0), deck);
+        assert_eq!(deck.scaled_to(800), deck);
+        assert_eq!(deck.scaled_to(1080), Panel { width: 1728, height: 1080, fps: 90 });
+        let ally = Panel { width: 1920, height: 1080, fps: 120 };
+        assert_eq!(ally.scaled_to(800), Panel { width: 1424, height: 800, fps: 120 });
     }
 
     #[test]

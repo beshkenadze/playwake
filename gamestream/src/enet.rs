@@ -23,6 +23,10 @@ const MOST_EARLY: u16 = 64;
 const FIRST_ROUND_TRIP: Duration = Duration::from_millis(50);
 /// The host drops a session that is silent this long; so does the client.
 const DEAD_AFTER: Duration = Duration::from_secs(10);
+/// The longest wait between two sends of one packet. Each send of a packet
+/// that is not acknowledged waits twice as long as the one before, as in
+/// ENet: a link that stalls for seconds must not come back to a flood.
+const LONGEST_RESEND: Duration = Duration::from_secs(1);
 
 const ACKNOWLEDGE: u8 = 1;
 const CONNECT: u8 = 2;
@@ -42,6 +46,8 @@ struct Unacknowledged {
     command: Vec<u8>,
     first_sent: Instant,
     last_sent: Instant,
+    /// How many times it was sent again.
+    resent: u32,
 }
 
 struct State {
@@ -65,6 +71,11 @@ impl State {
     /// does not hold the ones behind it for long.
     fn resend_after(&self) -> Duration {
         (self.round_trip * 2 + Duration::from_millis(10)).clamp(Duration::from_millis(20), HANDSHAKE_RESEND)
+    }
+
+    /// How long a packet that was sent again `resent` times waits for the next send.
+    fn next_resend(&self, resent: u32) -> Duration {
+        (self.resend_after() * 2u32.saturating_pow(resent.min(16))).min(LONGEST_RESEND)
     }
 
     /// Takes a reliable packet and returns the packets that are now next in
@@ -250,7 +261,12 @@ impl Enet {
         let command = command(SEND_RELIABLE | FLAG_ACKNOWLEDGE, channel, sequence, &body);
         self.transmit(state.peer, &command, true);
         let now = Instant::now();
-        state.unacknowledged.push(Unacknowledged { channel, sequence, command, first_sent: now, last_sent: now });
+        state.unacknowledged.push(Unacknowledged { channel, sequence, command, first_sent: now, last_sent: now, resent: 0 });
+    }
+
+    /// How many packets of `channel` the host has not acknowledged yet.
+    pub(crate) fn in_flight(&self, channel: u8) -> usize {
+        self.state.lock().unwrap().unacknowledged.iter().filter(|sent| sent.channel == channel).count()
     }
 
     /// Waits up to `wait` for a datagram, answers it, and resends what the
@@ -261,8 +277,7 @@ impl Enet {
         // Wake in time for the next resend.
         let wait = {
             let state = self.state.lock().unwrap();
-            let resend_after = state.resend_after();
-            state.unacknowledged.iter().map(|sent| resend_after.saturating_sub(sent.last_sent.elapsed())).min()
+            state.unacknowledged.iter().map(|sent| state.next_resend(sent.resent).saturating_sub(sent.last_sent.elapsed())).min()
                 .map_or(wait, |until_resend| wait.min(until_resend))
         };
         let _ = self.socket.set_read_timeout(Some(wait.max(Duration::from_millis(1))));
@@ -299,10 +314,14 @@ impl Enet {
             state.unacknowledged.clear();
             events.push(Event::Disconnected);
         }
-        let (peer, resend_after) = (state.peer, state.resend_after());
-        for sent in state.unacknowledged.iter_mut().filter(|sent| now.duration_since(sent.last_sent) >= resend_after) {
+        let due: Vec<usize> = state.unacknowledged.iter().enumerate()
+            .filter(|(_, sent)| now.duration_since(sent.last_sent) >= state.next_resend(sent.resent))
+            .map(|(index, _)| index).collect();
+        for index in due {
+            let sent = &mut state.unacknowledged[index];
             sent.last_sent = now;
-            self.transmit(peer, &sent.command, true);
+            sent.resent += 1;
+            self.transmit(state.peer, &state.unacknowledged[index].command, true);
         }
         events
     }
@@ -374,6 +393,15 @@ pub(crate) mod tests {
         assert_eq!(state.resend_after(), Duration::from_millis(20));
         for _ in 0..64 { state.measured(Duration::from_millis(900)); }
         assert_eq!(state.resend_after(), HANDSHAKE_RESEND);
+    }
+
+    #[test]
+    fn each_resend_of_a_packet_waits_twice_as_long_up_to_a_second() {
+        let mut state = state();
+        for _ in 0..64 { state.measured(Duration::from_millis(2)); }
+        let waits: Vec<u64> = (0..8).map(|resent| state.next_resend(resent).as_millis() as u64).collect();
+        assert_eq!(waits, [20, 40, 80, 160, 320, 640, 1000, 1000]);
+        assert_eq!(state.next_resend(u32::MAX), LONGEST_RESEND);
     }
 
     #[test]

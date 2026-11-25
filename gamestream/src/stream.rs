@@ -7,6 +7,7 @@ use crate::video::{Assembler, Frame};
 use crate::{Host, Result, Session, rtsp};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,6 +23,8 @@ pub struct Config {
     pub bitrate_kbps: u32,
     pub codec: Codec,
     pub hdr: bool,
+    /// Ask for full-range video: 1023 codes for each 10-bit sample, not 876.
+    pub full_range: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -46,6 +49,9 @@ const MEDIA_PING: Duration = Duration::from_millis(500);
 /// together can leave it sending video to the audio port.
 const AUDIO_PING_OFFSET: Duration = Duration::from_millis(250);
 const RECEIVE_WAIT: Duration = Duration::from_millis(100);
+/// Room for 2048 video packets, as the reference client asks. A key frame
+/// arrives in one burst that is larger than the system's default buffer.
+const VIDEO_RECEIVE_BUFFER: usize = 2048 * (rtsp::PACKET_SIZE as usize + 16);
 /// How long to wait for a key frame before asking the host again.
 const KEY_FRAME_REQUEST_GAP: Duration = Duration::from_millis(250);
 const GRACEFUL: u32 = 0x8003_0023;
@@ -54,16 +60,46 @@ const CHANNEL_GENERAL: u8 = 0;
 const CHANNEL_URGENT: u8 = 1;
 const CHANNEL_KEYBOARD: u8 = 2;
 const CHANNEL_GAMEPAD: u8 = 0x10;
+/// How many gamepad states may wait for the host's acknowledgement. More
+/// wait here, merged, so that a stalled link sends only what still matters.
+const GAMEPAD_IN_FLIGHT: usize = 8;
+/// Button changes kept while the link is stalled.
+const GAMEPAD_QUEUE: usize = 64;
 
 struct Control {
     enet: Enet,
     cipher: Mutex<Cipher>,
+    /// Gamepad states not sent yet, oldest first.
+    gamepads: Mutex<VecDeque<Gamepad>>,
 }
 
 impl Control {
     fn send(&self, channel: u8, kind: u16, payload: &[u8]) {
         let message = self.cipher.lock().unwrap().seal(kind, payload);
         self.enet.send(channel, &message);
+    }
+
+    /// Sends the gamepad states that the link has room for.
+    fn send_gamepads(&self) {
+        let mut waiting = self.gamepads.lock().unwrap();
+        while !waiting.is_empty() && self.enet.in_flight(CHANNEL_GAMEPAD) < GAMEPAD_IN_FLIGHT {
+            let state = waiting.pop_front().unwrap();
+            self.send(CHANNEL_GAMEPAD, control::INPUT, &state.packet());
+        }
+    }
+}
+
+/// Puts `state` behind the gamepad states that wait. A state that changes
+/// only sticks and triggers replaces the last one: the host needs where they
+/// are now, not each step. A button change is kept, so a short press is not
+/// lost; past `GAMEPAD_QUEUE` the oldest goes.
+fn queue_gamepad(waiting: &mut VecDeque<Gamepad>, state: Gamepad) {
+    match waiting.back_mut() {
+        Some(last) if last.buttons == state.buttons => *last = state,
+        _ => {
+            if waiting.len() == GAMEPAD_QUEUE { waiting.pop_front(); }
+            waiting.push_back(state);
+        }
     }
 }
 
@@ -130,15 +166,23 @@ impl Stream {
         let ports = rtsp::handshake(address, config)?;
         // The host ends the session unless both media streams ping it soon.
         let mut video = Media::open(on_port(ports.video), &ports.ping_payload, Duration::ZERO)?;
+        // The system grants what its limit allows; a smaller buffer still works.
+        let _ = socket2::SockRef::from(&video.socket).set_recv_buffer_size(VIDEO_RECEIVE_BUFFER);
         let mut audio = Media::open(on_port(ports.audio), &ports.ping_payload, AUDIO_PING_OFFSET)?;
         let control = Arc::new(Control {
             enet: Enet::connect(on_port(ports.control), ports.connect_data, CONNECT_TIMEOUT)?,
             cipher: Mutex::new(Cipher::new(&session.key)),
+            gamepads: Mutex::new(VecDeque::new()),
         });
         control.send(CHANNEL_GENERAL, control::REQUEST_IDR, &[0, 0]);
         control.send(CHANNEL_GENERAL, control::START_B, &[0]);
         // The host makes its virtual gamepad on the first state it gets, which
         // can take seconds; start that now, not on the player's first press.
+        // A pad left from an earlier stream is unplugged first: the new one
+        // arrives on the PC as a new controller, which wakes Steam from its
+        // screensaver as Moonlight's does. Stick moves below the games' dead
+        // zone, triggers and keys do not.
+        control.send(CHANNEL_GAMEPAD, control::INPUT, &Gamepad::unplug_packet());
         control.send(CHANNEL_GAMEPAD, control::INPUT, &Gamepad::default().packet());
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -154,7 +198,10 @@ impl Stream {
                     link.send(CHANNEL_GENERAL, control::PING, &[4, 0, 0, 0, 0, 0, 0, 0]);
                     next_ping += CONTROL_PING;
                 }
-                for event in link.enet.service(next_ping.saturating_duration_since(Instant::now())) {
+                let events = link.enet.service(next_ping.saturating_duration_since(Instant::now()));
+                // Acknowledgements may have made room for gamepad states that wait.
+                link.send_gamepads();
+                for event in events {
                     let packet = match event {
                         enet::Event::Packet(packet) => packet,
                         enet::Event::Disconnected => { ended = Some(Err("The PC closed the stream".to_owned())); break }
@@ -223,7 +270,8 @@ impl Stream {
 
     /// Sends the gamepad state to the host at once.
     pub fn gamepad(&self, state: &Gamepad) {
-        self.control.send(CHANNEL_GAMEPAD, control::INPUT, &state.packet());
+        queue_gamepad(&mut self.control.gamepads.lock().unwrap(), *state);
+        self.control.send_gamepads();
     }
 
     /// Presses or releases a key on the host. `key` is a Windows virtual-key
@@ -289,6 +337,23 @@ mod tests {
     }
 
     #[test]
+    fn merges_waiting_stick_moves_but_keeps_every_button_change() {
+        let pad = |buttons: u32, x: i16| Gamepad { buttons, left_stick: (x, 0), ..Gamepad::default() };
+        let mut waiting = VecDeque::new();
+        for x in 1..=50 { queue_gamepad(&mut waiting, pad(0, x)); }
+        assert_eq!(waiting, [pad(0, 50)]);
+        // A press and its release while the link is stalled both reach the host.
+        queue_gamepad(&mut waiting, pad(control::BUTTON_UP, 50));
+        queue_gamepad(&mut waiting, pad(0, 51));
+        queue_gamepad(&mut waiting, pad(0, 52));
+        assert_eq!(waiting, [pad(0, 50), pad(control::BUTTON_UP, 50), pad(0, 52)]);
+        // Past the limit the oldest change goes.
+        for press in 0..(GAMEPAD_QUEUE as u32 * 2) { queue_gamepad(&mut waiting, pad(press % 2, 0)); }
+        assert_eq!(waiting.len(), GAMEPAD_QUEUE);
+        assert_eq!(waiting.back(), Some(&pad(1, 0)));
+    }
+
+    #[test]
     fn plays_sound_packets_only_forward() {
         assert!(follows(7, None));
         assert!(follows(101, Some(100)));
@@ -306,6 +371,7 @@ mod tests {
         let control = Arc::new(Control {
             enet: Enet::connect(address, 0, CONNECT_TIMEOUT).unwrap(),
             cipher: Mutex::new(Cipher::new(&[0; 16])),
+            gamepads: Mutex::new(VecDeque::new()),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (running, finished) = (stop.clone(), Arc::new(AtomicBool::new(false)));

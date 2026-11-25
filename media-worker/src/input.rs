@@ -311,6 +311,8 @@ pub fn emit_route_events(events: Vec<RouteEvent>) {
             RouteEvent::GuidePulse(pressed) => protocol::event("xbox-guide-pulse", json!({ "pressed": pressed })),
             RouteEvent::Rearmed => protocol::event("stream-input-rearmed", json!({})),
             RouteEvent::Focus(active) => protocol::event("stream-input-focus", json!({ "active": active })),
+            RouteEvent::Quit => protocol::event("stream-quit", json!({})),
+            RouteEvent::ToggleStats => protocol::event("stream-stats", json!({})),
         }
     }
 }

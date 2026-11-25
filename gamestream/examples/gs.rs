@@ -58,7 +58,7 @@ fn main() -> gamestream::Result<()> {
                 hdr: false, host_audio: false, end_other: None };
             let session = host.launch(&identity, &info, &request)?;
             let config = gamestream::Config { width, height, fps, bitrate_kbps: 20000,
-                codec: gamestream::Codec::H264, hdr: false };
+                codec: gamestream::Codec::H264, hdr: false, full_range: false };
             let (stream, events) = gamestream::Stream::start(&host, &session, &config)?;
             let mut out = fs::File::create(file).map_err(|e| e.to_string())?;
             let started = std::time::Instant::now();
