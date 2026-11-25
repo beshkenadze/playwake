@@ -22,6 +22,11 @@ pub struct Game {
     pub cover: Option<String>,
 }
 
+/// The directory of the covers in the cover cache.
+pub const COVERS: &str = "cloud";
+/// Pixels: the library's cover is 64 units wide, and a unit is at most about
+/// 1.5 pixels on the handhelds. The app keeps every decoded cover in memory.
+const COVER_WIDTH: u64 = 144;
 const CACHED_ACCOUNTS: usize = 4;
 const CACHED_GAMES: usize = 4096;
 const CACHE_BYTES: u64 = 8 * 1024 * 1024;
@@ -160,12 +165,24 @@ mod tests {
         let box_art = image("BoxArt", "//store-images.s-microsoft.com/image/apps.1.box", 1080, 1080);
         let product = |images: Vec<Value>| json!({"LocalizedProperties":[{"Images":images}]});
         assert_eq!(cover(&product(vec![box_art.clone(), poster])).as_deref(),
-            Some("https://store-images.s-microsoft.com/image/apps.1.poster?w=300&h=450"));
+            Some("https://store-images.s-microsoft.com/image/apps.1.poster?w=144&h=216"));
         assert_eq!(cover(&product(vec![image("Logo", "//store-images.s-microsoft.com/image/apps.1.logo", 300, 300), box_art])).as_deref(),
-            Some("https://store-images.s-microsoft.com/image/apps.1.box?w=300&h=300"));
+            Some("https://store-images.s-microsoft.com/image/apps.1.box?w=144&h=144"));
         assert!(cover(&product(vec![image("Poster", "//images.example.org/apps.1.poster", 1440, 2160)])).is_none());
         assert!(cover(&product(vec![image("Poster", "http://store-images.s-microsoft.com/image/a", 1440, 2160)])).is_none());
         assert!(cover(&product(vec![])).is_none());
+    }
+
+    #[test]
+    fn only_the_details_that_name_a_game_can_fail_the_catalog() {
+        let game = |product: &str, title: Option<&str>| (product.to_owned(), title.map(str::to_owned), Some(product.to_owned()));
+        let games = [game("named", Some("Halo")), game("unnamed", None)];
+        let reply = |ids: &[&str]| json!({"Products": ids.iter().map(|id| json!({"ProductId":id,
+            "LocalizedProperties":[{"ProductTitle":format!("Title {id}")}]})).collect::<Vec<_>>()});
+        let found = details(&games, |ids| if ids.contains(&"named") { Err("timeout".into()) } else { Ok(reply(ids)) }).unwrap();
+        assert_eq!(found["unnamed"].title.as_deref(), Some("Title unnamed"));
+        assert!(!found.contains_key("named"));
+        assert!(details(&games, |ids| if ids.contains(&"unnamed") { Err("timeout".into()) } else { Ok(reply(ids)) }).is_err());
     }
 
     #[test]
@@ -264,15 +281,12 @@ fn load_catalog(account: &Xbox, service: Streaming, market: &str) -> Result<Vec<
         let Some(token) = &continuation else { complete = true; break; };
         if token.len() > 4096 || !pages.insert(token.clone()) { return Err("Invalid Xbox Cloud catalog pagination".into()); }
     }
-    let needs_names = games.iter().any(|(_, title, _)| title.is_none());
-    let metadata = match products(account, market, games.iter().filter_map(|(_, _, product)| product.as_deref())) {
-        Ok(metadata) => metadata,
-        Err(error) if needs_names => return Err(error),
-        Err(error) => {
-            journal::record("cloud_covers_failed", json!({"error":error}));
-            HashMap::new()
-        }
-    };
+    let metadata = details(&games, |batch| {
+        let request = account.client.get("https://displaycatalog.mp.microsoft.com/v7.0/products")
+            .query(&[("bigIds", batch.join(",").as_str()), ("market", market), ("languages", "en-US")]);
+        let stage = "Xbox Cloud game details";
+        xbox::read(xbox::send(request, stage)?, stage)
+    })?;
     let mut games: Vec<_> = games.into_iter().filter_map(|(id, name, product)| {
         let found = product.as_deref().and_then(|product| metadata.get(product));
         let name = name.or_else(|| found?.title.clone())?;
@@ -289,14 +303,26 @@ struct Product {
     cover: Option<String>,
 }
 
-fn products<'a>(account: &Xbox, market: &str, ids: impl Iterator<Item = &'a str>) -> Result<HashMap<String, Product>> {
-    let ids: Vec<_> = ids.collect();
+/// The store details of the catalog's products. The games without a title
+/// need theirs, so failing to get it fails the catalog; the covers of the
+/// other games are optional.
+fn details(games: &[(String, Option<String>, Option<String>)], mut fetch: impl FnMut(&[&str]) -> Result<Value>)
+    -> Result<HashMap<String, Product>>
+{
+    let ids = |named: bool| games.iter().filter(move |(_, title, _)| title.is_some() == named)
+        .filter_map(|(_, _, product)| product.as_deref()).collect::<Vec<_>>();
+    let mut found = products(&ids(false), &mut fetch)?;
+    match products(&ids(true), &mut fetch) {
+        Ok(more) => found.extend(more),
+        Err(error) => journal::record("cloud_covers_failed", json!({"error":error})),
+    }
+    Ok(found)
+}
+
+fn products(ids: &[&str], fetch: &mut impl FnMut(&[&str]) -> Result<Value>) -> Result<HashMap<String, Product>> {
     let mut found = HashMap::new();
     for batch in ids.chunks(40) {
-        let request = account.client.get("https://displaycatalog.mp.microsoft.com/v7.0/products")
-            .query(&[("bigIds", batch.join(",").as_str()), ("market", market), ("languages", "en-US")]);
-        let stage = "Xbox Cloud game details";
-        let reply = xbox::read(xbox::send(request, stage)?, stage)?;
+        let reply = fetch(batch)?;
         let products = reply["Products"].as_array().ok_or("Invalid Xbox Cloud game details response")?;
         for item in products {
             let Some(id) = safe_id(&item["ProductId"]) else { continue };
@@ -318,7 +344,7 @@ fn cover(product: &Value) -> Option<String> {
         if url.scheme() != "https" || url.host_str() != Some("store-images.s-microsoft.com") { return None; }
         let width = image["Width"].as_u64().filter(|width| *width > 0)?;
         let height = image["Height"].as_u64()?;
-        url.set_query(Some(&format!("w=300&h={}", 300 * height / width)));
+        url.set_query(Some(&format!("w={COVER_WIDTH}&h={}", COVER_WIDTH * height / width)));
         Some(url.to_string())
     })
 }

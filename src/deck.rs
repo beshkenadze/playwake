@@ -1056,7 +1056,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             .collect();
         let names = labels.iter().map(String::as_str).collect();
         body = body.child(library(v, Library {
-            id: "pc-game", title: t.t("Игры с ПК", "PC games"), names, selected: v.menu.pc_game,
+            id: "pc-game", title: t.t("Игры с ПК", "PC games"), names, covers: Vec::new(), cover_set: "",
+            selected: v.menu.pc_game,
             loading: v.pc_loading.then(|| t.t("Поиск ПК…", "Looking for PCs…")),
             error: v.pc_error.as_deref(),
             empty: t.t("ПК с Sunshine в сети не найдены.", "No PC with Sunshine found on the network."),
@@ -1115,8 +1116,10 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         );
     } else if v.menu.tab == Tab::Cloud {
         let names = v.cloud_catalog.iter().flatten().map(|game| game.name.as_str()).collect();
+        let covers = v.cloud_catalog.iter().flatten().map(|game| game.cover.as_deref()).collect();
         body = body.child(library(v, Library {
-            id: "cloud-game", title: "Xbox Cloud Gaming", names, selected: v.menu.cloud_game,
+            id: "cloud-game", title: "Xbox Cloud Gaming", names, covers, cover_set: crate::cloud::COVERS,
+            selected: v.menu.cloud_game,
             loading: v.cloud_loading.then(|| if v.cloud_catalog.is_some() {
                 t.t("Обновление каталога…", "Refreshing cloud library…")
             } else {
@@ -1317,6 +1320,9 @@ struct Library<'a> {
     id: &'static str,
     title: &'static str,
     names: Vec<&'a str>,
+    /// The cover URL of each name, and where the cover cache keeps them.
+    covers: Vec<Option<&'a str>>,
+    cover_set: &'static str,
     selected: usize,
     loading: Option<&'static str>,
     error: Option<&'a str>,
@@ -1349,8 +1355,12 @@ fn library(v: &RemotePlay, list: Library, accent: u32, unit: f32, cx: &mut Conte
     for (row, chunk) in games[start..end].chunks(LIBRARY_COLUMNS).enumerate() {
         page = page.child(div().flex().gap(s(14.)).children(chunk.iter().enumerate().map(|(column, name)| {
             let index = start + row * LIBRARY_COLUMNS + column;
-            let card = div().w(s(335.)).h(s(76.)).px(s(14.)).flex().items_center()
-                .bg(rgb(CARD)).rounded(s(10.)).text_size(s(18.)).child(name.to_string());
+            let cover = list.covers.get(index).copied().flatten().and_then(|url| crate::covers::file(list.cover_set, url));
+            let card = div().w(s(335.)).h(s(96.)).pr(s(14.)).flex().items_center().gap(s(14.))
+                .bg(rgb(CARD)).rounded(s(10.)).overflow_hidden().text_size(s(18.))
+                .when(cover.is_none(), |card| card.pl(s(14.)))
+                .when_some(cover, |card, path| card.child(img(path).w(s(64.)).h_full().rounded_l(s(10.)).object_fit(ObjectFit::Cover)))
+                .child(name.to_string());
             action((list.id, index), card, (list.play)(index),
                 list.selected == index && v.menu.focused_tab.is_none(), accent, unit, cx)
         })));

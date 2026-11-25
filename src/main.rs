@@ -1,4 +1,5 @@
 mod cloud;
+mod covers;
 mod deck;
 mod device;
 mod input;
@@ -29,6 +30,8 @@ enum Event {
     Consoles(Arc<xbox::Xbox>, xbox::Result<Vec<xbox::Console>>, bool),
     CachedCloudCatalog(Arc<xbox::Xbox>, Vec<cloud::Game>),
     CloudCatalog(Arc<xbox::Xbox>, xbox::Result<Vec<cloud::Game>>),
+    /// More covers are on disk.
+    Covers,
     PcCatalog(pc::Result<pc::Catalog>),
     PcPaired(pc::Unpaired, pc::Result<()>),
 }
@@ -251,11 +254,15 @@ impl RemotePlay {
         let read_cache = self.cloud_catalog.is_none();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            if read_cache && let Some(games) = cloud::cached_catalog(&account) {
-                let _ = tx.send(Event::CachedCloudCatalog(account.clone(), games));
+            let cached = read_cache.then(|| cloud::cached_catalog(&account)).flatten();
+            if let Some(games) = &cached {
+                let _ = tx.send(Event::CachedCloudCatalog(account.clone(), games.clone()));
             }
             let result = cloud::catalog(&account);
+            let games = result.as_ref().ok().cloned().or(cached);
             let _ = tx.send(Event::CloudCatalog(account, result));
+            let urls: Vec<&str> = games.iter().flatten().filter_map(|game| game.cover.as_deref()).collect();
+            if !urls.is_empty() { covers::fetch(cloud::COVERS, &urls, || { let _ = tx.send(Event::Covers); }); }
         });
     }
 
@@ -560,6 +567,7 @@ impl RemotePlay {
                     }
                 }
             }
+            Event::Covers => {}
             Event::PcCatalog(result) => {
                 self.pc_loading = false;
                 match result {
