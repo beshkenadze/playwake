@@ -424,13 +424,14 @@ impl RemotePlay {
             }
             Action::Pc => {
                 self.menu.select_tab(Tab::Pc);
-                if self.pc_catalog == pc::Catalog::default() { self.refresh_pc(); }
+                // The PC's apps change: a host can add games or change their IDs.
+                self.refresh_pc();
                 false
             }
             Action::PcHost(index) => {
                 self.menu.pc = index;
                 match self.pc_catalog.pcs.get(index).cloned() {
-                    Some(pc::Computer::Paired(pc)) => self.menu.open_pc(pc.id()),
+                    Some(pc::Computer::Paired(pc)) => { self.menu.open_pc(pc.id()); self.refresh_pc(); }
                     Some(pc::Computer::Unpaired(pc)) => self.start_pc_pairing(pc),
                     Some(pc::Computer::Offline(_)) => self.refresh_pc(),
                     None => {}
