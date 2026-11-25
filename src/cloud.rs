@@ -17,6 +17,9 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 pub struct Game {
     pub id: String,
     pub name: String,
+    /// A portrait cover from the Microsoft Store.
+    #[serde(default)]
+    pub cover: Option<String>,
 }
 
 const CACHED_ACCOUNTS: usize = 4;
@@ -150,10 +153,32 @@ mod tests {
     }
 
     #[test]
+    fn the_cover_is_the_poster_or_else_the_box_art_from_the_store() {
+        let image = |purpose: &str, uri: &str, width: u32, height: u32|
+            json!({"ImagePurpose":purpose,"Uri":uri,"Width":width,"Height":height});
+        let poster = image("Poster", "//store-images.s-microsoft.com/image/apps.1.poster", 1440, 2160);
+        let box_art = image("BoxArt", "//store-images.s-microsoft.com/image/apps.1.box", 1080, 1080);
+        let product = |images: Vec<Value>| json!({"LocalizedProperties":[{"Images":images}]});
+        assert_eq!(cover(&product(vec![box_art.clone(), poster])).as_deref(),
+            Some("https://store-images.s-microsoft.com/image/apps.1.poster?w=300&h=450"));
+        assert_eq!(cover(&product(vec![image("Logo", "//store-images.s-microsoft.com/image/apps.1.logo", 300, 300), box_art])).as_deref(),
+            Some("https://store-images.s-microsoft.com/image/apps.1.box?w=300&h=300"));
+        assert!(cover(&product(vec![image("Poster", "//images.example.org/apps.1.poster", 1440, 2160)])).is_none());
+        assert!(cover(&product(vec![image("Poster", "http://store-images.s-microsoft.com/image/a", 1440, 2160)])).is_none());
+        assert!(cover(&product(vec![])).is_none());
+    }
+
+    #[test]
+    fn a_catalog_cached_before_covers_still_loads() {
+        let cache: CatalogCache = serde_json::from_value(json!([{"account":"a","games":[{"id":"1","name":"Halo"}]}])).unwrap();
+        assert!(cache.0[0].games[0].cover.is_none());
+    }
+
+    #[test]
     fn catalog_cache_promotes_a_hit_and_evicts_the_oldest_account() {
         let mut cache = CatalogCache::default();
         for account in ["a", "b", "c", "d"] {
-            cache.put(account, vec![Game { id: account.into(), name: account.into() }]);
+            cache.put(account, vec![Game { id: account.into(), name: account.into(), cover: None }]);
         }
         assert_eq!(cache.get("a").unwrap()[0].name, "a");
         cache.put("e", vec![]);
@@ -239,12 +264,19 @@ fn load_catalog(account: &Xbox, service: Streaming, market: &str) -> Result<Vec<
         let Some(token) = &continuation else { complete = true; break; };
         if token.len() > 4096 || !pages.insert(token.clone()) { return Err("Invalid Xbox Cloud catalog pagination".into()); }
     }
-    let metadata = product_names(account, market, games.iter().filter_map(|(_, title, product)| {
-        title.is_none().then_some(product.as_deref()).flatten()
-    }))?;
+    let needs_names = games.iter().any(|(_, title, _)| title.is_none());
+    let metadata = match products(account, market, games.iter().filter_map(|(_, _, product)| product.as_deref())) {
+        Ok(metadata) => metadata,
+        Err(error) if needs_names => return Err(error),
+        Err(error) => {
+            journal::record("cloud_covers_failed", json!({"error":error}));
+            HashMap::new()
+        }
+    };
     let mut games: Vec<_> = games.into_iter().filter_map(|(id, name, product)| {
-        let name = name.or_else(|| metadata.get(product.as_deref()?).cloned())?;
-        Some(Game { id, name })
+        let found = product.as_deref().and_then(|product| metadata.get(product));
+        let name = name.or_else(|| found?.title.clone())?;
+        Some(Game { id, name, cover: found.and_then(|found| found.cover.clone()) })
     }).collect();
     games.sort_by_cached_key(|game| game.name.to_lowercase());
     journal::record("cloud_catalog_loaded", json!({"offered":offered,"named_playable":games.len(),"complete":complete}));
@@ -252,23 +284,43 @@ fn load_catalog(account: &Xbox, service: Streaming, market: &str) -> Result<Vec<
     Ok(games)
 }
 
-fn product_names<'a>(account: &Xbox, market: &str, ids: impl Iterator<Item = &'a str>) -> Result<HashMap<String, String>> {
+struct Product {
+    title: Option<String>,
+    cover: Option<String>,
+}
+
+fn products<'a>(account: &Xbox, market: &str, ids: impl Iterator<Item = &'a str>) -> Result<HashMap<String, Product>> {
     let ids: Vec<_> = ids.collect();
-    let mut names = HashMap::new();
+    let mut found = HashMap::new();
     for batch in ids.chunks(40) {
         let request = account.client.get("https://displaycatalog.mp.microsoft.com/v7.0/products")
             .query(&[("bigIds", batch.join(",").as_str()), ("market", market), ("languages", "en-US")]);
-        let stage = "Xbox Cloud game names";
+        let stage = "Xbox Cloud game details";
         let reply = xbox::read(xbox::send(request, stage)?, stage)?;
-        let products = reply["Products"].as_array().ok_or("Invalid Xbox Cloud game names response")?;
+        let products = reply["Products"].as_array().ok_or("Invalid Xbox Cloud game details response")?;
         for item in products {
-            if let (Some(id), Some(title)) = (safe_id(&item["ProductId"]),
-                    item["LocalizedProperties"].as_array().into_iter().flatten().find_map(|item| name(&item["ProductTitle"]))) {
-                names.insert(id, title);
-            }
+            let Some(id) = safe_id(&item["ProductId"]) else { continue };
+            let title = item["LocalizedProperties"].as_array().into_iter().flatten().find_map(|item| name(&item["ProductTitle"]));
+            found.insert(id, Product { title, cover: cover(item) });
         }
     }
-    Ok(names)
+    Ok(found)
+}
+
+/// The store's portrait poster, or else its square box art, sized for a card.
+fn cover(product: &Value) -> Option<String> {
+    let images: Vec<&Value> = product["LocalizedProperties"].as_array().into_iter().flatten()
+        .flat_map(|item| item["Images"].as_array().into_iter().flatten()).collect();
+    ["Poster", "BoxArt"].into_iter().find_map(|purpose| {
+        let image = images.iter().find(|image| image["ImagePurpose"] == purpose)?;
+        let raw = image["Uri"].as_str().filter(|uri| uri.len() <= 512)?;
+        let mut url = Url::parse(&raw.strip_prefix("//").map_or_else(|| raw.to_owned(), |rest| format!("https://{rest}"))).ok()?;
+        if url.scheme() != "https" || url.host_str() != Some("store-images.s-microsoft.com") { return None; }
+        let width = image["Width"].as_u64().filter(|width| *width > 0)?;
+        let height = image["Height"].as_u64()?;
+        url.set_query(Some(&format!("w=300&h={}", 300 * height / width)));
+        Some(url.to_string())
+    })
 }
 
 pub fn reserve(service: &Streaming, game: &Game, resolution: Resolution) -> Result<String> {
