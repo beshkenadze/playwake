@@ -23,7 +23,7 @@ pub struct Game {
 }
 
 /// The directory of the covers in the cover cache.
-pub const COVERS: &str = "cloud";
+pub static COVERS: crate::covers::Set = crate::covers::Set::new("cloud");
 /// Pixels: the library's cover is 64 units wide, and a unit is at most about
 /// 1.5 pixels on the handhelds. The app keeps every decoded cover in memory.
 const COVER_WIDTH: u64 = 144;

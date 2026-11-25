@@ -10,6 +10,8 @@ use std::{sync::Mutex, thread, time::Duration};
 pub type Result<T> = gamestream::Result<T>;
 
 const DISCOVERY: Duration = Duration::from_millis(1500);
+/// The directory of the covers in the cover cache.
+pub static COVERS: crate::covers::Set = crate::covers::Set::new("pc");
 
 /// What Playwake keeps between runs: its identity and the PCs it paired with.
 /// The file holds the private key and is readable by the owner only.
@@ -105,6 +107,11 @@ impl Game {
 
     pub fn pc(&self) -> &str {
         &self.pc.name
+    }
+
+    /// The key of the game's cover in the cover cache.
+    pub fn cover(&self) -> String {
+        format!("gamestream://{}/{}", self.pc.id, self.app)
     }
 
     /// The same game, started even if that ends `other` on its PC.
@@ -226,6 +233,30 @@ pub fn catalog() -> Result<Catalog> {
     let (catalog, changed) = collect(answers, &mut saved.hosts);
     if changed { store(&saved)?; }
     Ok(catalog)
+}
+
+/// Fetches the covers that the PCs keep for `games`.
+pub fn fetch_covers(games: &[Game], progress: impl Fn()) {
+    let saved = load();
+    let Ok(identity) = Identity::from_pem(&saved.key, &saved.certificate) else { return };
+    let keys: Vec<String> = games.iter().map(Game::cover).collect();
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    // Each PC is asked for its HTTPS port once; a PC that does not answer is skipped from then on.
+    let mut hosts: Vec<(&str, Option<Host>)> = Vec::new();
+    crate::covers::fetch(&COVERS, &keys, |key| {
+        let game = games.iter().find(|game| game.cover() == key)?;
+        let index = hosts.iter().position(|(id, _)| *id == game.pc.id).unwrap_or_else(|| {
+            let mut host = Host::new(&game.pc.address);
+            host.certificate = Some(game.pc.certificate.clone());
+            let answered = host.info(&identity).is_ok_and(|info| info.paired);
+            hosts.push((&game.pc.id, answered.then_some(host)));
+            hosts.len() - 1
+        });
+        let asset = hosts[index].1.as_ref()?.asset(&identity, game.app);
+        // A PC that stops answering would make every later cover wait out a timeout.
+        if asset.is_err() { hosts[index].1 = None; }
+        asset.ok()
+    }, progress);
 }
 
 /// Pairs with a PC. Blocks until the user has entered `pin` in Sunshine.

@@ -1055,8 +1055,10 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             .chain(v.pc_catalog.unpaired.iter().map(|pc| format!("{pair}: {}", pc.name)))
             .collect();
         let names = labels.iter().map(String::as_str).collect();
+        let keys: Vec<String> = v.pc_catalog.games.iter().map(crate::pc::Game::cover).collect();
+        let covers = keys.iter().map(|key| Some(key.as_str())).collect();
         body = body.child(library(v, Library {
-            id: "pc-game", title: t.t("Игры с ПК", "PC games"), names, covers: Vec::new(), cover_set: "",
+            id: "pc-game", title: t.t("Игры с ПК", "PC games"), names, covers, cover_set: &crate::pc::COVERS,
             selected: v.menu.pc_game,
             loading: v.pc_loading.then(|| t.t("Поиск ПК…", "Looking for PCs…")),
             error: v.pc_error.as_deref(),
@@ -1118,7 +1120,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         let names = v.cloud_catalog.iter().flatten().map(|game| game.name.as_str()).collect();
         let covers = v.cloud_catalog.iter().flatten().map(|game| game.cover.as_deref()).collect();
         body = body.child(library(v, Library {
-            id: "cloud-game", title: "Xbox Cloud Gaming", names, covers, cover_set: crate::cloud::COVERS,
+            id: "cloud-game", title: "Xbox Cloud Gaming", names, covers, cover_set: &crate::cloud::COVERS,
             selected: v.menu.cloud_game,
             loading: v.cloud_loading.then(|| if v.cloud_catalog.is_some() {
                 t.t("Обновление каталога…", "Refreshing cloud library…")
@@ -1322,7 +1324,7 @@ struct Library<'a> {
     names: Vec<&'a str>,
     /// The cover URL of each name, and where the cover cache keeps them.
     covers: Vec<Option<&'a str>>,
-    cover_set: &'static str,
+    cover_set: &'static crate::covers::Set,
     selected: usize,
     loading: Option<&'static str>,
     error: Option<&'a str>,

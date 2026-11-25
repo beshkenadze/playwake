@@ -1,4 +1,4 @@
-//! Development tool: `gs <state-dir> <address> info | pair <pin> | apps | launch <app-id> | cancel |
+//! Development tool: `gs <state-dir> <address> info | pair <pin> | apps | asset <app-id> <file> | launch <app-id> | cancel |
 //! stream <app-id> <seconds> <file> [fps]`. `stream` writes the received video to the
 //! file. From second 3 the pad alternates each second between A with the left
 //! stick up and the left stick right, and each state is printed when it is sent.
@@ -11,7 +11,7 @@ use std::{fs, io::Write, path::Path};
 fn main() -> gamestream::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [state, address, command, rest @ ..] = args.as_slice() else {
-        return Err("usage: gs <state-dir> <address> info | pair <pin> | apps | launch <app-id> | cancel | stream <app-id> <seconds> <file> [fps]".into());
+        return Err("usage: gs <state-dir> <address> info | pair <pin> | apps | asset <app-id> <file> | launch <app-id> | cancel | stream <app-id> <seconds> <file> [fps]".into());
     };
     let state = Path::new(state);
     // The directory holds the client's private key: owner only, from creation.
@@ -42,6 +42,11 @@ fn main() -> gamestream::Result<()> {
             println!("paired");
         }
         ("apps", []) => for app in host.apps(&identity)? { println!("{}\t{}\thdr={}", app.id, app.title, app.hdr); },
+        ("asset", [app, file]) => {
+            let image = host.asset(&identity, app.parse().map_err(|_| "app id")?)?;
+            fs::write(file, &image).map_err(|e| e.to_string())?;
+            println!("{} bytes", image.len());
+        }
         ("launch", [app]) => {
             let request = gamestream::Launch { app: app.parse().map_err(|_| "app id")?, width: 1920, height: 1080,
                 fps: 60, hdr: false, host_audio: false, end_other: None };
