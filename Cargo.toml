@@ -18,6 +18,7 @@ tempfile = "3"
 raw-window-handle = "0.6"
 uuid = { version = "1", features = ["v4"] }
 gamestream = { version = "0.1.0", path = "gamestream" }
+nucleo-matcher = "0.3.1"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 gilrs = "0.11"

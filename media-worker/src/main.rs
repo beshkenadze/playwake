@@ -833,10 +833,25 @@ fn menu_input_mode() {
                     evdev::EventType::KEY if event.value() == 1 => {
                         key = match event.code() {
                             304 => Some("accept"), 305 => Some("back"), 307 => Some("quit"), 308 => Some("refresh"),
-                            310 => Some("previous-tab"), 311 => Some("next-tab"), 315 => Some("settings"),
+                            310 => Some("previous-tab"), 311 => Some("next-tab"), 314 => Some("search"), 315 => Some("settings"),
+                            312 => Some("previous-letter"), 313 => Some("next-letter"),
                             544 => Some("up"), 545 => Some("down"), 546 => Some("left"), 547 => Some("right"),
                             _ => None,
                         };
+                    }
+                    // Analog triggers: a press past a quarter of the axis's range,
+                    // released below an eighth.
+                    evdev::EventType::ABSOLUTE if [2, 5].contains(&event.code()) => {
+                        let held = st.axes.get(&event.code()).copied().unwrap_or(0) == 1;
+                        let range = st.device.as_ref().and_then(|device| device.get_absinfo().ok())
+                            .and_then(|mut axes| axes.find(|(code, _)| code.0 == event.code()))
+                            .map_or(255, |(_, info)| info.maximum().max(1));
+                        if !held && event.value() > range / 4 {
+                            st.axes.insert(event.code(), 1);
+                            key = Some(if event.code() == 2 { "previous-letter" } else { "next-letter" });
+                        } else if held && event.value() <= range / 8 {
+                            st.axes.insert(event.code(), 0);
+                        }
                     }
                     evdev::EventType::ABSOLUTE if [0, 1, 16, 17].contains(&event.code()) => {
                         let value = if event.code() < 2 {

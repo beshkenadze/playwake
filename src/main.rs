@@ -32,6 +32,8 @@ enum Event {
     CloudCatalog(Arc<xbox::Xbox>, xbox::Result<Vec<cloud::Game>>),
     /// More covers are on disk.
     Covers,
+    /// A fetch of covers has ended.
+    CoversDone,
     PcCatalog(pc::Result<pc::Catalog>),
     PcPaired(pc::Unpaired, pc::Result<()>),
     /// A PC was added by its address, or the app it ran was quit.
@@ -48,6 +50,12 @@ const STREAM_RETRY_PAUSE: Duration = Duration::from_secs(3);
 /// A stream that played this long broke off rather than failed to start, so
 /// it gets its tries anew.
 const STREAM_STABLE: Duration = Duration::from_secs(30);
+
+/// A catalog in the order of its names, for the library and its letters.
+fn by_name<T>(mut items: Vec<T>, name: impl Fn(&T) -> &str) -> Vec<T> {
+    items.sort_by_cached_key(|item| deck::library_order(name(item)));
+    items
+}
 
 /// Whether a PC stream that ended with an error is started again: not one
 /// the user stopped, and only one that played or is already being retried.
@@ -106,6 +114,11 @@ struct RemotePlay {
     menu: Menu,
     menu_player: Option<media::Player>,
     keyboard_focus: FocusHandle,
+    /// The library grid's scroll, and the row it was last scrolled to.
+    library_scroll: ScrollHandle,
+    library_scrolled: std::cell::Cell<Option<(&'static str, usize)>>,
+    /// Fetches of covers under way; their tiles pulse until the covers come.
+    covers_loading: u32,
     active_target: Option<media::Target>,
     preview: Option<Preview>,
     cloud_catalog: Option<Vec<cloud::Game>>,
@@ -294,6 +307,7 @@ impl RemotePlay {
         self.cloud_error = None;
         let read_cache = self.cloud_catalog.is_none();
         let tx = self.tx.clone();
+        self.covers_loading += 1;
         thread::spawn(move || {
             let cached = read_cache.then(|| cloud::cached_catalog(&account)).flatten();
             if let Some(games) = &cached {
@@ -306,6 +320,7 @@ impl RemotePlay {
             if let (false, Ok(client)) = (urls.is_empty(), xbox::client()) {
                 covers::fetch(&cloud::COVERS, &urls, |url| covers::download(&client, url), || { let _ = tx.send(Event::Covers); });
             }
+            let _ = tx.send(Event::CoversDone);
         });
     }
 
@@ -314,11 +329,13 @@ impl RemotePlay {
         self.pc_loading = true;
         self.pc_error = None;
         let tx = self.tx.clone();
+        self.covers_loading += 1;
         thread::spawn(move || {
             let result = pc::catalog();
             let games = result.as_ref().map(|catalog| catalog.games.clone()).unwrap_or_default();
             let _ = tx.send(Event::PcCatalog(result));
             if !games.is_empty() { pc::fetch_covers(&games, || { let _ = tx.send(Event::Covers); }); }
+            let _ = tx.send(Event::CoversDone);
         });
     }
 
@@ -345,6 +362,66 @@ impl RemotePlay {
     }
 
     /// Edits the address being typed. Returns whether the keystroke was text.
+    /// The position in the library on show of the name at `index` of the
+    /// catalog: the same without a search, its place among the matches with one.
+    fn view_position(&self, index: usize) -> usize {
+        deck::library_names(self).map(|names| deck::library_view(&names, &self.menu.search))
+            .and_then(|view| view.iter().position(|&at| at == index)).unwrap_or(index)
+    }
+
+    /// Typing goes to the library's search; Steam's keyboard comes up for it.
+    fn start_search(&mut self) {
+        if !deck::library_names(self).is_some_and(|names| !names.is_empty()) { return; }
+        self.menu.searching = true;
+        self.menu.focused_tab = None;
+        if std::env::var_os("SteamAppId").is_some() {
+            let _ = std::process::Command::new("steam").arg("steam://open/keyboard")
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+        }
+    }
+
+    /// Ends the search, or clears it first; the selection stays on the game
+    /// that was selected among the matches.
+    fn leave_search(&mut self) {
+        let position = self.menu.library_position().map(|position| *position);
+        let selected = deck::library_names(self).zip(position)
+            .and_then(|(names, position)| deck::library_view(&names, &self.menu.search).get(position).copied());
+        if self.menu.search.is_empty() { self.menu.searching = false; } else { self.menu.search.clear(); }
+        if let (Some(selected), Some(position)) = (selected, self.menu.library_position()) { *position = selected; }
+    }
+
+    /// Ends the search at once, keeping the selected game selected.
+    fn close_search(&mut self) {
+        if !self.menu.search.is_empty() { self.leave_search(); }
+        self.menu.end_search();
+    }
+
+    /// The catalog index of the selected game in the library on show.
+    fn selected_index(&mut self) -> Option<usize> {
+        let position = *self.menu.library_position()?;
+        deck::library_names(self).and_then(|names| deck::library_view(&names, &self.menu.search).get(position).copied())
+    }
+
+    /// Takes what is typed into the library's search: any letter starts one.
+    fn type_into_search(&mut self, keystroke: &Keystroke) -> bool {
+        if self.stream.is_some() || self.pc_dialog.is_some() || !deck::library_names(self).is_some_and(|names| !names.is_empty()) {
+            return false;
+        }
+        let held = keystroke.modifiers;
+        if held.control || held.alt || held.platform { return false; }
+        if keystroke.key == "backspace" {
+            if !self.menu.searching { return false; }
+            self.menu.search.pop();
+        } else {
+            let Some(text) = keystroke.key_char.as_deref().filter(|text| !text.chars().any(char::is_control)) else { return false };
+            if !self.menu.searching && !text.chars().all(char::is_alphanumeric) { return false; }
+            self.menu.searching = true;
+            self.menu.search.push_str(text);
+        }
+        if let Some(position) = self.menu.library_position() { *position = 0; }
+        true
+    }
+
     fn type_into_address(&mut self, keystroke: &Keystroke) -> bool {
         let Some(PcDialog::Address(address)) = &mut self.pc_dialog else { return false };
         deck::edit_address(address, &keystroke.key, keystroke.key_char.as_deref())
@@ -419,10 +496,12 @@ impl RemotePlay {
         let t = deck::Text(self.prefs.russian());
         let save = match action {
             Action::Settings | Action::Home => {
+                self.close_search();
                 self.menu.select_tab(if action == Action::Settings { Tab::Settings } else { Tab::Xbox });
                 false
             }
             Action::Cloud => {
+                if self.menu.tab != Tab::Cloud { self.close_search(); }
                 self.menu.select_tab(Tab::Cloud);
                 if self.cloud_refreshed_at.is_none_or(|time| time.elapsed() >= Duration::from_secs(300)) {
                     self.refresh_cloud();
@@ -437,6 +516,7 @@ impl RemotePlay {
                 false
             }
             Action::Pc => {
+                if self.menu.tab != Tab::Pc { self.close_search(); }
                 self.menu.select_tab(Tab::Pc);
                 // The PC's apps change: a host can add games or change their IDs.
                 self.refresh_pc();
@@ -459,7 +539,7 @@ impl RemotePlay {
             }
             Action::PcList => { self.menu.pc_open = None; false }
             Action::PcGame(index) => {
-                self.menu.pc_game = index;
+                self.menu.pc_game = self.view_position(index);
                 match self.menu.pc_open.as_deref().and_then(|id| self.pc_catalog.choose(id, index)) {
                     Some(pc::Choice::Running(game)) => self.start_stream(media::Target::Pc(game), window),
                     // Ending an app on the PC can cost a running game: ask first.
@@ -471,17 +551,26 @@ impl RemotePlay {
                 false
             }
             Action::PcQuit(index) => {
-                self.menu.pc_game = index;
+                self.menu.pc_game = self.view_position(index);
                 if let Some(pc::Choice::Running(game)) = self.menu.pc_open.as_deref().and_then(|id| self.pc_catalog.choose(id, index)) {
                     self.pc_dialog = Some(PcDialog::Quit(game));
                 }
                 false
             }
             Action::VideoTarget => { self.menu.switch_video_target(); false }
+            Action::Search => { self.start_search(); false }
+            Action::Letter(letter) => {
+                if let Some(names) = deck::library_names(self) {
+                    let view = deck::library_view(&names, &self.menu.search);
+                    let found = deck::letter_position(&names, &view, letter);
+                    if let (Some(found), Some(position)) = (found, self.menu.library_position()) { *position = found; }
+                }
+                false
+            }
             Action::AskExit => { self.pc_dialog = Some(PcDialog::Exit); false }
             Action::CloudGame(index) => {
                 if let Some(game) = self.cloud_catalog.as_ref().and_then(|catalog| catalog.get(index)) {
-                    self.menu.cloud_game = index;
+                    self.menu.cloud_game = self.view_position(index);
                     self.start_stream(media::Target::Cloud(game.clone()), window);
                 }
                 false
@@ -634,6 +723,22 @@ impl RemotePlay {
             }
             return;
         }
+        if let Some(names) = deck::library_names(self).map(|names| names.into_iter().map(str::to_owned).collect::<Vec<_>>()) {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            match key {
+                Key::Search => { self.start_search(); return; }
+                Key::Back if self.menu.searching || !self.menu.search.is_empty() => { self.leave_search(); return; }
+                Key::PreviousLetter | Key::NextLetter if self.menu.search.is_empty() => {
+                    let view = deck::library_view(&names, "");
+                    let direction = if key == Key::NextLetter { 1 } else { -1 };
+                    if let Some(position) = self.menu.library_position() {
+                        *position = deck::letter_jump(&names, &view, *position, direction);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         let actions = deck::setting_actions(self);
         let order = deck::order(self);
         if let Some((action, direction)) = self.menu.navigate(key, &actions, &order) {
@@ -670,6 +775,7 @@ impl RemotePlay {
             }
             Event::CachedCloudCatalog(account, games) => {
                 if self.account.as_ref().is_some_and(|current| Arc::ptr_eq(current, &account)) {
+                    let games = by_name(games, |game| &game.name);
                     self.menu.cloud_game = self.menu.cloud_game.min(games.len().saturating_sub(1));
                     self.cloud_catalog = Some(games);
                 }
@@ -679,10 +785,15 @@ impl RemotePlay {
                     self.cloud_loading = false;
                     match result {
                         Ok(games) => {
-                            let previous = self.cloud_catalog.as_ref().and_then(|list| list.get(self.menu.cloud_game));
-                            self.menu.cloud_game = previous.and_then(|game| games.iter().position(|item| item.id == game.id))
-                                .unwrap_or_else(|| self.menu.cloud_game.min(games.len().saturating_sub(1)));
+                            let games = by_name(games, |game| &game.name);
+                            let previous = (self.menu.tab == Tab::Cloud).then(|| self.selected_index()).flatten()
+                                .or(Some(self.menu.cloud_game))
+                                .and_then(|index| self.cloud_catalog.as_ref()?.get(index)).map(|game| game.id.clone());
+                            let found = previous.and_then(|id| games.iter().position(|item| item.id == id));
                             self.cloud_catalog = Some(games);
+                            let count = deck::library_names(self).map_or(0, |names| deck::library_view(&names, &self.menu.search).len());
+                            self.menu.cloud_game = found.map(|index| self.view_position(index))
+                                .unwrap_or(self.menu.cloud_game).min(count.saturating_sub(1));
                             self.cloud_refreshed_at = Some(Instant::now());
                         }
                         Err(error) => {
@@ -693,12 +804,21 @@ impl RemotePlay {
                 }
             }
             Event::Covers => {}
+            Event::CoversDone => self.covers_loading = self.covers_loading.saturating_sub(1),
             Event::PcCatalog(result) => {
                 self.pc_loading = false;
                 match result {
                     Ok(catalog) => {
+                        let open = self.menu.tab == Tab::Pc && self.menu.pc_open.is_some();
+                        let previous = open.then(|| self.selected_index()).flatten()
+                            .and_then(|index| self.menu.pc_open.as_deref().and_then(|id| self.pc_catalog.apps(id).get(index).map(|game| game.app_id())));
                         self.menu.follow_pcs(&catalog);
                         self.pc_catalog = catalog;
+                        let found = previous.and_then(|app| self.menu.pc_open.as_deref()
+                            .and_then(|id| self.pc_catalog.apps(id).iter().position(|game| game.app_id() == app)));
+                        let count = deck::library_names(self).map_or(0, |names| deck::library_view(&names, &self.menu.search).len());
+                        if let Some(found) = found { self.menu.pc_game = self.view_position(found); }
+                        self.menu.pc_game = self.menu.pc_game.min(count.saturating_sub(1));
                     }
                     Err(error) => self.pc_error = Some(error),
                 }
@@ -878,7 +998,8 @@ fn main() {
                     stream: None, stream_commands: None, overlay_open: false, overlay_index: 0, restore_windowed: false,
                     prefs: session_store::load_preferences(), lsfg_missing: None, device: None,
                     menu: Menu { pc_available: cfg!(target_os = "linux"), ..Menu::default() },
-                    menu_player: None, keyboard_focus: cx.focus_handle(), active_target: None, preview: None,
+                    menu_player: None, keyboard_focus: cx.focus_handle(), library_scroll: ScrollHandle::new(),
+                    library_scrolled: Default::default(), covers_loading: 0, active_target: None, preview: None,
                     cloud_catalog: None, cloud_refreshed_at: None, cloud_loading: false, cloud_error: None,
                     pc_catalog: pc::Catalog::default(), pc_loading: false, pc_error: None, pc_pairing: None, pc_replace: None,
                     pc_dialog: None, reconnect: false, retry: None, retries: 0, video_ready: false, video_at: None, refreshing: false,

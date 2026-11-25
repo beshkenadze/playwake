@@ -144,6 +144,11 @@ impl Pc {
 }
 
 impl Game {
+    /// The app's ID on its PC, which a refresh keeps.
+    pub fn app_id(&self) -> u32 {
+        self.app
+    }
+
     pub fn pc(&self) -> &str {
         &self.pc.name
     }
@@ -277,6 +282,8 @@ fn collect(answers: Vec<std::result::Result<(Pc, Vec<Game>), Unpaired>>, saved: 
         seen.push(pc.id.clone());
         catalog.games.extend(games);
         catalog.pcs.push(Computer::Paired(pc));
+        // Apps in the order of their names, for the library and its letters.
+        catalog.games.sort_by_cached_key(|game| crate::deck::library_order(&game.name));
     }
     for pc in unpaired.into_iter().filter_map(std::result::Result::err) {
         if seen.contains(&pc.id) { continue; }

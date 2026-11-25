@@ -48,6 +48,11 @@ pub enum Key {
     Back,
     /// X: quits the app the PC runs.
     Quit,
+    /// View: searches the library.
+    Search,
+    /// The triggers: the first name of the previous or next letter.
+    PreviousLetter,
+    NextLetter,
     Settings,
     Refresh,
     PreviousTab,
@@ -64,6 +69,9 @@ impl Key {
             "accept" | "enter" | "return" => Self::Accept,
             "back" | "escape" => Self::Back,
             "quit" | "delete" => Self::Quit,
+            "search" => Self::Search,
+            "previous-letter" => Self::PreviousLetter,
+            "next-letter" => Self::NextLetter,
             "settings" => Self::Settings,
             "refresh" => Self::Refresh,
             "previous-tab" => Self::PreviousTab,
@@ -94,6 +102,10 @@ pub enum Action {
     AskExit,
     /// Switches the video settings between Xbox and PC.
     VideoTarget,
+    /// The first name filed under a letter of the library's rail.
+    Letter(char),
+    /// Starts searching the library.
+    Search,
     SignIn,
     Browser,
     Cancel,
@@ -148,8 +160,69 @@ impl Tab {
     }
 }
 
-const LIBRARY_COLUMNS: usize = 3;
-const LIBRARY_PAGE: usize = 9;
+/// A cover tile, 2:3 like a game's box, and the space around it.
+const TILE_W: f32 = 150.;
+const TILE_H: f32 = 225.;
+const TILE_GAP: f32 = 16.;
+const LIBRARY_PAD: f32 = 38.;
+/// The letter rail beside the grid, and the space between them.
+const RAIL_W: f32 = 34.;
+const RAIL_GAP: f32 = 12.;
+
+/// How many tiles fit across a library `width` points wide.
+pub fn library_columns(width: f32) -> usize {
+    (((width - 2. * LIBRARY_PAD - RAIL_W - RAIL_GAP + TILE_GAP) / (TILE_W + TILE_GAP)).floor() as usize).max(1)
+}
+
+/// The order a library shows its names in: all of them, or those that match
+/// the search, best first.
+pub fn library_view(names: &[&str], search: &str) -> Vec<usize> {
+    use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::{CaseMatching, Normalization, Pattern}};
+    if search.trim().is_empty() { return (0..names.len()).collect(); }
+    let pattern = Pattern::parse(search, CaseMatching::Ignore, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buffer = Vec::new();
+    let mut scored: Vec<(u32, usize)> = names.iter().enumerate()
+        .filter_map(|(index, name)| pattern.score(Utf32Str::new(name, &mut buffer), &mut matcher).map(|score| (score, index)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, index)| index).collect()
+}
+
+/// The letter a name is filed under: its first letter, or '#' for a name
+/// that starts with a digit or a sign.
+pub fn initial(name: &str) -> char {
+    name.chars().find(|c| c.is_alphanumeric())
+        .filter(|c| c.is_alphabetic())
+        .and_then(|c| c.to_uppercase().next())
+        .unwrap_or('#')
+}
+
+/// The order of names in a library: by the letter they are filed under,
+/// then by name, so each letter of the rail is one run of names.
+pub fn library_order(name: &str) -> (char, String) {
+    (initial(name), name.to_lowercase())
+}
+
+/// The position of the first name of the next (`direction` 1) or previous
+/// (-1) letter in `view`, or `position` when there is none.
+pub fn letter_jump(names: &[&str], view: &[usize], position: usize, direction: isize) -> usize {
+    let letter_at = |at: usize| view.get(at).map(|&index| initial(names[index]));
+    let Some(current) = letter_at(position) else { return position };
+    if direction > 0 {
+        (position..view.len()).find(|&at| letter_at(at) != Some(current)).unwrap_or(position)
+    } else {
+        // The start of the group before the current one.
+        let start = (0..=position).rev().take_while(|&at| letter_at(at) == Some(current)).last().unwrap_or(position);
+        let Some(previous) = start.checked_sub(1).and_then(letter_at) else { return start };
+        (0..start).find(|&at| letter_at(at) == Some(previous)).unwrap_or(start)
+    }
+}
+
+/// The position of the first name filed under `letter` in `view`.
+pub fn letter_position(names: &[&str], view: &[usize], letter: char) -> Option<usize> {
+    view.iter().position(|&index| initial(names[index]) == letter)
+}
 
 #[derive(Default)]
 pub struct Menu {
@@ -170,6 +243,11 @@ pub struct Menu {
     pub confirming_sign_out: bool,
     /// The video settings shown: a PC's instead of an Xbox's.
     pub video_pc: bool,
+    /// Tiles across the library grid, as many as fit the window.
+    pub columns: usize,
+    /// What the library is filtered by, and whether typing goes there.
+    pub search: String,
+    pub searching: bool,
 }
 
 impl Menu {
@@ -181,7 +259,23 @@ impl Menu {
         if self.row.is_some() { self.row = Some(0); }
     }
 
+    /// The selected position in the library on show, if one is.
+    pub fn library_position(&mut self) -> Option<&mut usize> {
+        match self.tab {
+            Tab::Cloud => Some(&mut self.cloud_game),
+            Tab::Pc if self.pc_open.is_some() => Some(&mut self.pc_game),
+            _ => None,
+        }
+    }
+
+    /// Ends the search; the library shows every name again.
+    pub fn end_search(&mut self) {
+        self.search.clear();
+        self.searching = false;
+    }
+
     pub fn select_tab(&mut self, tab: Tab) {
+        if tab != self.tab { self.end_search(); }
         self.tab = tab;
         self.focused_tab = None;
         self.row = None;
@@ -198,6 +292,7 @@ impl Menu {
     pub fn open_pc(&mut self, id: &str) {
         self.pc_open = Some(id.to_owned());
         self.pc_game = 0;
+        self.end_search();
     }
 
     /// Keeps the PC tab's selections inside a new catalog. A PC that is gone
@@ -248,16 +343,21 @@ impl Menu {
             Tab::Pc => Some(&mut self.pc),
             _ => None,
         };
+        let columns = if self.columns == 0 { 3 } else { self.columns };
         if let Some(game) = library {
             let last = consoles.len().saturating_sub(1);
             match key {
-                Up if *game < LIBRARY_COLUMNS => self.focused_tab = Some(self.tab),
-                Up => *game -= LIBRARY_COLUMNS,
-                Down => *game = (*game + LIBRARY_COLUMNS).min(last),
+                Up if *game < columns => self.focused_tab = Some(self.tab),
+                Up => *game -= columns,
+                Down => *game = (*game + columns).min(last),
                 Left => *game = game.saturating_sub(1),
                 Right => *game = (*game + 1).min(last),
                 Accept => return consoles.get((*game).min(last)).copied().and_then(run),
-                Quit if self.tab == Tab::Pc && self.pc_open.is_some() => return run(Action::PcQuit((*game).min(last))),
+                // The tile's own app, which a search may have moved.
+                Quit if self.tab == Tab::Pc && self.pc_open.is_some() => return match consoles.get(*game) {
+                    Some(&Action::PcGame(index)) => run(Action::PcQuit(index)),
+                    _ => None,
+                },
                 Back => return run(back),
                 _ => {}
             }
@@ -646,6 +746,16 @@ pub fn setting_actions(v: &RemotePlay) -> Vec<Action> {
     .collect()
 }
 
+/// The names of the library on show, in catalog order, when it is one that
+/// can be searched: Xbox Cloud games or a PC's apps.
+pub fn library_names(v: &RemotePlay) -> Option<Vec<&str>> {
+    match v.menu.tab {
+        Tab::Cloud => Some(v.cloud_catalog.iter().flatten().map(|game| game.name.as_str()).collect()),
+        Tab::Pc => v.menu.pc_open.as_deref().map(|id| v.pc_catalog.apps(id).into_iter().map(|game| game.name.as_str()).collect()),
+        _ => None,
+    }
+}
+
 pub fn order(v: &RemotePlay) -> Vec<Action> {
     if v.menu.confirming_sign_out {
         return vec![Action::Cancel, Action::ConfirmSignOut];
@@ -657,20 +767,18 @@ pub fn order(v: &RemotePlay) -> Vec<Action> {
         return vec![Action::Cancel];
     }
     if v.menu.tab == Tab::Pc {
-        return match &v.menu.pc_open {
-            Some(id) => match v.pc_catalog.apps(id).len() {
-                0 => vec![Action::Refresh],
-                apps => (0..apps).map(Action::PcGame).collect(),
-            },
-            None => (0..v.pc_catalog.pcs.len()).map(Action::PcHost).chain([Action::PcAdd]).collect(),
+        return match (&v.menu.pc_open, library_names(v)) {
+            (Some(_), Some(names)) if names.is_empty() => vec![Action::Refresh],
+            (Some(_), Some(names)) => library_view(&names, &v.menu.search).into_iter().map(Action::PcGame).collect(),
+            _ => (0..v.pc_catalog.pcs.len()).map(Action::PcHost).chain([Action::PcAdd]).collect(),
         };
     }
     if v.account.is_none() {
         return vec![Action::SignIn];
     }
     if v.menu.tab == Tab::Cloud {
-        return match &v.cloud_catalog {
-            Some(catalog) if !catalog.is_empty() => (0..catalog.len()).map(Action::CloudGame).collect(),
+        return match library_names(v) {
+            Some(names) if !names.is_empty() => library_view(&names, &v.menu.search).into_iter().map(Action::CloudGame).collect(),
             _ => vec![Action::Refresh],
         };
     }
@@ -714,6 +822,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
     let unit = (f32::from(viewport.width) / 1280.)
         .min(f32::from(viewport.height) / 700.)
         .max(0.2);
+    v.menu.columns = library_columns(f32::from(viewport.width) / unit);
     let s = |p| px(p * unit);
     let t = Text(v.prefs.russian());
     let (accent, primary) = colors(v.prefs);
@@ -858,6 +967,18 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                 hints.insert(2, ("X", t.t("Завершить", "Quit")));
             }
             hints.push(("B", t.t("К списку ПК", "PC list")));
+        }
+        if library_names(v).is_some_and(|names| !names.is_empty()) {
+            if v.menu.searching || !v.menu.search.is_empty() {
+                hints = vec![
+                    ("⌨", t.t("Печатайте название", "Type a name")),
+                    ("A", t.t("Играть", "Play")),
+                    ("B", if v.menu.search.is_empty() { t.t("Закрыть поиск", "Close search") } else { t.t("Очистить", "Clear") }),
+                ];
+            } else {
+                hints.insert(2, ("View", t.t("Поиск", "Search")));
+                hints.insert(3, ("LT/RT", t.t("Буквы", "Letters")));
+            }
         }
     } else if native_stream {
         hints = vec![("B", t.t("Отмена", "Cancel"))];
@@ -1217,6 +1338,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             empty: t.t("На этом ПК нет приложений.", "This PC has no apps."),
             refresh: t.t("Обновить список", "Refresh list"),
             running: open.and_then(|pc| v.pc_catalog.apps(pc.id()).iter().position(|game| game.running)),
+            searchable: open.is_some(),
         }, accent, unit, cx));
     } else if v.account.is_none() {
         let waiting = v.sign_in.is_some();
@@ -1284,6 +1406,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             empty: t.t("Для этого аккаунта нет доступных облачных игр.", "No cloud games are available for this account."),
             refresh: t.t("Обновить каталог", "Refresh library"),
             running: None,
+            searchable: true,
         }, accent, unit, cx));
     } else {
         let heading = div()
@@ -1459,6 +1582,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         .track_focus(&v.keyboard_focus)
         .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
             if view.type_into_stream(&ev.keystroke) { return; }
+            if view.type_into_search(&ev.keystroke) { cx.notify(); return; }
             let mapped = Key::parse(ev.keystroke.key.as_str());
             if let Some(key) = mapped {
                 view.menu_key(key, window, cx);
@@ -1547,10 +1671,12 @@ fn pc_dialog(v: &RemotePlay, dialog: &PcDialog, t: &Text, accent: u32, unit: f32
 struct Library<'a> {
     id: &'static str,
     title: &'a str,
+    /// Every name, in catalog order.
     names: Vec<&'a str>,
     /// The cover URL of each name, and where the cover cache keeps them.
     covers: Vec<Option<&'a str>>,
     cover_set: &'static crate::covers::Set,
+    /// The selected position in the view.
     selected: usize,
     loading: Option<&'static str>,
     error: Option<&'a str>,
@@ -1558,18 +1684,59 @@ struct Library<'a> {
     refresh: &'static str,
     /// The app the PC runs, which offers resume and quit on its tile.
     running: Option<usize>,
+    /// Games, which a search filters and the letter rail files.
+    searchable: bool,
+}
+
+/// The first letters of a name's first two words, for a tile without a cover.
+fn monogram(name: &str) -> String {
+    name.split_whitespace().filter_map(|word| word.chars().find(|c| c.is_alphanumeric()))
+        .take(2).flat_map(char::to_uppercase).collect()
+}
+
+/// A tile for a game whose cover is missing or still on its way: a colour
+/// of its own from the name, and `mark`, its first letters, large.
+fn placeholder(name: &str, mark: String, unit: f32) -> Div {
+    let s = |p| px(p * unit);
+    let hue = name.bytes().fold(7u32, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte.into())) % 360;
+    let hue = hue as f32 / 360.;
+    div().size_full().relative().flex().flex_col().items_center().justify_center()
+        .bg(linear_gradient(160., linear_color_stop(hsla(hue, 0.45, 0.36, 1.), 0.),
+            linear_color_stop(hsla((hue + 0.1) % 1., 0.5, 0.16, 1.), 1.)))
+        .child(div().text_size(s(52.)).font_weight(FontWeight::BOLD).text_color(rgba(0xffffffd9)).child(mark))
 }
 
 fn library(v: &RemotePlay, list: Library, accent: u32, unit: f32, cx: &mut Context<RemotePlay>) -> Div {
     let s = |p| px(p * unit);
+    let t = Text(v.prefs.russian());
     let games = &list.names;
     let actions = order(v);
-    let start = (list.selected / LIBRARY_PAGE) * LIBRARY_PAGE;
-    let end = (start + LIBRARY_PAGE).min(games.len());
-    let mut page = div().p(s(38.)).size_full().flex().flex_col().gap(s(16.))
+    let view = if list.searchable { library_view(games, &v.menu.search) } else { (0..games.len()).collect() };
+    let columns = if v.menu.columns == 0 { 3 } else { v.menu.columns };
+    let mut header = div().flex().items_center().gap(s(16.))
         .child(div().text_size(s(34.)).font_weight(FontWeight::SEMIBOLD).child(list.title.to_owned()));
-    if let Some(loading) = list.loading {
-        page = page.child(loading);
+    // With names on show, a refresh is a note in the header, so the grid
+    // does not jump.
+    if let (Some(loading), false) = (list.loading, games.is_empty()) {
+        header = header.child(div().text_size(s(15.)).text_color(rgb(MUTED)).child(loading));
+    }
+    if list.searchable && !games.is_empty() {
+        header = header.child(div().text_color(rgb(MUTED)).child(if view.len() == games.len() {
+            games.len().to_string() } else { format!("{} / {}", view.len(), games.len()) }));
+        let typing = v.menu.searching;
+        let field = if v.menu.search.is_empty() && !typing {
+            div().text_color(rgb(MUTED)).child(t.t("Поиск · View", "Search · View"))
+        } else {
+            div().child(format!("{}{}", v.menu.search, if typing { "▏" } else { "" }))
+        };
+        header = header.child(div().flex_1()).child(div().id((list.id, usize::MAX - 1)).w(s(320.)).h(s(40.)).px(s(14.))
+            .flex().items_center().rounded(s(10.)).bg(rgb(CARD)).border(s(2.))
+            .border_color(rgb(if typing { accent } else { LINE })).cursor_pointer().child(field)
+            .on_click(cx.listener(|view, _, window, cx| { view.activate(Action::Search, 1, window, cx); cx.notify(); })));
+    }
+    let mut page = div().p(s(LIBRARY_PAD)).pb(s(12.)).size_full().flex().flex_col().gap(s(16.)).child(header);
+    if let (Some(loading), true) = (list.loading, games.is_empty()) {
+        page = page.child(div().text_color(rgb(MUTED)).child(loading));
     }
     if let Some(error) = list.error {
         page = page.child(div().text_color(rgb(MUTED)).child(error.to_owned()));
@@ -1582,31 +1749,78 @@ fn library(v: &RemotePlay, list: Library, accent: u32, unit: f32, cx: &mut Conte
             .child(list.refresh), Action::Refresh,
             v.menu.focused_tab.is_none(), accent, unit, cx).w(s(240.)));
     }
-    for (row, chunk) in games[start..end].chunks(LIBRARY_COLUMNS).enumerate() {
-        page = page.child(div().flex().gap(s(14.)).children(chunk.iter().enumerate().map(|(column, name)| {
-            let index = start + row * LIBRARY_COLUMNS + column;
-            let card = div().w(s(335.)).h(s(76.)).px(s(14.)).flex().flex_col().justify_center().gap(s(6.))
-                .bg(rgb(CARD)).rounded(s(10.)).text_size(s(18.)).child(name.to_string());
-            let card = if list.running == Some(index) {
-                let t = Text(v.prefs.russian());
-                let chip = |label: &'static str| div().px(s(10.)).py(s(3.)).rounded(s(8.)).bg(rgb(LINE)).text_size(s(15.)).child(label);
-                card.child(div().flex().gap(s(8.))
-                    .child(chip(t.t("▶ A Продолжить", "▶ A Resume")))
-                    .child(chip(t.t("■ X Завершить", "■ X Quit")).id(("pc-quit", index)).cursor_pointer()
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            cx.stop_propagation();
-                            view.activate(Action::PcQuit(index), 1, window, cx);
-                            cx.notify();
-                        }))))
-            } else { card };
-            action((list.id, index), card, actions.get(index).copied().unwrap_or(Action::Refresh),
-                list.selected == index && v.menu.focused_tab.is_none(), accent, unit, cx)
+    if view.is_empty() {
+        return page.child(div().text_color(rgb(MUTED)).child(format!("{} «{}»",
+            t.t("Ничего не найдено по", "Nothing matches"), v.menu.search)));
+    }
+    // The selected row scrolls into sight once, when it changes, so the grid
+    // still scrolls by touch.
+    let selected = list.selected.min(view.len() - 1);
+    if v.library_scrolled.get() != Some((list.id, selected)) {
+        v.library_scroll.scroll_to_item(selected / columns);
+        v.library_scrolled.set(Some((list.id, selected)));
+    }
+    let focused = v.menu.focused_tab.is_none();
+    let rows = view.chunks(columns).enumerate().map(|(row, chunk)| {
+        div().flex().gap(s(TILE_GAP)).children(chunk.iter().enumerate().map(|(column, &index)| {
+            let position = row * columns + column;
+            let selected = list.selected == position && focused;
+            let name = games[index];
+            let key = list.covers.get(index).copied().flatten();
+            let cover = key.and_then(|key| crate::covers::file(list.cover_set, key));
+            let command = actions.get(position).copied().unwrap_or(Action::Refresh);
+            let mark = if command == Action::PcAdd { "+".to_owned() } else { monogram(name) };
+            let art = match cover {
+                Some(path) => img(path).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                None if key.is_some() && v.covers_loading > 0 => placeholder(name, mark, unit)
+                    .with_animation(("cover-loading", index), Animation::new(std::time::Duration::from_millis(1400))
+                        .repeat().with_easing(pulsating_between(0.55, 1.)), |tile, delta| tile.opacity(delta))
+                    .into_any_element(),
+                None => placeholder(name, mark, unit).into_any_element(),
+            };
+            let mut tile = div().w(s(TILE_W)).h(s(TILE_H)).rounded(s(10.)).overflow_hidden().relative().bg(rgb(CARD)).child(art);
+            if list.running == Some(index) {
+                let chip = |label: &'static str| div().px(s(8.)).py(s(3.)).rounded(s(7.)).bg(rgba(0x000000b3)).text_size(s(13.)).child(label);
+                tile = tile.child(div().absolute().top(s(8.)).left(s(8.)).child(chip(t.t("● Запущено", "● Running"))))
+                    .child(div().absolute().bottom(s(8.)).left(s(8.)).right(s(8.)).flex().justify_between()
+                        .child(chip(t.t("▶ A", "▶ A")))
+                        .child(chip(t.t("■ X", "■ X")).id(("pc-quit", index)).cursor_pointer()
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                cx.stop_propagation();
+                                view.activate(Action::PcQuit(index), 1, window, cx);
+                                cx.notify();
+                            }))));
+            }
+            div().flex().flex_col().gap(s(6.))
+                // The selected cover has a heavier frame, seen from across the room.
+                .child(action((list.id, index), tile, command, selected, accent, unit, cx)
+                    .when(selected, |frame| frame.border(s(4.)).rounded(s(14.))))
+                .child(div().w(s(TILE_W)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(s(14.))
+                    .text_color(rgb(if selected { TEXT } else { MUTED }))
+                    .when(selected, |label| label.font_weight(FontWeight::SEMIBOLD)).child(name.to_owned()))
+        }))
+    });
+    let grid = div().id((list.id, usize::MAX - 2)).flex_1().min_h(px(0.)).overflow_y_scroll().track_scroll(&v.library_scroll)
+        .flex().flex_col().gap(s(14.)).children(rows);
+    // Letters to jump to, while the names are in their own order.
+    let mut letters: Vec<char> = Vec::new();
+    if list.searchable && v.menu.search.is_empty() {
+        for &index in &view {
+            let letter = initial(games[index]);
+            if letters.last() != Some(&letter) { letters.push(letter); }
+        }
+    }
+    let current = view.get(list.selected).map(|&index| initial(games[index]));
+    let rail = (letters.len() > 1).then(|| div().w(s(RAIL_W)).flex().flex_col().items_center().gap(s(1.))
+        .children(letters.into_iter().enumerate().map(|(at, letter)| {
+            let on = current == Some(letter);
+            div().id(("letter", at)).w_full().text_center().rounded(s(6.)).text_size(s(13.)).cursor_pointer()
+                .text_color(rgb(if on { CANVAS } else { MUTED })).when(on, |el| el.bg(rgb(accent)).font_weight(FontWeight::BOLD))
+                .child(letter.to_string())
+                .on_click(cx.listener(move |view, _, window, cx| { view.activate(Action::Letter(letter), 1, window, cx); cx.notify(); }))
         })));
-    }
-    if !games.is_empty() {
-        page = page.child(div().text_color(rgb(MUTED)).child(format!("{}–{} / {}", start + 1, end, games.len())));
-        if !v.status.is_empty() { page = page.child(div().text_color(rgb(MUTED)).child(v.status.clone())); }
-    }
+    page = page.child(div().flex_1().min_h(px(0.)).flex().gap(s(RAIL_GAP)).child(grid).children(rail));
+    if !v.status.is_empty() { page = page.child(div().text_color(rgb(MUTED)).child(v.status.clone())); }
     page
 }
 
@@ -1717,6 +1931,73 @@ mod navigation_tests {
         assert_eq!(menu.pc_game, 4);
         assert_eq!(menu.cloud_game, 0);
         assert_eq!(menu.navigate(Key::Accept, &[], &games), Some((Action::PcGame(4), 1)));
+    }
+
+    #[test]
+    fn the_search_finds_names_loosely_best_first() {
+        let names = ["BALL x PIT", "Balatro", "Diablo® IV", "No Man's Sky", "Desktop"];
+        assert_eq!(super::library_view(&names, ""), [0, 1, 2, 3, 4]);
+        assert_eq!(super::library_view(&names, "diablo")[0], 2);
+        assert_eq!(super::library_view(&names, "nms")[0], 3);
+        assert!(super::library_view(&names, "zzz").is_empty());
+    }
+
+    #[test]
+    fn names_are_filed_under_their_first_letter() {
+        assert_eq!(super::initial("ball x pit"), 'B');
+        assert_eq!(super::initial("“Nodebuster”"), 'N');
+        assert_eq!(super::initial("7 Days to Die"), '#');
+        assert_eq!(super::monogram("No Man's Sky"), "NM");
+        assert_eq!(super::monogram("Desktop"), "D");
+    }
+
+    #[test]
+    fn the_triggers_jump_between_letters() {
+        let names = ["Balatro", "BALL x PIT", "Cyberpunk 2077", "Desktop", "Diablo IV"];
+        let view: Vec<usize> = (0..names.len()).collect();
+        assert_eq!(super::letter_jump(&names, &view, 0, 1), 2);
+        assert_eq!(super::letter_jump(&names, &view, 2, 1), 3);
+        assert_eq!(super::letter_jump(&names, &view, 4, 1), 4);
+        // Back goes to the start of the letter before, from anywhere in a letter.
+        assert_eq!(super::letter_jump(&names, &view, 4, -1), 2);
+        assert_eq!(super::letter_jump(&names, &view, 2, -1), 0);
+        assert_eq!(super::letter_jump(&names, &view, 1, -1), 0);
+        assert_eq!(super::letter_position(&names, &view, 'D'), Some(3));
+    }
+
+    #[test]
+    fn x_quits_the_app_of_the_selected_tile_even_in_a_search() {
+        let mut menu = Menu::default();
+        menu.select_tab(Tab::Pc);
+        menu.open_pc("den");
+        // A search left one match: the catalog's fifth app.
+        assert_eq!(menu.navigate(Key::Quit, &[], &[Action::PcGame(5)]), Some((Action::PcQuit(5), 1)));
+        assert_eq!(menu.navigate(Key::Quit, &[], &[]), None);
+    }
+
+    #[test]
+    fn down_moves_a_whole_row_of_the_grid() {
+        let mut menu = Menu { columns: 4, ..Menu::default() };
+        menu.select_tab(Tab::Cloud);
+        let games: Vec<Action> = (0..12).map(Action::CloudGame).collect();
+        menu.navigate(Key::Down, &[], &games);
+        assert_eq!(menu.cloud_game, 4);
+        menu.navigate(Key::Right, &[], &games);
+        assert_eq!(menu.cloud_game, 5);
+    }
+
+    #[test]
+    fn each_letter_is_one_run_of_names() {
+        let mut names = vec!["!Zelda", "Apex", "Zork", "Élan", "apple"];
+        names.sort_by_key(|name| super::library_order(name));
+        assert_eq!(names, ["Apex", "apple", "!Zelda", "Zork", "Élan"]);
+    }
+
+    #[test]
+    fn the_grid_fits_as_many_tiles_as_the_width_takes() {
+        // Seven 150-point covers across a Steam Deck.
+        assert_eq!(super::library_columns(1280.), 7);
+        assert_eq!(super::library_columns(400.), 1);
     }
 
     #[test]
