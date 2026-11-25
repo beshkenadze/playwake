@@ -1200,12 +1200,16 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                 Computer::Offline(pc) => format!("{} · {}", pc.name, t.t("не в сети", "offline")),
             }).chain([t.t("Добавить ПК по адресу", "Add a PC by address").to_owned()]).collect(),
         };
+        // Only a PC's apps have covers; the PC list has none.
+        let keys: Vec<String> = open.map(|pc| v.pc_catalog.apps(pc.id()).iter().map(|game| game.cover()).collect())
+            .unwrap_or_default();
+        let covers = labels.iter().enumerate().map(|(index, _)| keys.get(index).map(String::as_str)).collect();
         let loading = v.pc_loading.then(|| t.t("Поиск ПК…", "Looking for PCs…"));
         let none_found = open.is_none() && v.pc_catalog.pcs.is_empty() && loading.is_none();
         body = body.child(library(v, Library {
             id: if open.is_some() { "pc-game" } else { "pc" },
             title: open.map_or(t.t("ПК", "PCs"), |pc| pc.name.as_str()),
-            names: labels.iter().map(String::as_str).collect(),
+            names: labels.iter().map(String::as_str).collect(), covers, cover_set: &crate::pc::COVERS,
             selected: if open.is_some() { v.menu.pc_game } else { v.menu.pc },
             loading,
             error: v.pc_error.as_deref().or(none_found.then(||
@@ -1267,8 +1271,10 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         );
     } else if v.menu.tab == Tab::Cloud {
         let names = v.cloud_catalog.iter().flatten().map(|game| game.name.as_str()).collect();
+        let covers = v.cloud_catalog.iter().flatten().map(|game| game.cover.as_deref()).collect();
         body = body.child(library(v, Library {
-            id: "cloud-game", title: "Xbox Cloud Gaming", names, selected: v.menu.cloud_game,
+            id: "cloud-game", title: "Xbox Cloud Gaming", names, covers, cover_set: &crate::cloud::COVERS,
+            selected: v.menu.cloud_game,
             loading: v.cloud_loading.then(|| if v.cloud_catalog.is_some() {
                 t.t("Обновление каталога…", "Refreshing cloud library…")
             } else {
@@ -1542,6 +1548,9 @@ struct Library<'a> {
     id: &'static str,
     title: &'a str,
     names: Vec<&'a str>,
+    /// The cover URL of each name, and where the cover cache keeps them.
+    covers: Vec<Option<&'a str>>,
+    cover_set: &'static crate::covers::Set,
     selected: usize,
     loading: Option<&'static str>,
     error: Option<&'a str>,

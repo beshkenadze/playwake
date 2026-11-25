@@ -1,4 +1,5 @@
 mod cloud;
+mod covers;
 mod deck;
 mod device;
 mod input;
@@ -29,6 +30,8 @@ enum Event {
     Consoles(Arc<xbox::Xbox>, xbox::Result<Vec<xbox::Console>>, bool),
     CachedCloudCatalog(Arc<xbox::Xbox>, Vec<cloud::Game>),
     CloudCatalog(Arc<xbox::Xbox>, xbox::Result<Vec<cloud::Game>>),
+    /// More covers are on disk.
+    Covers,
     PcCatalog(pc::Result<pc::Catalog>),
     PcPaired(pc::Unpaired, pc::Result<()>),
     /// A PC was added by its address, or the app it ran was quit.
@@ -292,11 +295,17 @@ impl RemotePlay {
         let read_cache = self.cloud_catalog.is_none();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            if read_cache && let Some(games) = cloud::cached_catalog(&account) {
-                let _ = tx.send(Event::CachedCloudCatalog(account.clone(), games));
+            let cached = read_cache.then(|| cloud::cached_catalog(&account)).flatten();
+            if let Some(games) = &cached {
+                let _ = tx.send(Event::CachedCloudCatalog(account.clone(), games.clone()));
             }
             let result = cloud::catalog(&account);
+            let games = result.as_ref().ok().cloned().or(cached);
             let _ = tx.send(Event::CloudCatalog(account, result));
+            let urls: Vec<&str> = games.iter().flatten().filter_map(|game| game.cover.as_deref()).collect();
+            if let (false, Ok(client)) = (urls.is_empty(), xbox::client()) {
+                covers::fetch(&cloud::COVERS, &urls, |url| covers::download(&client, url), || { let _ = tx.send(Event::Covers); });
+            }
         });
     }
 
@@ -305,7 +314,12 @@ impl RemotePlay {
         self.pc_loading = true;
         self.pc_error = None;
         let tx = self.tx.clone();
-        thread::spawn(move || { let _ = tx.send(Event::PcCatalog(pc::catalog())); });
+        thread::spawn(move || {
+            let result = pc::catalog();
+            let games = result.as_ref().map(|catalog| catalog.games.clone()).unwrap_or_default();
+            let _ = tx.send(Event::PcCatalog(result));
+            if !games.is_empty() { pc::fetch_covers(&games, || { let _ = tx.send(Event::Covers); }); }
+        });
     }
 
     /// Shows a PIN and waits, off the UI thread, for the user to enter it on the PC.
@@ -678,6 +692,7 @@ impl RemotePlay {
                     }
                 }
             }
+            Event::Covers => {}
             Event::PcCatalog(result) => {
                 self.pc_loading = false;
                 match result {

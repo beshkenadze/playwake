@@ -172,10 +172,24 @@ impl Host {
         }).collect())
     }
 
+    /// The cover the host keeps for an app: the image set for it in Sunshine,
+    /// or Sunshine's own box art.
+    pub fn asset(&self, identity: &Identity, app: u32) -> Result<Vec<u8>> {
+        image(&self.answer(identity, true, "appasset", &format!("appid={app}&AssetType=2&AssetIdx=0"),
+            Some(REQUEST_TIMEOUT))?)
+    }
+
     /// One GET; returns the XML body. Without a timeout it waits for as long
     /// as the host takes, which pairing needs while the PIN is being entered.
     pub(crate) fn get(&self, identity: &Identity, secure: bool, path: &str, query: &str,
         timeout: Option<Duration>) -> Result<String>
+    {
+        body(&self.answer(identity, secure, path, query, timeout)?)
+    }
+
+    /// One GET; returns the whole answer.
+    fn answer(&self, identity: &Identity, secure: bool, path: &str, query: &str,
+        timeout: Option<Duration>) -> Result<Vec<u8>>
     {
         let port = if secure { self.https_port } else { self.http_port };
         let address = (self.address.as_str(), port).to_socket_addrs()
@@ -192,14 +206,13 @@ impl Host {
             hex::encode(request_id), if query.is_empty() { "" } else { "&" }, self.address);
         // The timeout is for each read; the deadline is for the whole answer.
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let response = if secure {
+        if secure {
             let mut tls = self.tls(identity)?;
             let mut stream = rustls::Stream::new(&mut tls, &mut socket);
             exchange(&mut stream, &request, deadline)
         } else {
             exchange(&mut socket, &request, deadline)
-        }.map_err(|e| format!("Request to {} failed: {e}", self.address))?;
-        body(&response)
+        }.map_err(|e| format!("Request to {} failed: {e}", self.address))
     }
 
     fn tls(&self, identity: &Identity) -> Result<rustls::ClientConnection> {
@@ -307,6 +320,23 @@ fn body(response: &[u8]) -> Result<String> {
     Ok(body.to_owned())
 }
 
+/// The body of a successful answer that holds a PNG or JPEG image.
+fn image(response: &[u8]) -> Result<Vec<u8>> {
+    let end = response.windows(4).position(|window| window == b"\r\n\r\n").ok_or("The PC sent an incomplete answer")?;
+    let head = String::from_utf8_lossy(&response[..end]);
+    let status = head.split_whitespace().nth(1).unwrap_or_default();
+    if status != "200" { return Err(format!("The PC answered HTTP {status}")); }
+    let body = &response[end + 4..];
+    // The host may close the connection early without a TLS goodbye.
+    let length = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+    });
+    if length.is_some_and(|length| length != body.len()) { return Err("The PC sent an incomplete image".into()); }
+    if body.starts_with(b"\x89PNG\r\n\x1a\n") || body.starts_with(b"\xff\xd8\xff") { Ok(body.to_vec()) }
+    else { Err("The PC sent no image".into()) }
+}
+
 /// The text of the first `<tag>…</tag>`.
 pub(crate) fn value(xml: &str, tag: &str) -> Option<String> {
     let rest = xml.split_once(&format!("<{tag}>"))?.1;
@@ -332,6 +362,16 @@ pub(crate) fn check_status(xml: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_asset_is_the_image_in_the_answer() {
+        let png = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 10\r\n\r\n\x89PNG\r\n\x1a\n\x00\xff";
+        assert_eq!(image(png).unwrap(), b"\x89PNG\r\n\x1a\n\x00\xff");
+        assert!(image(b"HTTP/1.1 200 OK\r\ncontent-length: 4000\r\n\r\n\x89PNG\r\n\x1a\n\x00\xff").is_err());
+        assert!(image(b"HTTP/1.1 200 OK\r\n\r\n\xff\xd8\xff\xe0").is_ok());
+        assert!(image(b"HTTP/1.1 200 OK\r\n\r\n<root status_code=\"401\"/>").is_err());
+        assert!(image(b"HTTP/1.1 404 Not Found\r\n\r\n\x89PNG\r\n\x1a\n").is_err());
+    }
 
     #[test]
     fn reads_values_and_the_root_status() {
