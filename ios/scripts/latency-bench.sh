@@ -15,7 +15,12 @@ if [ -z "$UDID" ]; then
 fi
 [ -n "$UDID" ] || { echo "no booted simulator" >&2; exit 1; }
 
-xcodebuild -project "$IOS_ROOT/PlaywakeIOS.xcodeproj" -scheme PlaywakeIOS \
+(
+    cd "$IOS_ROOT"
+    tuist generate --no-open
+) >&2
+
+xcodebuild -workspace "$IOS_ROOT/PlaywakeIOS.xcworkspace" -scheme PlaywakeIOS \
     -configuration Debug -sdk iphonesimulator -destination "id=$UDID" \
     -derivedDataPath "$IOS_ROOT/build/DerivedData" build -quiet >&2
 
@@ -40,7 +45,7 @@ for f in "$SESSION_TMP"/*.json; do
 done
 rm -rf "$SESSION_TMP"
 # shellcheck disable=SC2086
-xcrun simctl launch "$UDID" "$BUNDLE" -autolab ${LAUNCH_ARGS:-} >/dev/null
+xcrun simctl launch "$UDID" "$BUNDLE" -autolab -playoutMs 0 ${LAUNCH_ARGS:-} >/dev/null
 sleep "$WARMUP"
 
 DATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data)

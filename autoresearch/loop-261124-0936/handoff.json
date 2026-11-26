@@ -1,0 +1,48 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-11-24T16:10:00+02:00",
+  "status": "BOUNDED",
+  "results_tsv": "autoresearch/loop-261124-0936/results.tsv",
+  "config": {
+    "goal": "reduce client-side Xbox streaming latency of the iOS client on a physical iPhone XS (live console stream)",
+    "scope": "ios/PlaywakeIOS/**",
+    "metric": "client pipeline ms = median jb + dec + hold + sub + pres per second during trials + median actuate->send",
+    "direction": "lower_is_better",
+    "verify": "DEVICE=00008020-000959100A68002E ios/scripts/device-trials.sh 720 (RDR2 cabin scene on the console, phone unlocked)",
+    "guard": "trials n>=6, ren>=55 fps, no dropped frames"
+  },
+  "findings": [
+    "jb and dec stats were lifetime averages that kept the 80-113 ms startup spike for a minute; now per-interval deltas.",
+    "Trial actuation coalesced with the 8 ms input tick (GCD timer leeway); a strict timer with a random offset measures the real input wait (~3.5 ms).",
+    "Event-driven input (send on controller change, restart the tick): actuate->send 3.48 -> 0.87 ms at an unchanged 125 packets/s. Kept.",
+    "Synchronous enqueue: no gain; the render-queue hop is 0.05 ms. Discarded.",
+    "CAMetalLayer sink on iOS: real submit->display 30.8 ms plus 13 ms drawable wait, worse than AVSampleBufferDisplayLayer. Stays opt-in.",
+    "sub is mostly the AVSampleBufferDisplayLayer.enqueue call (0.9-1.8 ms system IPC).",
+    "Decoded frames reach the renderer in 0.33 ms; the 10 ms playout delay does not hold them after decoding.",
+    "RDR2 runs at 30 fps, so poll->turn moves in 33 ms steps; it is a guard, not the metric.",
+    "Measurements need an optimized build: at -Onone trial analysis took 18 ms in the render callback.",
+    "Long RDR2 run (338 s): 5-8 render gaps over 25 ms per second (p50 34 ms, 9 over 100 ms), 44 display stalls per minute; RTT p50 4 / p90 26 / max 111 ms. The median is near the XS floor; the tail is not.",
+    "pres swings 18-27 ms with a ~30 s period: the phase between the 60 fps stream and the 60 Hz display drifts; it cannot be controlled from the client.",
+    "Network on the phone (Wi-Fi, direct host path): zero lost packets, NACKs, retransmits and PLIs; the console stamps frames evenly. About 5-9 video frames per second reach the decoder input late (up to 80-180 ms) and the next ones come right behind them: bunched delivery, not loss. A wired Mac A/B did not connect (ICE failed with Wi-Fi ignored).",
+    "Measurements must run with the camera moving: a static scene sends 1-4 Mb/s, a moving one ~5 Mb/s and more late frames.",
+    "Audio: 50 packets/s (20 ms Opus). NetEq holds 87-115 ms by default (target 80 = minimum, network-driven, not A/V sync). audioJitterBufferFastAccelerate: no gain. audioJitterBufferMaxPackets 3-4: worse (113-115 ms).",
+    "WebRTC-Audio-NetEqDelayManagerConfig quantile 0.6 (now default): target 60 ms, audio jitter buffer 68 ms static, 77/88/92 ms under motion vs 115 ms, concealed 0.02-0.05%. Kept.",
+    "Remote-control ids must grow: the trial script used seconds and rc.sh a counter, so rc.sh commands were silently ignored; both use milliseconds and rc.sh checks the acknowledgement now.",
+    "The console leaves the game for the home screen after the stream has been off for a while; re-enter the game before measuring.",
+    "Smoothing (ForcePlayoutDelay) works: 0 ms -> video jb 2.4 ms, 8.9 render gaps/s; 10 ms -> 2.6-2.8 ms, 5.5-6.4 gaps/s; 50 ms -> 28 ms, 1.5 gaps/s but freezes up to 486 ms. 10 ms is the best trade-off; a fresh install still defaults to 50.",
+    "User listened with NetEq quantile 0.6: audio sounds whole.",
+    "XS client pipeline is near its floor: input ~1 ms, video jb ~1-3, decode ~5, decode->renderer 0.3, sub ~2.5, display ~20 (60 Hz composited path).",
+    "iPhone 15 Pro (Smoothing 10): client pipeline 20.2-20.7 ms = video jb 0.6 + decode 3.8 + hold 0.2 + sub 1.5 + display 13.3-14.1 (120 Hz confirmed) + input 0.5-0.7. XS: ~28-30 ms.",
+    "Late frames are the XS Wi-Fi, not the console: same network and console, 0.2 late frames/s on the 15 Pro vs 5.6-6.4/s on the XS; RTT p90 9 vs 27-32 ms. NetEq then holds 34 ms of audio on the 15 Pro vs 77-92 ms on the XS.",
+    "Smoothing default changed 50 -> 10 ms (single constant WebRTCTrials.defaultPlayoutMs). A fresh 15 Pro install at 50 ms had video jb 36 ms and 8 freezes up to 411 ms.",
+    "Mac (Catalyst): libwebrtc typed interfaces by name because the NWPathMonitor was off, so Wi-Fi en0 outranked USB Ethernet en7. WebRTC-Network-UseNWPathMonitor=Enabled fixes it: stream runs over Ethernet. Mac wired vs Wi-Fi: late max 49 vs 111 ms, RTT p90 13 vs 28, audio jb 57 vs 166 ms, client ~17.7 vs ~19.3 ms. iPhone 15 Pro with the flag: 18.8 ms, fine."
+  ],
+  "next_candidates": [
+    "15 Pro display 13.3 ms is near the 120 Hz composited floor (~12.5 ms on average).",
+    "Decode 3.8 ms (15 Pro) / 5.5 ms (XS): custom VideoToolbox decoder with kVTDecompressionPropertyKey_RealTime and synchronous decode; TimedDecoder is the hook.",
+    "1080p on the 15 Pro: measure decode and display cost against 720p.",
+    "XS late frames: AWDL hypothesis (AirDrop receiving and Handoff off) with the 5 s net line."
+  ],
+  "rollback_point": "uncommitted working tree; no experiment commits (user rule: commit only on request)"
+}

@@ -18,7 +18,9 @@ else
     PROFILE_FLAG=""
 fi
 
-if [ "$PLATFORM" = "iphoneos" ]; then
+if [ "${IS_MACCATALYST:-NO}" = "YES" ]; then
+    TARGETS="aarch64-apple-ios-macabi"
+elif [ "$PLATFORM" = "iphoneos" ]; then
     TARGETS="aarch64-apple-ios"
 else
     TARGETS="aarch64-apple-ios-sim x86_64-apple-ios"

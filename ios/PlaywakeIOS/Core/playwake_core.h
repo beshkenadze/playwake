@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +61,30 @@ size_t pw_input_packet(uint32_t sequence, double time, uint16_t buttons,
                        uint16_t lt, uint16_t rt,
                        uint8_t *out, size_t capacity);
 size_t pw_connect_packet(double start_time, uint8_t *out, size_t capacity);
+
+/* Stream-input route shared with the SteamOS worker: View+Menu tap opens the
+ * stream menu, menu keys are reported instead of sent, Guide pulse on close. */
+typedef struct pw_route pw_route;
+typedef struct {
+    int16_t axes[4];
+    uint16_t buttons;
+    uint16_t lt;
+    uint16_t rt;
+} pw_pad;
+enum {
+    PW_ROUTE_MENU_OPENED = 1 << 0,
+    PW_ROUTE_MENU_CLOSED = 1 << 1,
+    PW_ROUTE_KEY_PREVIOUS = 1 << 2,
+    PW_ROUTE_KEY_NEXT = 1 << 3,
+    PW_ROUTE_KEY_ACTIVATE = 1 << 4,
+    PW_ROUTE_KEY_BACK = 1 << 5,
+};
+pw_route *pw_route_new(void);
+void pw_route_free(pw_route *route);
+/* Rewrites `pad` with what may reach the console; returns PW_ROUTE_* bits. */
+uint32_t pw_route_input(pw_route *route, pw_pad *pad, double now_ms);
+uint32_t pw_route_open(pw_route *route);
+uint32_t pw_route_close(pw_route *route, bool guide);
 
 #ifdef __cplusplus
 }

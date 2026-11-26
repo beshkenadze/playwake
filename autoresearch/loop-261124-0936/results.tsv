@@ -1,0 +1,31 @@
+# metric_direction: lower_is_better
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	09:40	-	32.79	0.0	pass	turn 204.8 n8 ren59.9 drop0	baseline	live XS RDR2 720p60, optimized Debug, uncommitted tree: jb 1.60 dec 5.30 sub 2.58 pres 19.83 actuate->send 3.48 (per-interval jb/dec, strict actuation timer)
+1	09:42	uncommitted	27.57	-5.22	pass	turn 208.0 n8 ren60.0 drop0	keep	event-driven input: send on controller/trial/remote change, restart the 8 ms tick (actuate->send 3.48 -> 0.87 ms)
+2	09:44	-	28.36	+0.79	pass	turn 261.5 n8 ren60.0 drop0	discard	synchronous enqueue by default: sub 1.98-2.85 -> 2.23 ms, no gain; the render-queue hop is not the cost (reverted)
+3	09:46	-	49.83	+22.26	pass	turn 235.4 n8 ren60.6 drop0	discard	CAMetalLayer sink (-cametal) with measured presentedTime: sub 13.2 ms (drawable wait), actual submit->display 30.8 ms vs AVSampleBufferDisplayLayer model 19.8 ms; stays opt-in, presented-time measurement kept
+4	09:51	-	28.46	-	pass	turn 228.8 n8 ren60.2 drop0	no-op	measurement: sub split = queue hop 0.04-0.09 + AVSampleBufferDisplayLayer.enqueue call 0.9-1.8 ms (system IPC, grows over the session) + prepare; nothing app-side to cut
+5	09:51	-	30.04	-	pass	turn 213.3 n8 ren60.0 drop0	no-op	measurement: TimedDecoder wrapper times decode finish -> renderer: hold 0.33 ms, the 10 ms playout delay does not hold decoded frames; metric v2 now includes hold (jb 0.60 dec 5.40 hold 0.33 sub 2.65 pres 20.11 act 0.95)
+6	10:51	-	28.93	-	pass	turn 181.1 n8 ren60.0 drop0	baseline	re-baseline after review fixes (H.264-only decoder wrapper, stop/handshake race, deferred 1 ms send, trial timeout, script exits on zero samples); metric v2 incl. hold
+7	11:32	-	32.34	-	pass	turn 158.2 n8 ren59.9 drop0	baseline	audio baseline: 50 pkt/s (20 ms Opus), NetEq target = minimum ~80 ms, audio jitter buffer delay 87-94 ms (network-driven, not A/V sync); zero packet loss, ~5 late video frames/s up to 50-136 ms
+8	11:32	-	33.68	-	pass	turn 183.1 n8 ren59.9 drop0	discard	-audioFastAccelerate: steady audio jitter buffer 87 ms, same as baseline; only the startup decline is faster
+9	11:36	-	30.78	-	pass	turn 193.7 n8 ren60.0 drop0	discard	-audioMaxPackets 4: audio jb 115 ms (worse), no concealment
+10	11:36	-	31.67	-	pass	turn 191.0 n8 ren60.0 drop0	discard	-audioMaxPackets 3: audio jb 113 ms (worse); maxPackets caps the packet store, not the NetEq target
+11	11:39	-	27.08	-	pass	turn 223.8 n8 ren60.0 drop0	keep-candidate	-netEqQuantile 0.8: audio jb 87-93 -> 79 ms (target 80 -> 60), concealment 0.08% in 45 s
+12	11:39	-	31.55	-	pass	turn 209.4 n8 ren59.9 drop0	keep-candidate	-netEqQuantile 0.6: audio jb 68 ms (target 60), no concealment in 40 s
+13	11:55	-	34.32	-	pass	turn 193.7 n8 ren60.0 drop0	baseline	audio under camera motion (5.2 Mb/s, 120 s): default NetEq jb 115 ms (max 554), target 83, concealed 0.12%
+14	11:55	-	29.96	-	pass	turn 210.2 n8 ren59.9 drop0	keep-candidate	quantile 0.6 under motion: audio jb 77 ms, target 60, concealed 0.02%
+15	11:55	-	29.22	-	pass	turn 181.2 n8 ren59.9 drop0	discard	quantile 0.5 under motion: target 60 but jb 111 ms after a burst overfilled the buffer; no concealment
+16	12:02	-	32.02	-	pass	turn 204.9 n8 ren59.9 drop0	keep	NetEq quantile 0.6 as default (field trial): under motion audio jb 77/88/92 ms over 3 runs vs 115 ms default, concealed 0.02-0.05%; static 68 vs 87-93 ms
+17	12:02	-	29.62	-	pass	turn 222.2 n8 ren60.0 drop0	discard	quantile 0.6 + audioJitterBufferFastAccelerate: 88 ms, no gain; flags removed
+18	12:14	-	34.28	-	pass	turn 214.7 n8 ren60.0 drop0	no-op	playout delay 0 under motion: video jb 2.4 ms (vs 2.6-2.8 at 10), render gaps 8.9/s (vs 5.5-6.4 at 10): 10 ms costs ~0.3 ms and absorbs small lateness
+19	12:14	-	45.65	-	pass	turn 205.8 n8 ren60.0 drop0	no-op	playout delay 50 under motion: video jb 28 ms, render gaps 1.5/s but 3 freezes up to 486 ms; the setting works, 10 ms stays the best trade-off (app default for a fresh install is still 50)
+20	12:33	-	52.80	-	pass	turn 211.4 n8 ren59.9 drop0	baseline	iPhone 15 Pro, fresh install (Smoothing default 50): video jb 36 ms, dec 3.9, sub 1.50, pres 13.2 (display 120 Hz confirmed), 8 freezes up to 411 ms, audio jb 39 ms conc 0.57%
+21	12:33	-	20.22	-32.58	pass	turn 173.2 n8 ren59.9 drop0	keep	15 Pro with Smoothing 10: video jb 0.6, dec 3.8, hold 0.19, sub 1.49, pres 13.45, input 0.70; late frames 0.2/s vs 5.6-6.4/s on the XS (XS Wi-Fi, not the console); RTT p90 9 vs 27-32 ms; audio jb 34 ms
+22	12:33	-	20.73	-	pass	turn 187.6 n8 ren59.9 drop0	keep	Smoothing default 50 -> 10 ms (single constant WebRTCTrials.defaultPlayoutMs): fresh 15 Pro install runs min_ms:10, client pipeline 20.7 ms
+23	12:55	-	22.57	-	pass	turn 154.5 n8 ren59.9 drop0	no-op	15 Pro 1080p (11.3 Mb/s): decode 5.5 vs 3.9 ms, jb 1.3 vs 0.6, display same 13.5; late 0.7/s vs 0.3/s, 1 freeze (189 ms); +1.7 ms client total vs 720p
+24	12:55	-	20.84	-	pass	turn 171.6 n8 ren59.9 drop0	baseline	15 Pro 720p control run right after 1080p (5.2 Mb/s): client 20.8 ms
+25	13:12	-	19.25	-	pass	turn 240.4 n8	baseline	MacBook (Catalyst, built-in 120 Hz display, Wi-Fi path): jb 1.0 dec 4.2 hold 1.66 sub 0.32 pres 11.7 input 0.37; late 5.1/s max 127 ms, RTT p90 28 ms, audio jb 166 ms. Stream uses Wi-Fi (en0 IPv6) although USB Ethernet en7 is the primary service: this WebRTC build types every en* as wifi and ranks en0 above en7; ping to the console 0.6 ms wired vs 3-80 ms Wi-Fi
+26	13:32	-	17.7	-	pass	turn 186.4 n8	keep	WebRTC-Network-UseNWPathMonitor enabled: Mac stream moves from Wi-Fi (en0) to Ethernet (en7). Wired: jb 0.7 dec 3.3 hold 0.28 sub 0.32 pres 11.8 input 1.3; late max 49 vs 111 ms, RTT p90 13 vs 28, audio jb 57 vs 166 ms
+27	13:57	-	18.83	-	pass	turn 156.4 n8 ren59.9 drop0	keep	path monitor flag on the iPhone 15 Pro: Wi-Fi candidates only, client 18.8 ms, 0 late frames in the last 15 s, no freezes
+28	15:53	-	16.5	-	pass	turn 154.4 n8	keep	new SwiftUI UI (design from Claude Design), Mac wired: client 16.5 ms (16.4 before), stats HUD on: 16.5 ms; View+Menu route shared with SteamOS via ios-core

@@ -1,0 +1,34 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-11-23T18:05:00+02:00",
+  "status": "LIVE_STREAM_VERIFIED",
+  "results_tsv": "autoresearch/loop-261123-1329/results.tsv",
+  "config": {
+    "goal": "reduce Xbox streaming end-to-end latency on iOS",
+    "scope": "ios/PlaywakeIOS/**, ios/scripts/latency-bench.sh",
+    "metric": "median capture->renderFrame latency (ms), lower_is_better",
+    "direction": "lower_is_better",
+    "verify": "SIM_UDID=<booted> ./ios/scripts/latency-bench.sh"
+  },
+  "findings": [
+    "ForcePlayoutDelay min/max 0 removed the 14.8 ms jitter-buffer component (iteration 1).",
+    "Barcode latency is lab-only now; the live path skips IOSurface readback (iteration 2).",
+    "Re-baseline at 0e65b96 with a microsecond barcode and 60 samples: 6.01 ms median.",
+    "Encode-time split: e2e 6.0 = encode 4.0 + decode 1.6 + jitter buffer 0.1 + rtt 0.4.",
+    "Submit metric (renderFrame entry -> AVSampleBufferDisplayLayer enqueue) is 0.45 ms median on Mac Catalyst; the async render-queue hop is not a bottleneck.",
+    "Mac Catalyst lab baseline: e2e 10.9 = encT 9.1 + dec 1.2 + sub 0.45 + jb 0.5 + rtt 0.9 (46 samples, ren ~59, drop 0). The harness encoder dominates; client receive path is ~2.2 ms.",
+    "The client-controlled receive path is ~2 ms; the rest is the lab's synthetic H.264 encoder.",
+    "libwebrtc already runs the video decode queue at TaskQueueFactory::Priority::HIGH.",
+    "Live xHome session verified on 'My Mac (Mac Catalyst)': saved session restored without sign-in, 1280x720@60 decoded/displayed, ~1 MiB/s inbound, no re-auth needed (refresh token valid and rotated normally).",
+    "Further gains on this metric would come from optimizing the harness sender, which does not transfer to the live Xbox stream (proxy success) - not attempted.",
+    "Live stats are now written to lab.log once per second by SessionController's rtc.onStats; the live receive path was measured on the simulator at 720p60: jb 2.3 ms, dec 4.1 ms, sub 0.08 ms, vsync wait (pres) 6.4 ms, rtt 4 ms median (spikes to ~70 ms), zero drops.",
+    "The video view requests 120 Hz via CADisplayLink.preferredFrameRateRange and Info.plist CADisableMinimumFrameDurationOnPhone, so ProMotion devices present on the next 120 Hz vsync; the simulator stays at 60 Hz so the lab metric is unchanged (6.00 ms).",
+    "Diagnostics are Debug-only now: LabLog.write takes an autoclosure and compiles to nothing in Release; the file rotates at 2 MiB to lab.log.1 (checked by pre-filling the simulator log). Production stats go through SessionEvents (Combine PassthroughSubject, throttled to one sample per 5 s) instead of disk logging."
+  ],
+  "next_candidates": [
+    "Input-to-console cadence: the input loop is fixed at 8 ms (125 Hz) in XboxRTC; evaluate 4 ms against Xbox tolerance during live play (needs a controller).",
+    "Validate the 120 Hz vsync gain and the rtt spikes on a physical ProMotion iPhone; the simulator cannot show either."
+  ],
+  "rollback_point": "0e65b96"
+}

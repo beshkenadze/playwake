@@ -1,0 +1,8 @@
+# metric_direction: lower_is_better
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	13:29	c4a2dbd	21	0.0	-	-	baseline	initial state (median e2e 21 ms, jb ~14 ms)
+1	13:30	1a67457	7	-14.0	pass	ren~60 drop0	keep	force zero playout delay (jb 14.8 -> 0.2 ms)
+2	13:34	c7eac02	6.5	0.0	pass	ren~60 drop0	keep	barcode read is lab-only; bogus clock-domain fallback removed (live path skips IOSurface readback)
+3	14:50	0e65b96	6.01	-0.49	pass	ren~60 drop0	baseline	re-baseline with microsecond barcode and 60 samples (encT 4.0, dec 1.6, jb 0.1, rtt 0.4)
+4	16:02	0e65b96	10.92	+4.91	pass	ren~59 drop0	baseline	Mac Catalyst baseline (46 samples): e2e 10.9 = encT 9.1 + dec 1.2 + sub 0.45 + jb 0.5 + rtt 0.9; harness encoder dominates, receive path ~2.2 ms
+5	17:58	uncommitted	-	0.0	pass	ren~60 drop0	baseline	live simulator 720p60 baseline with stats now logged to lab.log: jb 2.3, dec 4.1, sub 0.08, pres 6.4, rtt 4 ms, no drops

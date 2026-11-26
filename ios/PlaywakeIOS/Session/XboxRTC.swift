@@ -1,4 +1,3 @@
-import AVFoundation
 import Foundation
 import QuartzCore
 import WebRTC
@@ -21,6 +20,8 @@ final class XboxRTC: NSObject {
         case state(String)
         case inputReady
         case inputSent
+        /// PW_ROUTE_* bits from the stream-input route.
+        case menu(UInt32)
     }
 
     var onEvent: ((Event) -> Void)?
@@ -29,6 +30,9 @@ final class XboxRTC: NSObject {
     private let renderer: LowLatencyVideoRenderer
     private let core = PlaywakeCore.shared
     private let factory: RTCPeerConnectionFactory
+    private let decodeClock: DecodeClock
+    private var lastCounters: [String: Double] = [:]
+    private var loggedCandidates = false
     private var pc: RTCPeerConnection?
     private var options = Options()
     private var startTime: Double = 0
@@ -46,24 +50,53 @@ final class XboxRTC: NSObject {
     private var exchanged = false
     private var pendingRemote: [RTCIceCandidate] = []
 
+    /// Owned by `inputQueue`, like everything the input loop touches.
     private var inputTimer: DispatchSourceTimer?
+    private var lastSendAt: CFTimeInterval = 0
+    /// Stream-input route shared with SteamOS; touched only on `inputQueue`.
+    private let route = pw_route_new()
+    private var stopped = false
     private var statsTimer: DispatchSourceTimer?
     private var inputQueue = DispatchQueue(label: "io.playwake.input", qos: .userInteractive)
     private var sequence: UInt32 = 0
     private var handshakeOpened = false
     private var handshakeAcknowledged = false
+    private var inputIntervalMs = 8
+    private var inputSentCount = 0
+    private var inputLogAt: CFAbsoluteTime = 0
+    private var sawControllerInput = false
 
-    private var lastInbound: (frames: Double, bytes: Double, at: CFAbsoluteTime)?
+    private var lastInbound: (frames: Double, bytes: Double, decode: Double, jbDelay: Double, jbEmitted: Double,
+                              at: CFAbsoluteTime)?
+    private var statsTicks = 0
+    private var trials: LatencyTrials?
+    private var remote: RemoteControl?
     private var stats = LabStats()
 
     init(renderer: LowLatencyVideoRenderer) {
         self.renderer = renderer
         WebRTCTrials.install()
-        RTCSetMinDebugLogLevel(.warning)
+        RTCSetMinDebugLogLevel(ProcessInfo.processInfo.arguments.contains("-rtcVerbose") ? .info : .warning)
+        let decoders = TimedDecoderFactory()
+        renderer.setDecodeClock(decoders.clock)
+        self.decodeClock = decoders.clock
         self.factory = RTCPeerConnectionFactory(
             encoderFactory: RTCDefaultVideoEncoderFactory(),
-            decoderFactory: RTCDefaultVideoDecoderFactory())
+            decoderFactory: decoders,
+            audioDevice: PlayoutAudioDevice())
         super.init()
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-latencyTrials") || arguments.contains("-remote") {
+            let trials = LatencyTrials()
+            trials.onActuate = { [weak self] in self?.sendNow() }
+            self.trials = trials
+            renderer.setTrials(trials)
+            if arguments.contains("-remote") {
+                remote = RemoteControl(renderer: renderer, onInput: { [weak self] in self?.sendNow() }) { [weak self] in
+                    trials.run(height: Int(self?.options.height ?? 0))
+                }
+            }
+        }
     }
 
     // MARK: - Lifecycle
@@ -72,8 +105,6 @@ final class XboxRTC: NSObject {
         self.options = options
         self.handsize = (options.width, options.height)
         self.startTime = CACurrentMediaTime() * 1000
-        configureAudio()
-
         let config = RTCConfiguration()
         config.sdpSemantics = .unifiedPlan
         config.bundlePolicy = .maxBundle
@@ -117,7 +148,16 @@ final class XboxRTC: NSObject {
     }
 
     func stop() {
-        inputTimer?.cancel(); inputTimer = nil
+        // First, so a handshake ACK still in flight cannot start input again.
+        inputQueue.sync {
+            stopped = true
+            inputTimer?.cancel()
+            inputTimer = nil
+        }
+        Gamepad.shared.onChange = nil
+        remote?.stop()
+        trials?.cancel()
+        renderer.setTrials(nil)
         statsTimer?.cancel(); statsTimer = nil
         messageChannel?.close()
         controlChannel?.close()
@@ -128,19 +168,6 @@ final class XboxRTC: NSObject {
         pc?.close()
         pc = nil
         emit(.state("stopped"))
-    }
-
-    private func configureAudio() {
-        let session = RTCAudioSession.sharedInstance()
-        session.lockForConfiguration()
-        let configuration = RTCAudioSessionConfiguration.webRTC()
-        configuration.category = AVAudioSession.Category.playback.rawValue
-        configuration.categoryOptions = []
-        configuration.mode = AVAudioSession.Mode.moviePlayback.rawValue
-        configuration.ioBufferDuration = 0.005
-        _ = try? session.setConfiguration(configuration, active: true)
-        session.unlockForConfiguration()
-        session.isAudioEnabled = true
     }
 
     private func createChannels(on pc: RTCPeerConnection) {
@@ -281,33 +308,125 @@ final class XboxRTC: NSObject {
     }
 
     private func startInput() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.inputTimer == nil else { return }
+        inputQueue.async { [weak self] in
+            guard let self, !self.stopped, self.inputTimer == nil else { return }
+            Gamepad.shared.onChange = { [weak self] in self?.sendNow() }
+            self.remote?.start()
+            if ProcessInfo.processInfo.arguments.contains("-latencyTrials") {
+                self.trials?.run(height: Int(self.options.height))
+            }
+            let requested = UserDefaults.standard.integer(forKey: "inputMs")
+            self.inputIntervalMs = (1...16).contains(requested) ? requested : 8
+            self.inputLogAt = CFAbsoluteTimeGetCurrent()
             let timer = DispatchSource.makeTimerSource(queue: self.inputQueue)
-            timer.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(0))
-            timer.setEventHandler { [weak self] in self?.tick() }
+            timer.schedule(deadline: .now(), repeating: .milliseconds(self.inputIntervalMs),
+                           leeway: .milliseconds(0))
+            timer.setEventHandler { [weak self] in
+                // A tick already queued when sendNow() sent must not repeat it.
+                guard let self, CACurrentMediaTime() - self.lastSendAt >= 0.001 else { return }
+                self.tick()
+            }
             timer.resume()
             self.inputTimer = timer
-            self.emit(.state("input armed"))
+            self.emit(.state("input armed at \(self.inputIntervalMs) ms"))
+        }
+    }
+
+    deinit {
+        pw_route_free(route)
+    }
+
+    /// Opens the stream menu from touch or keyboard.
+    func openMenu() {
+        inputQueue.async { [weak self] in
+            guard let self else { return }
+            let events = pw_route_open(self.route)
+            if events != 0 { self.emit(.menu(events)) }
+        }
+    }
+
+    /// Closes the stream menu; `guide` presses Xbox Guide once the pad is released.
+    func closeMenu(guide: Bool) {
+        inputQueue.async { [weak self] in
+            guard let self else { return }
+            let events = pw_route_close(self.route, guide)
+            if events != 0 { self.emit(.menu(events)) }
+            self.sendNow()
+        }
+    }
+
+    private func routePad(_ pad: inout Gamepad.Snapshot, at now: Double) -> UInt32 {
+        var wire = pw_pad(axes: (pad.axes[0], pad.axes[1], pad.axes[2], pad.axes[3]),
+                          buttons: pad.buttons, lt: pad.lt, rt: pad.rt)
+        let events = pw_route_input(route, &wire, now)
+        pad.axes = [wire.axes.0, wire.axes.1, wire.axes.2, wire.axes.3]
+        pad.buttons = wire.buttons
+        pad.lt = wire.lt
+        pad.rt = wire.rt
+        return events
+    }
+
+    /// Sends the pad state now instead of at the next tick, then restarts the
+    /// tick from this packet. Sends stay at least 1 ms apart.
+    func sendNow() {
+        inputQueue.async { [weak self] in
+            guard let self, let timer = self.inputTimer else { return }
+            let interval = DispatchTimeInterval.milliseconds(self.inputIntervalMs)
+            let wait = 0.001 - (CACurrentMediaTime() - self.lastSendAt)
+            if wait > 0 {
+                // Too close to the last packet: send when the 1 ms is over.
+                timer.schedule(deadline: .now() + wait, repeating: interval, leeway: .milliseconds(0))
+                return
+            }
+            self.tick()
+            timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(0))
         }
     }
 
     private func tick() {
         guard let channel = inputChannel, channel.readyState == .open else { return }
-        let gamepad = Gamepad.shared.snapshot()
+        lastSendAt = CACurrentMediaTime()
+        let polledAt = CACurrentMediaTime() * 1000
+        var gamepad = Gamepad.shared.snapshot()
+        // Only the physical pad goes through the route: the menu pauses it,
+        // while remote-control and trial input still reach the console.
+        let menuEvents = routePad(&gamepad, at: polledAt)
+        remote?.apply(to: &gamepad, at: polledAt)
+        let trialX = trials?.stickX(at: polledAt)
+        if let trialX {
+            gamepad.axes[2] = trialX
+            gamepad.buttons = 0
+        }
         sequence &+= 1
-        let time = CACurrentMediaTime() * 1000 - startTime
         let packet = core.inputPacket(
-            sequence: sequence, time: time, buttons: gamepad.buttons,
+            sequence: sequence, time: polledAt - startTime, buttons: gamepad.buttons,
             left: (gamepad.axes[0], gamepad.axes[1]),
             right: (gamepad.axes[2], gamepad.axes[3]),
             triggers: (gamepad.lt, gamepad.rt))
-        send(data: packet, on: channel)
+        if send(data: packet, on: channel), trialX != nil {
+            trials?.sent(polledAt: polledAt, sentAt: CACurrentMediaTime() * 1000)
+        }
+
+        if !sawControllerInput,
+           gamepad.buttons != 0 || gamepad.lt > 0 || gamepad.rt > 0
+               || gamepad.axes.contains(where: { $0 != 0 }) {
+            sawControllerInput = true
+            LabLog.write("input active buttons=\(gamepad.buttons) axes=\(gamepad.axes) lt=\(gamepad.lt) rt=\(gamepad.rt)")
+        }
+        if menuEvents != 0 { emit(.menu(menuEvents)) }
+        inputSentCount += 1
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - inputLogAt >= 1 {
+            LabLog.write("input \(inputSentCount) packets/s interval \(inputIntervalMs) ms")
+            inputSentCount = 0
+            inputLogAt = now
+        }
     }
 
-    private func send(data: Data, on channel: RTCDataChannel?) {
-        guard let channel, channel.readyState == .open else { return }
-        channel.sendData(RTCDataBuffer(data: data, isBinary: true))
+    @discardableResult
+    private func send(data: Data, on channel: RTCDataChannel?) -> Bool {
+        guard let channel, channel.readyState == .open else { return false }
+        return channel.sendData(RTCDataBuffer(data: data, isBinary: true))
     }
 
     private func send(text: String, on channel: RTCDataChannel?) {
@@ -346,36 +465,124 @@ final class XboxRTC: NSObject {
             var updated = self.stats
             updated.renderFps = self.renderer.snapshotFPS()
             updated.latencyMs = self.renderer.snapshotLatency()
+            updated.submitMs = self.renderer.snapshotSubmit()
+            updated.holdMs = self.renderer.snapshotHold()
+            updated.presentMs = self.renderer.snapshotPresent()
             for (_, stat) in report.statistics {
                 let values = stat.values
                 guard stat.type == "inbound-rtp", values["kind"] as? String == "video" else { continue }
                 let frames = self.number(values["framesDecoded"])
                 let bytes = self.number(values["bytesReceived"])
-                if let previous = self.lastInbound {
-                    let dt = max(now - previous.at, 0.001)
-                    updated.decodeFps = (frames - previous.frames) / dt
+                let decode = self.number(values["totalDecodeTime"])
+                let delay = self.number(values["jitterBufferDelay"])
+                let emitted = self.number(values["jitterBufferEmittedCount"])
+                // Decode time and jitter buffer delay over the last interval;
+                // lifetime averages keep the startup spike for a minute.
+                let previous = self.lastInbound ?? (0, 0, 0, 0, 0, now)
+                let dt = max(now - previous.at, 0.001)
+                let decoded = frames - previous.frames
+                let released = emitted - previous.jbEmitted
+                if self.lastInbound != nil {
+                    updated.decodeFps = decoded / dt
                     updated.bitrateMbps = (bytes - previous.bytes) * 8 / dt / 1_000_000
                 }
-                self.lastInbound = (frames, bytes, now)
+                updated.decodeMs = decoded > 0 ? (decode - previous.decode) / decoded * 1000 : 0
+                updated.jitterBufferMs = released > 0 ? (delay - previous.jbDelay) / released * 1000 : 0
+                self.lastInbound = (frames, bytes, decode, delay, emitted, now)
                 updated.jitterMs = self.number(values["jitter"]) * 1000
                 updated.framesDropped = Int(self.number(values["framesDropped"]))
-                let decodeTime = self.number(values["totalDecodeTime"])
-                updated.decodeMs = frames > 0 ? decodeTime / frames * 1000 : 0
-                let emitted = self.number(values["jitterBufferEmittedCount"])
-                let delay = self.number(values["jitterBufferDelay"])
-                updated.jitterBufferMs = emitted > 0 ? delay / emitted * 1000 : 0
                 updated.width = Int(self.number(values["frameWidth"]))
                 updated.height = Int(self.number(values["frameHeight"]))
             }
-            for (_, stat) in report.statistics where stat.type == "candidate-pair" {
-                if let state = stat.values["state"] as? String, state == "succeeded" {
-                    let rtt = self.number(stat.values["currentRoundTripTime"])
-                    if rtt > 0 { updated.rttMs = rtt * 1000 }
+            // RTT and network type of the pair the transport actually uses.
+            if let pairId = report.statistics.values.first(where: { $0.type == "transport" })?
+                .values["selectedCandidatePairId"] as? String,
+               let pair = report.statistics[pairId]?.values {
+                let rtt = self.number(pair["currentRoundTripTime"])
+                if rtt > 0 { updated.rttMs = rtt * 1000 }
+                if let localId = pair["localCandidateId"] as? String,
+                   let network = report.statistics[localId]?.values["networkType"] as? String {
+                    updated.network = network
                 }
+            }
+            self.trials?.updateContext(String(
+                format: "%dx%d rtt %.0f ms jb %.1f ms pres %.1f ms",
+                updated.width, updated.height, updated.rttMs, updated.jitterBufferMs, updated.presentMs))
+            self.statsTicks += 1
+            if self.statsTicks % 5 == 0 {
+                self.logNetwork(report)
+                self.logAudio(report)
             }
             self.stats = updated
             DispatchQueue.main.async { [weak self] in self?.onStats?(updated) }
         }
+    }
+
+    /// Change of a cumulative stat since the previous call for `key`.
+    private func delta(_ key: String, _ value: NSObject?) -> Double {
+        let current = number(value)
+        defer { lastCounters[key] = current }
+        return current - (lastCounters[key] ?? current)
+    }
+
+    /// Where late frames come from, over the last 5 s: packet loss and
+    /// retransmission, the sender's own cadence, or delivery to the decoder.
+    private func logNetwork(_ report: RTCStatisticsReport) {
+        let all = report.statistics
+        guard let video = all.values.first(where: { $0.type == "inbound-rtp" && $0.values["kind"] as? String == "video" })?.values
+        else { return }
+        let assembled = delta("assembled", video["framesAssembledFromMultiplePackets"])
+        let assembly = delta("assembly", video["totalAssemblyTime"])
+        let arrival = decodeClock.snapshotArrival()
+        let gaps = renderer.snapshotGaps()
+        var path = "?"
+        if let pairId = all.values.first(where: { $0.type == "transport" })?.values["selectedCandidatePairId"] as? String,
+           let pair = all[pairId]?.values,
+           let local = (pair["localCandidateId"] as? String).flatMap({ all[$0]?.values }),
+           let remote = (pair["remoteCandidateId"] as? String).flatMap({ all[$0]?.values }) {
+            // For a host candidate the local address tells the interface;
+            // for a server-reflexive one it is the NAT mapping.
+            path = "\(local["candidateType"] ?? "?" as NSString)→\(remote["candidateType"] ?? "?" as NSString) \(local["networkType"] ?? "?" as NSString) \(local["protocol"] ?? "?" as NSString) \(local["address"] ?? local["ip"] ?? "?" as NSString) → \(remote["address"] ?? remote["ip"] ?? "?" as NSString)"
+        }
+        if !loggedCandidates {
+            // Once: how WebRTC ranks the local interfaces.
+            loggedCandidates = true
+            for candidate in all.values where candidate.type == "local-candidate" {
+                let v = candidate.values
+                LabLog.write("local candidate \(v["address"] ?? v["ip"] ?? "?" as NSString) \(v["networkType"] ?? "?" as NSString) \(v["candidateType"] ?? "?" as NSString) priority \(v["priority"] ?? 0 as NSNumber)")
+            }
+        }
+        LabLog.write(String(
+            format: "net 5s: lost %.0f nack %.0f retx %.0f pli %.0f freeze %.0f | assembly %.2f ms | frames %d late %d (max %.1f ms) bursts %d sender gaps %d | capture→decoder %@ ms | render gaps %d (max %.1f ms) | %@",
+            delta("lost", video["packetsLost"]), delta("nack", video["nackCount"]),
+            delta("retx", video["retransmittedPacketsReceived"]), delta("pli", video["pliCount"]),
+            delta("freeze", video["freezeCount"]),
+            assembled > 0 ? assembly / assembled * 1000 : 0,
+            arrival.frames, arrival.late, arrival.maxLateMs, arrival.bursts, arrival.senderGaps,
+            arrival.captureAgeMs.map { String(format: "%.1f", $0) } ?? "n/a",
+            gaps.count, gaps.maxMs, path))
+    }
+
+    /// Audio health: samples the jitter buffer produced, how many were
+    /// concealed, the output level (non-zero once playout pulls audio), and
+    /// the audio jitter buffer delay over the last interval.
+    private func logAudio(_ report: RTCStatisticsReport) {
+        let all = report.statistics.values
+        guard let inbound = all.first(where: { $0.type == "inbound-rtp" && $0.values["kind"] as? String == "audio" })?.values
+        else { return }
+        let level = String(format: "%.3f", number(inbound["audioLevel"]))
+        let emitted = delta("audioEmitted", inbound["jitterBufferEmittedCount"])
+        // Target includes A/V sync and playout-delay constraints; minimum is
+        // what the network jitter alone needs.
+        func perSample(_ key: String, _ stat: String) -> String {
+            let value = delta(key, inbound[stat])
+            return String(format: "%.1f", emitted > 0 ? value / emitted * 1000 : 0)
+        }
+        let jitterBuffer = perSample("audioDelay", "jitterBufferDelay")
+        let target = perSample("audioTarget", "jitterBufferTargetDelay")
+        let minimum = perSample("audioMinimum", "jitterBufferMinimumDelay")
+        let packets = delta("audioPackets", inbound["packetsReceived"]) / 5
+        LabLog.write("audio \(Int(packets)) pkt/s rx:\(Int(number(inbound["totalSamplesReceived"]))) concealed:\(Int(number(inbound["concealedSamples"]))) level:\(level) jb:\(jitterBuffer)ms target:\(target)ms minimum:\(minimum)ms")
     }
 
     private func number(_ value: NSObject?) -> Double {

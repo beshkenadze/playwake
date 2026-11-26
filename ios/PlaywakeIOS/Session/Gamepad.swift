@@ -12,7 +12,7 @@ final class Gamepad {
     }
 
     // Wire masks mirrored from media-worker/src/input.rs.
-    private enum Button {
+    enum Button {
         static let south: UInt16 = 16
         static let east: UInt16 = 32
         static let north: UInt16 = 64
@@ -34,7 +34,18 @@ final class Gamepad {
 
     private let lock = NSLock()
     private var current: GCController?
+    private var changeHandler: (() -> Void)?
+    /// Controller events arrive here instead of the main queue, which UI
+    /// work can hold up.
+    private let handlerQueue = DispatchQueue(label: "io.playwake.gamepad", qos: .userInteractive)
+
+    /// Called on every controller input change, so input can be sent at once.
+    var onChange: (() -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return changeHandler }
+        set { lock.lock(); changeHandler = newValue; lock.unlock() }
+    }
     private var observing = false
+    private var discoveryTimer: DispatchSourceTimer?
 
     private init() {}
 
@@ -54,13 +65,45 @@ final class Gamepad {
             if self?.current === controller { self?.current = nil }
             self?.lock.unlock()
         }
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        // macOS only delivers controller input to the focused app by default.
+        GCController.shouldMonitorBackgroundEvents = true
+        #endif
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
-        adopt(GCController.controllers().first)
+        let available = GCController.controllers()
+        LabLog.write("gamepad scan: \(available.count) controller(s)")
+        adopt(available.first)
+        // The HID manager comes up asynchronously, and on macOS a pad already
+        // connected is only exposed once the app is focused, so keep looking
+        // until one shows up instead of guessing a timeout.
+        guard discoveryTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 1, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let adopted = self.current != nil
+            self.lock.unlock()
+            guard !adopted else {
+                self.discoveryTimer?.cancel()
+                self.discoveryTimer = nil
+                return
+            }
+            let found = GCController.controllers()
+            if !found.isEmpty {
+                LabLog.write("gamepad retry: \(found.count) controller(s)")
+                self.adopt(found.first)
+            }
+        }
+        timer.resume()
+        discoveryTimer = timer
     }
 
     private func adopt(_ controller: GCController?) {
         guard let controller else { return }
         controller.playerIndex = .index1
+        controller.handlerQueue = handlerQueue
+        controller.extendedGamepad?.valueChangedHandler = { [weak self] _, _ in self?.onChange?() }
         lock.lock()
         current = controller
         lock.unlock()

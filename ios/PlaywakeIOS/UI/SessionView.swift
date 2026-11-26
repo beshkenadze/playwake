@@ -136,28 +136,48 @@ struct SessionView: View {
     private var signingInPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             if let device = controller.device {
-                Text("Enter this code at Microsoft")
+                Text("Scan the QR code or enter this code at Microsoft")
                     .font(.system(size: 13, weight: .semibold))
-                Text(device.code)
-                    .font(.system(size: 34, weight: .black, design: .monospaced))
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 10)
-                    .background(Color.white.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                    .textSelection(.enabled)
-                HStack(spacing: 12) {
+                HStack(alignment: .center, spacing: 20) {
                     if let url = device.url {
-                        Button(action: { openURL(url) }) {
-                            Label("Open Microsoft", systemImage: "safari")
+                        QRCodeView(text: url.absoluteString)
+                    }
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(device.code)
+                            .font(.system(size: 34, weight: .black, design: .monospaced))
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 10)
+                            .background(Color.white.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .textSelection(.enabled)
+                        if device.prefilled {
+                            Text("The link already includes the code")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        } else if let url = device.url {
+                            Text(url.host ?? "microsoft.com/link")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.borderedProminent)
+                        HStack(spacing: 12) {
+                            if let url = device.url {
+                                Button(action: { openURL(url) }) {
+                                    Label("Open Microsoft", systemImage: "safari")
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                            Button(action: {
+                                UIPasteboard.general.string = device.code
+                            }) {
+                                Label("Copy code", systemImage: "doc.on.doc")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .font(.system(size: 13, weight: .medium, design: .monospaced))
                     }
-                    Button(action: {
-                        UIPasteboard.general.string = device.code
-                    }) {
-                        Label("Copy code", systemImage: "doc.on.doc")
-                    }
-                    .buttonStyle(.bordered)
+                    Spacer(minLength: 0)
+                }
+                HStack {
                     Spacer()
                     Button("Cancel", role: .cancel) { controller.cancelSignIn() }
                         .buttonStyle(.bordered)
@@ -195,6 +215,26 @@ struct SessionView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 220)
+
+                Picker("Smoothing", selection: Binding(
+                    get: { controller.playoutMs },
+                    set: { controller.setPlayoutMs($0) })) {
+                    Text("Off").tag(0)
+                    Text("5 ms").tag(5)
+                    Text("10 ms").tag(10)
+                    Text("20 ms").tag(20)
+                    Text("50 ms").tag(50)
+                    Text("100 ms").tag(100)
+                    Text("150 ms").tag(150)
+                }
+                .pickerStyle(.menu)
+                .frame(width: 130)
+
+                Toggle("V-Sync", isOn: Binding(
+                    get: { controller.vsyncOn },
+                    set: { controller.setVsync($0) }))
+                    .toggleStyle(.switch)
+                    .font(.system(size: 12, design: .monospaced))
 
                 Button("Sign out") { controller.signOut() }
                     .font(.system(size: 12, design: .monospaced))

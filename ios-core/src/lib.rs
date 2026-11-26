@@ -18,11 +18,15 @@ mod session_store;
 mod xbox;
 #[path = "../../src/cloud.rs"]
 mod cloud;
+#[path = "../../media-worker/src/route.rs"]
+mod route;
 
 mod bridge;
 mod handshake;
+mod input_route;
 #[allow(dead_code)]
 mod sdp;
 mod wire;
 
 pub use bridge::*;
+pub use input_route::*;
