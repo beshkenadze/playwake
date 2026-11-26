@@ -45,6 +45,8 @@ pub fn pin() -> String {
 /// Sunshine. Blocks while the user enters `pin` on the host. On success the
 /// host certificate is stored in `host`.
 pub fn pair(host: &mut Host, identity: &Identity, pin: &str) -> Result<()> {
+    // The last step goes over HTTPS: know its port before the user enters the PIN.
+    host.learn_https_port(identity)?;
     let result = exchange(host, identity, pin);
     if result.is_err() {
         // Leave the host ready for another attempt.

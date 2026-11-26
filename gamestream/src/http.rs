@@ -140,6 +140,13 @@ impl Host {
         Self { address: address.to_owned(), http_port: HTTP_PORT, https_port: 0, certificate: None }
     }
 
+    /// Learns the host's HTTPS port from a plain answer, if it is not known
+    /// yet: `Host::new` cannot know it, and port 0 cannot be reached.
+    pub(crate) fn learn_https_port(&mut self, identity: &Identity) -> Result<()> {
+        if self.https_port == 0 { self.https_port = self.ask(identity, false)?.https_port; }
+        Ok(())
+    }
+
     /// Asks over HTTPS when paired. Only that answer is from the PC that was
     /// paired, so only it can say `paired`; a plain answer never does.
     pub fn info(&mut self, identity: &Identity) -> Result<ServerInfo> {
@@ -362,6 +369,27 @@ pub(crate) fn check_status(xml: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_host_learns_its_https_port_before_it_needs_it() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request);
+            let xml = "<root status_code=\"200\"><hostname>den</hostname><HttpsPort>47990</HttpsPort></root>";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{xml}", xml.len()).unwrap();
+        });
+        let mut host = Host { http_port: port, ..Host::new("127.0.0.1") };
+        assert_eq!(host.https_port, 0);
+        host.learn_https_port(&Identity::generate().unwrap()).unwrap();
+        server.join().unwrap();
+        assert_eq!(host.https_port, 47990);
+        // Known now: no second question.
+        host.learn_https_port(&Identity::generate().unwrap()).unwrap();
+    }
 
     #[test]
     fn an_asset_is_the_image_in_the_answer() {
