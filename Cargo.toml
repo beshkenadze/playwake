@@ -1,10 +1,10 @@
 [package]
 name = "playwake"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 
 [workspace]
-members = ["media-worker"]
+members = ["gamestream","media-worker"]
 default-members = ["."]
 
 [dependencies]
@@ -17,6 +17,8 @@ serde_json = "1"
 tempfile = "3"
 raw-window-handle = "0.6"
 uuid = { version = "1", features = ["v4"] }
+gamestream = { version = "0.1.0", path = "gamestream" }
+nucleo-matcher = "0.3.1"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 gilrs = "0.11"

@@ -1,6 +1,6 @@
 [package]
 name = "playwake-media"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 description = "Native GStreamer media worker for Playwake (replaces the PyGObject worker)"
 
@@ -20,3 +20,6 @@ evdev = "0.13"
 cairo-rs = { version = "0.20", features = ["xlib"] }
 x11-dl = "2"
 libc = "0.2"
+gamestream = { version = "0.1.0", path = "../gamestream" }
+gstreamer-app = { version = "0.23", features = ["v1_20"] }
+ash = "0.38"

@@ -7,6 +7,28 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Write;
 
+/// A paired Sunshine host and the app to stream from it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Pc {
+    pub address: String,
+    /// PEM of the certificate the host showed while pairing.
+    pub certificate: String,
+    /// PEM of this client's key and certificate.
+    pub client_key: String,
+    pub client_certificate: String,
+    pub app: u32,
+    pub fps: u32,
+    /// The other app the user agreed to end if the PC still runs it.
+    #[serde(default)]
+    pub end_other: Option<u32>,
+    /// The user wants HDR and the PC can encode it.
+    #[serde(default)]
+    pub hdr: bool,
+    /// The stream is smaller than the screen and SteamOS scales it up.
+    #[serde(default)]
+    pub scaled: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Command {
@@ -36,6 +58,12 @@ pub enum Command {
         volume: u32,
         #[serde(default = "default_console_name")]
         console_name: String,
+        /// The jitter buffer the user chose; absent for measurement runs.
+        #[serde(default)]
+        jitter_ms: Option<u32>,
+        /// Present for a stream from a PC instead of an Xbox.
+        #[serde(default)]
+        pc: Option<Pc>,
     },
     Answer {
         sdp: String,
@@ -73,11 +101,37 @@ pub enum Command {
     OverlaySelection {
         index: usize,
     },
+    /// Text typed on this device, for a PC stream.
+    Type {
+        text: String,
+    },
+    /// A key pressed and released, as a Windows virtual-key code, for a PC stream.
+    Key {
+        code: u8,
+    },
     InputFocus {
         active: bool,
     },
     Stats,
     Stop,
+    /// The LSFG preview: a made-up scene in the video window, no stream.
+    Preview {
+        width: u32,
+        height: u32,
+        /// The scene's rate; LSFG shows twice as many frames.
+        #[serde(default = "default_preview_fps")]
+        fps: u32,
+        #[serde(default)]
+        lsfg: bool,
+        #[serde(default)]
+        performance: bool,
+        #[serde(default)]
+        flow_scale: String,
+        #[serde(default)]
+        russian: bool,
+        #[serde(default)]
+        xbox_palette: bool,
+    },
 }
 
 fn default_width() -> u32 { 1920 }
@@ -86,6 +140,7 @@ fn default_renderer() -> String { "auto".into() }
 fn default_volume() -> u32 { 100 }
 fn default_console_name() -> String { "Xbox".into() }
 fn default_pulse_duration() -> u64 { 230 }
+fn default_preview_fps() -> u32 { 30 }
 
 pub fn parse(line: &str) -> Option<Command> {
     serde_json::from_str(line).ok()
@@ -147,6 +202,10 @@ mod tests {
         assert!(matches!(parse(r#"{"action":"overlay-open"}"#), Some(Command::OverlayOpen)));
         assert!(matches!(parse(r#"{"action":"diagnostics-toggle"}"#), Some(Command::DiagnosticsToggle)));
         assert!(matches!(parse(r#"{"action":"input-focus","active":false}"#), Some(Command::InputFocus { active: false })));
+        assert!(matches!(parse(r#"{"action":"type","text":"я"}"#), Some(Command::Type { text }) if text == "я"));
+        assert!(matches!(parse(r#"{"action":"key","code":13}"#), Some(Command::Key { code: 13 })));
+        assert!(matches!(parse(r#"{"action":"start","bitrate":1,"jitter_ms":5}"#), Some(Command::Start { jitter_ms: Some(5), .. })));
+        assert!(matches!(parse(r#"{"action":"start","bitrate":1,"jitter_ms":null}"#), Some(Command::Start { jitter_ms: None, .. })));
         assert!(matches!(parse(r#"{"action":"stop"}"#), Some(Command::Stop)));
     }
 

@@ -35,6 +35,7 @@ The Flatpak uses the Freedesktop 26.08 runtime. Cloud Gaming availability depend
 
 - **Remote Play.** Wake and stream from your Xbox. Enable auto-connect to start streaming when exactly one console is available.
 - **Xbox Cloud Gaming.** Browse the cloud catalog and launch a title from its own tab.
+- **PC games.** The **PC** tab finds PCs that run [Sunshine](https://github.com/LizardByte/Sunshine) on your network. Choose a PC to pair it: Playwake shows a PIN that you enter in the Sunshine web UI, once. After that the tab lists the PC's apps, and a stream plays in Playwake's own player with the same overlay, stats and controller handling as an Xbox stream. Playwake asks the PC for this device's resolution and refresh rate, at the bitrate of **Settings → Video → Bitrate from a PC** (5 to 150 Mbps, 20 by default). Video is H.264 in SDR. On an HDR screen under Gamescope, such as the Steam Deck OLED, a PC that encodes 10-bit HEVC streams in HDR instead; **Settings → Video → HDR from a PC** turns that off. Before a start would end another app that the PC still runs, Playwake asks.
 - **Fullscreen video.** Hardware decoding where available, configurable bitrate and resolution, Fit or Lanczos scaling, and optional Vulkan frame generation via [lsfg-vk](https://lsfg-vk.dev/).
 - **Live diagnostics.** See the negotiated resolution, actual bitrate, decoded and presented FPS, available RTT, video delay, and separate network and client frame-drop counters.
 
@@ -45,9 +46,9 @@ The Flatpak uses the Freedesktop 26.08 runtime. Cloud Gaming availability depend
 | **LB / RB** | Switch tabs |
 | **D-pad / left stick** | Move focus. Press **Up** from the first row to reach the tabs |
 | **A / B** | Select or go back |
-| **View + Menu together** | Open the Playwake stream overlay, with Xbox Guide, statistics, reconnect and end stream |
+| **View + Menu tapped together** | Open the Playwake stream overlay, with Xbox Guide, statistics, reconnect and end stream |
 
-The stream shows the overlay shortcut when it starts. On desktop, you can also right-click the video to open the overlay. See the [Linux setup guide](docs/development.md#lsfg-on-linux) for optional Lossless Scaling configuration.
+Tap both buttons at the same time; there is no need to hold them. The stream shows the overlay shortcut when it starts. On desktop, you can also right-click the video to open the overlay. See the [Linux setup guide](docs/development.md#lsfg-on-linux) for optional Lossless Scaling configuration.
 
 ## Project status
 

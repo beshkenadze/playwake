@@ -1,4 +1,4 @@
-use super::{DevicePrompt, RemotePlay, Window, assets, login_qr};
+use super::{DevicePrompt, PcDialog, RemotePlay, Window, assets, login_qr};
 use crate::session_store::{Language as Locale, Preferences};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -21,6 +21,23 @@ impl AssetSource for Branding {
     }
 }
 
+/// Tells a new confirming press from the one that opened a dialog. A held
+/// key repeats under X11 as fresh presses, so a press counts only after a
+/// second without one.
+pub struct Confirm(std::time::Instant);
+
+impl Confirm {
+    pub fn opened(now: std::time::Instant) -> Self {
+        Self(now)
+    }
+
+    pub fn press(&mut self, now: std::time::Instant) -> bool {
+        let deliberate = now.duration_since(self.0) >= std::time::Duration::from_secs(1);
+        self.0 = now;
+        deliberate
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Key {
     Up,
@@ -29,6 +46,13 @@ pub enum Key {
     Right,
     Accept,
     Back,
+    /// X: quits the app the PC runs.
+    Quit,
+    /// View: searches the library.
+    Search,
+    /// The triggers: the first name of the previous or next letter.
+    PreviousLetter,
+    NextLetter,
     Settings,
     Refresh,
     PreviousTab,
@@ -44,6 +68,10 @@ impl Key {
             "right" => Self::Right,
             "accept" | "enter" | "return" => Self::Accept,
             "back" | "escape" => Self::Back,
+            "quit" | "delete" => Self::Quit,
+            "search" => Self::Search,
+            "previous-letter" => Self::PreviousLetter,
+            "next-letter" => Self::NextLetter,
             "settings" => Self::Settings,
             "refresh" => Self::Refresh,
             "previous-tab" => Self::PreviousTab,
@@ -60,6 +88,24 @@ pub enum Action {
     Cloud,
     Play(usize),
     CloudGame(usize),
+    Pc,
+    /// A tile of the PC list.
+    PcHost(usize),
+    PcAdd,
+    /// Back from a PC's apps to the PC list.
+    PcList,
+    /// An app of the open PC.
+    PcGame(usize),
+    /// Quit the app the PC runs, after asking.
+    PcQuit(usize),
+    /// Asks before closing Playwake.
+    AskExit,
+    /// Switches the video settings between Xbox and PC.
+    VideoTarget,
+    /// The first name filed under a letter of the library's rail.
+    Letter(char),
+    /// Starts searching the library.
+    Search,
     SignIn,
     Browser,
     Cancel,
@@ -70,7 +116,11 @@ pub enum Action {
     ConfirmSignOut,
     Resolution,
     Bitrate,
+    Jitter,
     Upscale,
+    PcBitrate,
+    PcStreamHeight,
+    PcHdr,
     Lsfg,
     LsfgPerformance,
     LsfgFlowScale,
@@ -87,6 +137,7 @@ pub enum Tab {
     #[default]
     Xbox,
     Cloud,
+    Pc,
     Settings,
 }
 
@@ -95,18 +146,83 @@ impl Tab {
         match self {
             Self::Xbox => Action::Home,
             Self::Cloud => Action::Cloud,
+            Self::Pc => Action::Pc,
             Self::Settings => Action::Settings,
         }
     }
 
-    fn step(self, offset: isize) -> Self {
-        let tabs = [Self::Xbox, Self::Cloud, Self::Settings];
-        tabs[(self as isize + offset).rem_euclid(tabs.len() as isize) as usize]
+    /// The PC tab is skipped where Moonlight cannot be run.
+    fn step(self, offset: isize, pc: bool) -> Self {
+        let tabs = [Self::Xbox, Self::Cloud, Self::Pc, Self::Settings];
+        let tabs: Vec<Self> = tabs.into_iter().filter(|tab| pc || *tab != Self::Pc).collect();
+        let current = tabs.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
+        tabs[(current + offset).rem_euclid(tabs.len() as isize) as usize]
     }
 }
 
-const CLOUD_COLUMNS: usize = 3;
-const CLOUD_PAGE: usize = 9;
+/// A cover tile, 2:3 like a game's box, and the space around it.
+const TILE_W: f32 = 150.;
+const TILE_H: f32 = 225.;
+const TILE_GAP: f32 = 16.;
+const LIBRARY_PAD: f32 = 38.;
+/// The letter rail beside the grid, and the space between them.
+const RAIL_W: f32 = 34.;
+const RAIL_GAP: f32 = 12.;
+
+/// How many tiles fit across a library `width` points wide.
+pub fn library_columns(width: f32) -> usize {
+    (((width - 2. * LIBRARY_PAD - RAIL_W - RAIL_GAP + TILE_GAP) / (TILE_W + TILE_GAP)).floor() as usize).max(1)
+}
+
+/// The order a library shows its names in: all of them, or those that match
+/// the search, best first.
+pub fn library_view(names: &[&str], search: &str) -> Vec<usize> {
+    use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::{CaseMatching, Normalization, Pattern}};
+    if search.trim().is_empty() { return (0..names.len()).collect(); }
+    let pattern = Pattern::parse(search, CaseMatching::Ignore, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buffer = Vec::new();
+    let mut scored: Vec<(u32, usize)> = names.iter().enumerate()
+        .filter_map(|(index, name)| pattern.score(Utf32Str::new(name, &mut buffer), &mut matcher).map(|score| (score, index)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, index)| index).collect()
+}
+
+/// The letter a name is filed under: its first letter, or '#' for a name
+/// that starts with a digit or a sign.
+pub fn initial(name: &str) -> char {
+    name.chars().find(|c| c.is_alphanumeric())
+        .filter(|c| c.is_alphabetic())
+        .and_then(|c| c.to_uppercase().next())
+        .unwrap_or('#')
+}
+
+/// The order of names in a library: by the letter they are filed under,
+/// then by name, so each letter of the rail is one run of names.
+pub fn library_order(name: &str) -> (char, String) {
+    (initial(name), name.to_lowercase())
+}
+
+/// The position of the first name of the next (`direction` 1) or previous
+/// (-1) letter in `view`, or `position` when there is none.
+pub fn letter_jump(names: &[&str], view: &[usize], position: usize, direction: isize) -> usize {
+    let letter_at = |at: usize| view.get(at).map(|&index| initial(names[index]));
+    let Some(current) = letter_at(position) else { return position };
+    if direction > 0 {
+        (position..view.len()).find(|&at| letter_at(at) != Some(current)).unwrap_or(position)
+    } else {
+        // The start of the group before the current one.
+        let start = (0..=position).rev().take_while(|&at| letter_at(at) == Some(current)).last().unwrap_or(position);
+        let Some(previous) = start.checked_sub(1).and_then(letter_at) else { return start };
+        (0..start).find(|&at| letter_at(at) == Some(previous)).unwrap_or(start)
+    }
+}
+
+/// The position of the first name filed under `letter` in `view`.
+pub fn letter_position(names: &[&str], view: &[usize], letter: char) -> Option<usize> {
+    view.iter().position(|&index| initial(names[index]) == letter)
+}
 
 #[derive(Default)]
 pub struct Menu {
@@ -117,12 +233,49 @@ pub struct Menu {
     pub editing_value: bool,
     pub console: usize,
     pub cloud_game: usize,
+    /// The selected tile of the PC list; the last one adds a PC.
+    pub pc: usize,
+    /// The ID of the PC whose apps are shown instead of the PC list.
+    pub pc_open: Option<String>,
+    pub pc_game: usize,
+    pub pc_available: bool,
     pub browser_cancel: bool,
     pub confirming_sign_out: bool,
+    /// The video settings shown: a PC's instead of an Xbox's.
+    pub video_pc: bool,
+    /// Tiles across the library grid, as many as fit the window.
+    pub columns: usize,
+    /// What the library is filtered by, and whether typing goes there.
+    pub search: String,
+    pub searching: bool,
 }
 
 impl Menu {
+    /// Shows the other device's video settings. The rows below the switch
+    /// change, so the selection goes back to the switch.
+    pub fn switch_video_target(&mut self) {
+        self.video_pc = !self.video_pc;
+        self.editing_value = false;
+        if self.row.is_some() { self.row = Some(0); }
+    }
+
+    /// The selected position in the library on show, if one is.
+    pub fn library_position(&mut self) -> Option<&mut usize> {
+        match self.tab {
+            Tab::Cloud => Some(&mut self.cloud_game),
+            Tab::Pc if self.pc_open.is_some() => Some(&mut self.pc_game),
+            _ => None,
+        }
+    }
+
+    /// Ends the search; the library shows every name again.
+    pub fn end_search(&mut self) {
+        self.search.clear();
+        self.searching = false;
+    }
+
     pub fn select_tab(&mut self, tab: Tab) {
+        if tab != self.tab { self.end_search(); }
         self.tab = tab;
         self.focused_tab = None;
         self.row = None;
@@ -134,6 +287,21 @@ impl Menu {
         self.focused_tab = None;
         self.row = None;
         self.editing_value = false;
+    }
+
+    pub fn open_pc(&mut self, id: &str) {
+        self.pc_open = Some(id.to_owned());
+        self.pc_game = 0;
+        self.end_search();
+    }
+
+    /// Keeps the PC tab's selections inside a new catalog. A PC that is gone
+    /// or no longer paired closes, and the PC list shows again.
+    pub fn follow_pcs(&mut self, catalog: &crate::pc::Catalog) {
+        self.pc_open.take_if(|id| catalog.paired(id).is_none());
+        self.pc = self.pc.min(catalog.pcs.len());
+        let apps = self.pc_open.as_deref().map_or(0, |id| catalog.apps(id).len());
+        self.pc_game = self.pc_game.min(apps.saturating_sub(1));
     }
 
     pub fn navigate(
@@ -150,8 +318,8 @@ impl Menu {
             Tab::Xbox
         };
         match key {
-            PreviousTab => return run(self.tab.step(-1).action()),
-            NextTab => return run(self.tab.step(1).action()),
+            PreviousTab => return run(self.tab.step(-1, self.pc_available).action()),
+            NextTab => return run(self.tab.step(1, self.pc_available).action()),
             Settings => return run(other_tab.action()),
             Refresh => return run(Action::Refresh),
             _ => {}
@@ -159,8 +327,8 @@ impl Menu {
 
         if let Some(tab) = self.focused_tab {
             match key {
-                Left => self.focused_tab = Some(tab.step(-1)),
-                Right => self.focused_tab = Some(tab.step(1)),
+                Left => self.focused_tab = Some(tab.step(-1, self.pc_available)),
+                Right => self.focused_tab = Some(tab.step(1, self.pc_available)),
                 Accept => return run(tab.action()),
                 Down | Back => self.focused_tab = None,
                 _ => {}
@@ -168,16 +336,29 @@ impl Menu {
             return None;
         }
 
-        if self.tab == Tab::Cloud {
+        let back = if self.tab == Tab::Pc && self.pc_open.is_some() { Action::PcList } else { Action::Home };
+        let library = match self.tab {
+            Tab::Cloud => Some(&mut self.cloud_game),
+            Tab::Pc if self.pc_open.is_some() => Some(&mut self.pc_game),
+            Tab::Pc => Some(&mut self.pc),
+            _ => None,
+        };
+        let columns = if self.columns == 0 { 3 } else { self.columns };
+        if let Some(game) = library {
             let last = consoles.len().saturating_sub(1);
             match key {
-                Up if self.cloud_game < CLOUD_COLUMNS => self.focused_tab = Some(self.tab),
-                Up => self.cloud_game -= CLOUD_COLUMNS,
-                Down => self.cloud_game = (self.cloud_game + CLOUD_COLUMNS).min(last),
-                Left => self.cloud_game = self.cloud_game.saturating_sub(1),
-                Right => self.cloud_game = (self.cloud_game + 1).min(last),
-                Accept => return consoles.get(self.cloud_game.min(last)).copied().and_then(run),
-                Back => return run(Action::Home),
+                Up if *game < columns => self.focused_tab = Some(self.tab),
+                Up => *game -= columns,
+                Down => *game = (*game + columns).min(last),
+                Left => *game = game.saturating_sub(1),
+                Right => *game = (*game + 1).min(last),
+                Accept => return consoles.get((*game).min(last)).copied().and_then(run),
+                // The tile's own app, which a search may have moved.
+                Quit if self.tab == Tab::Pc && self.pc_open.is_some() => return match consoles.get(*game) {
+                    Some(&Action::PcGame(index)) => run(Action::PcQuit(index)),
+                    _ => None,
+                },
+                Back => return run(back),
                 _ => {}
             }
             return None;
@@ -190,6 +371,7 @@ impl Menu {
                 Left => self.console = self.console.saturating_sub(1),
                 Right => self.console = self.console.saturating_add(1).min(last),
                 Accept => return consoles.get(self.console.min(last)).copied().and_then(run),
+                Back => return run(Action::AskExit),
                 _ => {}
             }
             return None;
@@ -236,7 +418,7 @@ impl Action {
     fn adjustable(self) -> bool {
         matches!(
             self,
-            Self::Resolution | Self::Bitrate | Self::Volume | Self::Language | Self::Palette
+            Self::Resolution | Self::Bitrate | Self::PcBitrate | Self::PcStreamHeight | Self::Jitter | Self::Volume | Self::Language | Self::Palette
         )
     }
 }
@@ -255,6 +437,8 @@ const CARD: u32 = 0x2c2c2e;
 const LINE: u32 = 0x393b3b;
 const TEXT: u32 = 0xececec;
 const MUTED: u32 = 0xa1a1a6;
+const WARNING: u32 = 0xf5b041;
+const WARNING_CARD: u32 = 0x3a2c14;
 
 fn colors(prefs: Preferences) -> (u32, u32) {
     if prefs.xbox_palette {
@@ -281,6 +465,8 @@ struct Row {
     hint: &'static str,
     value: String,
     action: Option<Action>,
+    /// Something the user has to fix, drawn in the warning colour.
+    warning: bool,
 }
 
 impl Row {
@@ -295,11 +481,34 @@ impl Row {
             hint,
             value: value.into(),
             action,
+            warning: false,
         }
+    }
+
+    fn warning(label: &'static str, hint: &'static str) -> Self {
+        Self { warning: true, ..Self::new(label, hint, "", None) }
     }
 }
 
-fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize) -> Vec<Row> {
+fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize,
+    lsfg_missing: Option<crate::lsfg::Missing>, video_pc: bool) -> Vec<Row> {
+    use crate::lsfg::Missing;
+    // Without its parts LSFG cannot be turned on; a warning says what to install.
+    let lsfg_fix = match lsfg_missing {
+        None => "",
+        Some(Missing::Platform) => t.t("Только на Linux с Vulkan", "Linux with Vulkan only"),
+        Some(Missing::Parts { dll: true, layer: true }) => t.t(
+            "Установите слой Vulkan lsfg-vk 2.x (lsfg-vk.dev) и ветку lsfg-vk у Lossless Scaling: Steam → Свойства → Бета-версии",
+            "Install the lsfg-vk 2.x Vulkan layer (lsfg-vk.dev) and Lossless Scaling's lsfg-vk branch: Steam → Properties → Betas"),
+        Some(Missing::Parts { dll: true, .. }) => t.t(
+            "Переключите Lossless Scaling на ветку lsfg-vk: Steam → Свойства → Бета-версии",
+            "Switch Lossless Scaling to its lsfg-vk branch: Steam → Properties → Betas"),
+        Some(Missing::Parts { .. }) => t.t(
+            "Установите слой Vulkan lsfg-vk 2.x (lsfg-vk.dev)",
+            "Install the lsfg-vk 2.x Vulkan layer (lsfg-vk.dev)"),
+    };
+    let lsfg_ready = lsfg_missing.is_none();
+    let when_ready = |action: Action| lsfg_ready.then_some(action);
     use self::Action::*;
     let on = |value| {
         if value {
@@ -336,12 +545,15 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 signed_in.then_some(Refresh),
             ),
         ],
-        1 => vec![
+        // The video settings of an Xbox or of a PC, as the switch on top
+        // shows, then the ones both share.
+        1 => [Row::new(t.t("Настройки для", "Settings for"), "", "", Some(VideoTarget))].into_iter()
+            .chain(if !video_pc { vec![
             Row::new(
-                t.t("Запрашиваемое разрешение", "Requested resolution"),
+                t.t("Разрешение", "Resolution"),
                 t.t(
-                    "Фактический размер потока выбирает Xbox",
-                    "Xbox picks the actual stream size",
+                    "Xbox принимает только 720p, 1080p и 1440p, итоговый размер выбирает сама Xbox",
+                    "Xbox takes only 720p, 1080p and 1440p and picks the final size itself",
                 ),
                 format!("‹  {}p  ›", p.height),
                 Some(Resolution),
@@ -352,6 +564,40 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 format!("‹  {} {}  ›", p.bitrate_mbps, t.t("Мбит/с", "Mbps")),
                 Some(Bitrate),
             ),
+            // A PC's sound and picture play as they arrive, without this buffer.
+            Row::new(
+                t.t("Буфер джиттера", "Jitter buffer"),
+                t.t("Меньше — ниже задержка, больше — плавнее на Wi-Fi · со следующего подключения",
+                    "Lower cuts latency, higher smooths Wi-Fi · applies on reconnect"),
+                format!("‹  {} {}  ›", p.jitter_ms, t.t("мс", "ms")),
+                Some(Jitter),
+            ),
+            ] } else { vec![
+            Row::new(
+                t.t("Разрешение", "Resolution"),
+                t.t("ПК подстраивает свой дисплей под любое. Меньше экрана — растягивает SteamOS фильтром из его настроек (FSR, NIS…), больше — уменьшает Playwake · со следующего подключения",
+                    "The PC sets its display to any of them. Below the screen, SteamOS scales it up with the filter set there (FSR, NIS…); above it, Playwake scales it down · applies on reconnect"),
+                if p.pc_stream_height == 0 {
+                    format!("‹  {} · {}p  ›", t.t("Экран", "Screen"), crate::pc::Panel::of(crate::device::current()).height)
+                } else { format!("‹  {}p  ›", p.pc_stream_height) },
+                Some(PcStreamHeight),
+            ),
+            Row::new(
+                t.t("Битрейт", "Bitrate"),
+                t.t("Выше — чётче картинка, но нужен быстрый Wi-Fi · со следующего подключения",
+                    "Higher is sharper but needs fast Wi-Fi · applies on reconnect"),
+                format!("‹  {} {}  ›", p.pc_bitrate_mbps, t.t("Мбит/с", "Mbps")),
+                Some(PcBitrate),
+            ),
+            Row::new(
+                "HDR",
+                t.t("На HDR-экране, если ПК кодирует HDR · со следующего подключения",
+                    "On an HDR screen when the PC encodes HDR · applies on reconnect"),
+                on(p.pc_hdr),
+                Some(PcHdr),
+            ),
+            ] })
+            .chain([
             Row::new(
                 t.t("Апскейлинг", "Upscaling"),
                 t.t("Для видео меньше экрана · со следующего подключения",
@@ -359,38 +605,33 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                 if p.lanczos_upscale { "Lanczos" } else { t.t("Вписать", "Fit") },
                 Some(Upscale),
             ),
-            Row::new(
-                t.t("Полноэкранный режим", "Fullscreen"),
-                "",
-                t.t("Во время стрима", "While streaming"),
-                None,
-            ),
-        ],
-        2 => vec![
-            Row::new(
-                "LSFG 2×",
-                t.t(
-                    "Применяется при следующем подключении",
-                    "Applies on the next connection",
-                ),
-                on(p.lsfg_enabled),
-                Some(Lsfg),
-            ),
+        ]).collect(),
+        2 => lsfg_missing.map(|_| Row::warning(
+            t.t("LSFG не установлен", "LSFG is not installed"), lsfg_fix)).into_iter().chain([
+            Row {
+                warning: !lsfg_ready,
+                ..Row::new(
+                    "LSFG 2×",
+                    if lsfg_ready { t.t("Применяется при следующем подключении", "Applies on the next connection") } else { "" },
+                    if lsfg_ready { on(p.lsfg_enabled) } else { t.t("Не установлено", "Not installed") },
+                    when_ready(Lsfg),
+                )
+            },
             Row::new(
                 t.t("Режим LSFG", "LSFG mode"),
                 "",
                 if p.lsfg_performance { t.t("Производительность", "Performance") }
                 else { t.t("Качество", "Quality") },
-                Some(LsfgPerformance),
+                when_ready(LsfgPerformance),
             ),
-            Row::new("Flow Scale", "", p.lsfg_flow_scale(), Some(LsfgFlowScale)),
+            Row::new("Flow Scale", "", p.lsfg_flow_scale(), when_ready(LsfgFlowScale)),
             Row::new(
                 t.t("Предпросмотр LSFG", "LSFG preview"),
                 t.t("Сравнить движение и FPS вывода", "Compare motion and presentation FPS"),
                 t.t("Открыть", "Open"),
-                Some(LsfgPreview),
+                when_ready(LsfgPreview),
             ),
-        ],
+        ]).collect(),
         3 => vec![
             Row::new(
                 t.t("Громкость стрима", "Stream volume"),
@@ -417,6 +658,19 @@ fn rows(p: Preferences, t: &Text, signed_in: bool, count: usize, section: usize)
                     "Tap both buttons together",
                 ),
                 "View + Menu",
+                None,
+            ),
+            Row::new(
+                t.t("Завершить стрим", "End stream"),
+                t.t("Вместе нажмите View и Menu и, удерживая их, нажмите LB и RB",
+                    "Press View and Menu together, hold them, and press LB and RB"),
+                "View + Menu + LB + RB",
+                None,
+            ),
+            Row::new(
+                t.t("Статистика стрима", "Stream statistics"),
+                t.t("Зажмите LB, RB и X, затем нажмите View", "Hold LB, RB and X, then press View"),
+                "View + LB + RB + X",
                 None,
             ),
             Row::new(
@@ -484,10 +738,22 @@ pub fn setting_actions(v: &RemotePlay) -> Vec<Action> {
         v.account.is_some(),
         v.consoles.len(),
         v.menu.section,
+        v.lsfg_missing,
+        v.menu.video_pc,
     )
     .into_iter()
     .filter_map(|row| row.action)
     .collect()
+}
+
+/// The names of the library on show, in catalog order, when it is one that
+/// can be searched: Xbox Cloud games or a PC's apps.
+pub fn library_names(v: &RemotePlay) -> Option<Vec<&str>> {
+    match v.menu.tab {
+        Tab::Cloud => Some(v.cloud_catalog.iter().flatten().map(|game| game.name.as_str()).collect()),
+        Tab::Pc => v.menu.pc_open.as_deref().map(|id| v.pc_catalog.apps(id).into_iter().map(|game| game.name.as_str()).collect()),
+        _ => None,
+    }
 }
 
 pub fn order(v: &RemotePlay) -> Vec<Action> {
@@ -500,12 +766,19 @@ pub fn order(v: &RemotePlay) -> Vec<Action> {
     if v.sign_in.is_some() {
         return vec![Action::Cancel];
     }
+    if v.menu.tab == Tab::Pc {
+        return match (&v.menu.pc_open, library_names(v)) {
+            (Some(_), Some(names)) if names.is_empty() => vec![Action::Refresh],
+            (Some(_), Some(names)) => library_view(&names, &v.menu.search).into_iter().map(Action::PcGame).collect(),
+            _ => (0..v.pc_catalog.pcs.len()).map(Action::PcHost).chain([Action::PcAdd]).collect(),
+        };
+    }
     if v.account.is_none() {
         return vec![Action::SignIn];
     }
     if v.menu.tab == Tab::Cloud {
-        return match &v.cloud_catalog {
-            Some(catalog) if !catalog.is_empty() => (0..catalog.len()).map(Action::CloudGame).collect(),
+        return match library_names(v) {
+            Some(names) if !names.is_empty() => library_view(&names, &v.menu.search).into_iter().map(Action::CloudGame).collect(),
             _ => vec![Action::Refresh],
         };
     }
@@ -538,11 +811,18 @@ fn action(
         }))
 }
 
+/// A dialog's choice: the gamepad hint, which a tap or click takes too.
+fn dialog_choice(id: &'static str, label: &'static str, key: Key, unit: f32, cx: &mut Context<RemotePlay>) -> Stateful<Div> {
+    div().id(id).px(px(18. * unit)).py(px(10. * unit)).cursor_pointer().child(label)
+        .on_click(cx.listener(move |view, _, window, cx| { view.menu_key(key, window, cx); cx.notify(); }))
+}
+
 pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePlay>) -> AnyElement {
     let viewport = window.viewport_size();
     let unit = (f32::from(viewport.width) / 1280.)
         .min(f32::from(viewport.height) / 700.)
         .max(0.2);
+    v.menu.columns = library_columns(f32::from(viewport.width) / unit);
     let s = |p| px(p * unit);
     let t = Text(v.prefs.russian());
     let (accent, primary) = colors(v.prefs);
@@ -552,9 +832,41 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             .when(!preview.ready, |el| el.child(t.t("Открывается превью… · B Назад", "Starting preview… · B Back")))
             .into_any_element();
     }
+    if let Some((game, running, _)) = &v.pc_replace {
+        return div().id("pc-replace").size_full().bg(rgb(CANVAS)).text_color(rgb(TEXT)).track_focus(&v.keyboard_focus)
+            .flex().flex_col().items_center().justify_center().gap(s(18.))
+            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
+                if let Some(key) = Key::parse(ev.keystroke.key.as_str()) { view.menu_key(key, window, cx); cx.notify(); }
+            }))
+            .child(div().text_size(s(30.)).child(format!("{} {}", t.t("На ПК запущено:", "The PC is running:"), running.name)))
+            .child(div().max_w(s(820.)).text_center().text_color(rgb(MUTED)).child(format!("{} {} {}",
+                t.t("Запуск", "Starting"), game.name,
+                t.t("завершит его. Несохранённый прогресс в игре может пропасть.",
+                    "will end it. Unsaved progress in a game can be lost."))))
+            .child(div().flex().gap(s(24.)).text_color(rgb(accent))
+                .child(dialog_choice("pc-replace-accept", t.t("A Завершить и запустить", "A End it and start"), Key::Accept, unit, cx))
+                .child(dialog_choice("pc-replace-cancel", t.t("B Отмена", "B Cancel"), Key::Back, unit, cx)))
+            .into_any_element();
+    }
+    if let Some((pc, pin)) = &v.pc_pairing {
+        return div().id("pc-pairing").size_full().bg(rgb(CANVAS)).text_color(rgb(TEXT)).track_focus(&v.keyboard_focus)
+            .flex().flex_col().items_center().justify_center().gap(s(18.))
+            .child(div().text_size(s(30.)).child(format!("{} {}", t.t("Сопряжение с", "Pairing with"), pc.name)))
+            .child(div().text_size(s(96.)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(accent)).child(pin.clone()))
+            .child(div().max_w(s(760.)).text_center().text_color(rgb(MUTED)).child(format!("{} https://{}:47990/pin",
+                t.t("Введите этот PIN в веб-интерфейсе Sunshine:", "Enter this PIN in the Sunshine web UI:"), pc.address)))
+            .child(div().text_color(rgb(MUTED)).child(dialog_choice("pc-pairing-cancel", t.t("B Отмена", "B Cancel"), Key::Back, unit, cx)))
+            .into_any_element();
+    }
+    if let Some(dialog) = &v.pc_dialog {
+        return pc_dialog(v, dialog, &t, accent, unit, cx);
+    }
     let native_stream = v.stream.is_some() && super::x11_window(window).is_some();
     if native_stream && v.video_ready {
-        return div().size_full().bg(rgb(0)).into_any_element();
+        // The video window covers this one; it still takes what is typed.
+        return div().id("stream").size_full().bg(rgb(0)).track_focus(&v.keyboard_focus)
+            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _, _| { view.type_into_stream(&ev.keystroke); }))
+            .into_any_element();
     }
     let tabs_available = v.stream.is_none()
         && v.sign_in.is_none()
@@ -589,6 +901,7 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
     };
     let home = tab("Remote Play", Tab::Xbox, 0);
     let cloud = tab("Xbox Cloud", Tab::Cloud, 1);
+    let pc = tab(t.t("ПК", "PC"), Tab::Pc, 3);
     let settings = tab(t.t("Настройки", "Settings"), Tab::Settings, 2);
     let top = div()
         .h(s(72.))
@@ -608,7 +921,9 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                 .mr(s(16.))
                 .child("Playwake"),
         )
-        .when(tabs_available, |bar| bar.child(home).child(cloud).child(settings))
+        .when(tabs_available, |bar| {
+            bar.child(home).child(cloud).when(v.menu.pc_available, |bar| bar.child(pc)).child(settings)
+        })
         .child(div().flex_1())
         .when(v.account.is_none(), |bar| {
             bar.child(
@@ -620,7 +935,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
     let mut hints = vec![
         ("◀▶", t.t("Выбор", "Move")),
         ("A", t.t("Выбрать", "Select")),
-        ("B", t.t("Назад", "Back")),
+        // On the home screen B closes Playwake, after asking.
+        ("B", if v.menu.tab == Tab::Xbox { t.t("Выход", "Exit") } else { t.t("Назад", "Back") }),
     ];
     if v.menu.editing_value {
         hints = vec![
@@ -635,13 +951,35 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             ("↓", t.t("К содержимому", "Back to content")),
             ("LB/RB", t.t("Вкладки", "Tabs")),
         ];
-    } else if v.menu.tab != Tab::Settings && v.account.is_some() && v.stream.is_none() {
+    } else if v.menu.tab != Tab::Settings && (v.account.is_some() || v.menu.tab == Tab::Pc) && v.stream.is_none() {
+        let pc_list = v.menu.tab == Tab::Pc && v.menu.pc_open.is_none();
         hints = vec![
-            (if v.menu.tab == Tab::Cloud { "↔↕" } else { "◀▶" }, t.t("Выбор", "Move")),
-            ("A", t.t("Играть", "Play")),
+            (if v.menu.tab == Tab::Xbox { "◀▶" } else { "↔↕" }, t.t("Выбор", "Move")),
+            ("A", if pc_list { t.t("Открыть", "Open") } else { t.t("Играть", "Play") }),
             ("Y", t.t("Обновить", "Refresh")),
             ("LB/RB", t.t("Вкладки", "Tabs")),
         ];
+        if v.menu.tab == Tab::Pc && !pc_list {
+            let running = v.menu.pc_open.as_deref()
+                .and_then(|id| v.pc_catalog.apps(id).get(v.menu.pc_game).map(|game| game.running)).unwrap_or(false);
+            if running {
+                hints[1].1 = t.t("Продолжить", "Resume");
+                hints.insert(2, ("X", t.t("Завершить", "Quit")));
+            }
+            hints.push(("B", t.t("К списку ПК", "PC list")));
+        }
+        if library_names(v).is_some_and(|names| !names.is_empty()) {
+            if v.menu.searching || !v.menu.search.is_empty() {
+                hints = vec![
+                    ("⌨", t.t("Печатайте название", "Type a name")),
+                    ("A", t.t("Играть", "Play")),
+                    ("B", if v.menu.search.is_empty() { t.t("Закрыть поиск", "Close search") } else { t.t("Очистить", "Clear") }),
+                ];
+            } else {
+                hints.insert(2, ("View", t.t("Поиск", "Search")));
+                hints.insert(3, ("LT/RT", t.t("Буквы", "Letters")));
+            }
+        }
     } else if native_stream {
         hints = vec![("B", t.t("Отмена", "Cancel"))];
     } else if v.menu.tab == Tab::Settings {
@@ -736,7 +1074,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                     div()
                         .text_size(s(38.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(t.t("Подключение к Xbox", "Connecting to Xbox")),
+                        .child(if v.menu.tab == Tab::Pc { t.t("Подключение к ПК", "Connecting to PC") }
+                            else { t.t("Подключение к Xbox", "Connecting to Xbox") }),
                 )
                 .child(div().text_color(rgb(MUTED)).child(v.status.clone()))
                 .child(
@@ -850,6 +1189,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             v.account.is_some(),
             v.consoles.len(),
             v.menu.section,
+            v.lsfg_missing,
+            v.menu.video_pc,
         );
         let side = div()
             .w(s(295.))
@@ -902,7 +1243,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             )
             .children(current_rows.into_iter().enumerate().map(|(i, row)| {
                 let inner = div()
-                    .bg(rgb(CARD))
+                    .bg(rgb(if row.warning && row.value.is_empty() { WARNING_CARD } else { CARD }))
+                    .when(row.warning && row.value.is_empty(), |d| d.border(s(2.)).border_color(rgb(WARNING)))
                     .rounded(s(10.))
                     .min_h(s(62.))
                     .px(s(18.))
@@ -911,23 +1253,33 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                     .items_center()
                     .justify_between()
                     .gap(s(16.))
-                    .child(div().flex().flex_col().child(row.label).when(
-                        !row.hint.is_empty(),
-                        |d| {
-                            d.child(
-                                div()
-                                    .text_size(s(14.))
-                                    .text_color(rgb(MUTED))
-                                    .child(row.hint),
-                            )
-                        },
-                    ))
-                    .child(
+                    .child(div().flex_1().min_w_0().flex().flex_col().gap(s(4.))
+                        .child(div().when(row.warning && row.value.is_empty(), |d| d
+                            .text_color(rgb(WARNING)).font_weight(FontWeight::SEMIBOLD))
+                            .child(row.label))
+                        .when(!row.hint.is_empty(), |d| {
+                            d.child(if row.warning {
+                                div().text_size(s(17.)).text_color(rgb(TEXT))
+                            } else {
+                                div().text_size(s(14.)).text_color(rgb(MUTED))
+                            }.child(row.hint))
+                        }))
+                    .child(if row.action == Some(Action::VideoTarget) {
+                        // Both choices, the active one filled.
+                        div().flex_none().flex().gap(s(6.)).children([("Xbox", false), (t.t("ПК", "PC"), true)].map(|(label, pc)| {
+                            let active = v.menu.video_pc == pc;
+                            div().px(s(18.)).py(s(6.)).rounded(s(8.))
+                                .bg(rgb(if active { accent } else { CANVAS }))
+                                .text_color(rgb(if active { CANVAS } else { MUTED }))
+                                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                .child(label)
+                        }))
+                    } else {
                         div()
                             .flex_none()
-                            .text_color(rgb(if row.action.is_some() { TEXT } else { MUTED }))
-                            .child(row.value),
-                    );
+                            .text_color(rgb(if row.warning { WARNING } else if row.action.is_some() { TEXT } else { MUTED }))
+                            .child(row.value)
+                    });
                 if let Some(command) = row.action {
                     let selected = v.menu.row == Some(active_index) && v.menu.focused_tab.is_none();
                     active_index += 1;
@@ -952,12 +1304,42 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
             .when(!v.status.is_empty(), |el| {
                 el.child(
                     div()
-                        .text_size(s(14.))
-                        .text_color(rgb(MUTED))
+                        .text_size(s(17.))
+                        .text_color(rgb(WARNING))
                         .child(v.status.clone()),
                 )
             });
         body = body.child(div().size_full().flex().child(side).child(content));
+    } else if v.menu.tab == Tab::Pc {
+        use crate::pc::Computer;
+        let open = v.menu.pc_open.as_deref().and_then(|id| v.pc_catalog.paired(id));
+        let labels: Vec<String> = match open {
+            Some(pc) => v.pc_catalog.apps(pc.id()).iter().map(|game| game.name.clone()).collect(),
+            None => v.pc_catalog.pcs.iter().map(|computer| match computer {
+                Computer::Paired(pc) => pc.name.clone(),
+                Computer::Unpaired(pc) => format!("{}: {}", t.t("Сопрячь", "Pair"), pc.name),
+                Computer::Offline(pc) => format!("{} · {}", pc.name, t.t("не в сети", "offline")),
+            }).chain([t.t("Добавить ПК по адресу", "Add a PC by address").to_owned()]).collect(),
+        };
+        // Only a PC's apps have covers; the PC list has none.
+        let keys: Vec<String> = open.map(|pc| v.pc_catalog.apps(pc.id()).iter().map(|game| game.cover()).collect())
+            .unwrap_or_default();
+        let covers = labels.iter().enumerate().map(|(index, _)| keys.get(index).map(String::as_str)).collect();
+        let loading = v.pc_loading.then(|| t.t("Поиск ПК…", "Looking for PCs…"));
+        let none_found = open.is_none() && v.pc_catalog.pcs.is_empty() && loading.is_none();
+        body = body.child(library(v, Library {
+            id: if open.is_some() { "pc-game" } else { "pc" },
+            title: open.map_or(t.t("ПК", "PCs"), |pc| pc.name.as_str()),
+            names: labels.iter().map(String::as_str).collect(), covers, cover_set: &crate::pc::COVERS,
+            selected: if open.is_some() { v.menu.pc_game } else { v.menu.pc },
+            loading,
+            error: v.pc_error.as_deref().or(none_found.then(||
+                t.t("ПК с Sunshine в сети не найдены.", "No PC with Sunshine found on the network."))),
+            empty: t.t("На этом ПК нет приложений.", "This PC has no apps."),
+            refresh: t.t("Обновить список", "Refresh list"),
+            running: open.and_then(|pc| v.pc_catalog.apps(pc.id()).iter().position(|game| game.running)),
+            searchable: open.is_some(),
+        }, accent, unit, cx));
     } else if v.account.is_none() {
         let waiting = v.sign_in.is_some();
         body = hero(body, unit).child(
@@ -1010,7 +1392,22 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
                 ),
         );
     } else if v.menu.tab == Tab::Cloud {
-        body = body.child(cloud_library(v, &t, accent, unit, cx));
+        let names = v.cloud_catalog.iter().flatten().map(|game| game.name.as_str()).collect();
+        let covers = v.cloud_catalog.iter().flatten().map(|game| game.cover.as_deref()).collect();
+        body = body.child(library(v, Library {
+            id: "cloud-game", title: "Xbox Cloud Gaming", names, covers, cover_set: &crate::cloud::COVERS,
+            selected: v.menu.cloud_game,
+            loading: v.cloud_loading.then(|| if v.cloud_catalog.is_some() {
+                t.t("Обновление каталога…", "Refreshing cloud library…")
+            } else {
+                t.t("Загрузка каталога…", "Loading cloud library…")
+            }),
+            error: v.cloud_error.as_deref(),
+            empty: t.t("Для этого аккаунта нет доступных облачных игр.", "No cloud games are available for this account."),
+            refresh: t.t("Обновить каталог", "Refresh library"),
+            running: None,
+            searchable: true,
+        }, accent, unit, cx));
     } else {
         let heading = div()
             .flex()
@@ -1184,6 +1581,8 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         .flex_col()
         .track_focus(&v.keyboard_focus)
         .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
+            if view.type_into_stream(&ev.keystroke) { return; }
+            if view.type_into_search(&ev.keystroke) { cx.notify(); return; }
             let mapped = Key::parse(ev.keystroke.key.as_str());
             if let Some(key) = mapped {
                 view.menu_key(key, window, cx);
@@ -1196,44 +1595,232 @@ pub fn render(v: &mut RemotePlay, window: &mut Window, cx: &mut Context<RemotePl
         .into_any_element()
 }
 
-fn cloud_library(v: &RemotePlay, t: &Text, accent: u32, unit: f32, cx: &mut Context<RemotePlay>) -> Div {
-    let s = |p| px(p * unit);
-    let games = v.cloud_catalog.as_deref().unwrap_or_default();
-    let start = (v.menu.cloud_game / CLOUD_PAGE) * CLOUD_PAGE;
-    let end = (start + CLOUD_PAGE).min(games.len());
-    let mut page = div().p(s(38.)).size_full().flex().flex_col().gap(s(16.))
-        .child(div().text_size(s(34.)).font_weight(FontWeight::SEMIBOLD).child("Xbox Cloud Gaming"));
-    if v.cloud_loading {
-        page = page.child(if v.cloud_catalog.is_some() {
-            t.t("Обновление каталога…", "Refreshing cloud library…")
-        } else {
-            t.t("Загрузка каталога…", "Loading cloud library…")
-        });
+/// What a key asks of a PC dialog.
+#[derive(Debug, PartialEq)]
+pub enum PcStep {
+    Close,
+    QuitApp,
+    Add,
+    Exit,
+}
+
+/// The step a key asks of a PC dialog, or `None` to keep it, maybe changed.
+pub fn pc_dialog_step(dialog: &mut PcDialog, key: Key) -> Option<PcStep> {
+    match (dialog, key) {
+        (_, Key::Back) => Some(PcStep::Close),
+        (PcDialog::Quit(_), Key::Accept) => Some(PcStep::QuitApp),
+        (PcDialog::Exit, Key::Accept) => Some(PcStep::Exit),
+        (PcDialog::Address(address), Key::Accept) if !address.is_empty() => Some(PcStep::Add),
+        _ => None,
     }
-    if let Some(error) = &v.cloud_error {
-        page = page.child(div().text_color(rgb(MUTED)).child(error.clone()));
+}
+
+/// Adds a typed character of a host name or an IP address, or removes one on
+/// backspace. Returns whether the keystroke edited the address.
+pub fn edit_address(address: &mut String, key: &str, typed: Option<&str>) -> bool {
+    if key == "backspace" {
+        address.pop();
+        return true;
     }
-    if games.is_empty() && !v.cloud_loading {
-        if v.cloud_error.is_none() {
-            page = page.child(t.t("Для этого аккаунта нет доступных облачных игр.", "No cloud games are available for this account."));
+    match typed {
+        Some(text) if !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || ".:-".contains(c)) => {
+            address.push_str(text);
+            true
         }
-        return page.child(action(("cloud-refresh", 0), div().p(s(12.))
-            .child(t.t("Обновить каталог", "Refresh library")), Action::Refresh,
+        _ => false,
+    }
+}
+
+fn pc_dialog(v: &RemotePlay, dialog: &PcDialog, t: &Text, accent: u32, unit: f32, cx: &mut Context<RemotePlay>) -> AnyElement {
+    let s = |p| px(p * unit);
+    let screen = div().id("pc-dialog").size_full().bg(rgb(CANVAS)).text_color(rgb(TEXT)).track_focus(&v.keyboard_focus)
+        .flex().flex_col().items_center().justify_center().gap(s(18.))
+        .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
+            if !view.type_into_address(&ev.keystroke) && let Some(key) = Key::parse(ev.keystroke.key.as_str()) {
+                view.menu_key(key, window, cx);
+            }
+            cx.notify();
+        }));
+    let choices = |accept: &'static str, back: &'static str, cx: &mut Context<RemotePlay>| div().flex().gap(s(24.))
+        .text_color(rgb(accent))
+        .child(dialog_choice("pc-dialog-accept", accept, Key::Accept, unit, cx))
+        .child(dialog_choice("pc-dialog-back", back, Key::Back, unit, cx));
+    match dialog {
+        PcDialog::Exit => screen
+            .child(div().text_size(s(30.)).child(t.t("Выйти из Playwake?", "Exit Playwake?")))
+            .child(choices(t.t("A Выйти", "A Exit"), t.t("B Отмена", "B Cancel"), cx)),
+        PcDialog::Quit(game) => screen
+            .child(div().text_size(s(30.)).child(format!("{} {}?", t.t("Завершить", "Quit"), game.name)))
+            .child(div().max_w(s(820.)).text_center().text_color(rgb(MUTED)).child(t.t(
+                "Несохранённый прогресс в игре будет потерян.", "Unsaved progress in a game will be lost.")))
+            .child(choices(t.t("A Завершить", "A Quit"), t.t("B Отмена", "B Cancel"), cx)),
+        PcDialog::Address(address) => screen
+            .child(div().text_size(s(30.)).child(t.t("Добавить ПК по адресу", "Add a PC by address")))
+            .child(div().text_color(rgb(MUTED)).child(t.t(
+                "Введите IP-адрес или имя ПК с Sunshine.", "Enter the IP address or name of the PC with Sunshine.")))
+            .child(div().min_w(s(420.)).px(s(18.)).py(s(12.)).bg(rgb(CARD)).rounded(s(10.)).text_size(s(26.))
+                .child(format!("{address}▏")))
+            .child(div().text_color(rgb(MUTED)).child(t.t("Клавиатура Steam: Steam + X", "Steam keyboard: Steam + X")))
+            .child(choices(t.t("A Добавить", "A Add"), t.t("B Отмена", "B Cancel"), cx)),
+    }
+    .into_any_element()
+}
+
+/// A paged grid of names: the cloud catalog, the PCs, or the apps of a PC.
+/// Each tile does what `order` gives for it.
+struct Library<'a> {
+    id: &'static str,
+    title: &'a str,
+    /// Every name, in catalog order.
+    names: Vec<&'a str>,
+    /// The cover URL of each name, and where the cover cache keeps them.
+    covers: Vec<Option<&'a str>>,
+    cover_set: &'static crate::covers::Set,
+    /// The selected position in the view.
+    selected: usize,
+    loading: Option<&'static str>,
+    error: Option<&'a str>,
+    empty: &'static str,
+    refresh: &'static str,
+    /// The app the PC runs, which offers resume and quit on its tile.
+    running: Option<usize>,
+    /// Games, which a search filters and the letter rail files.
+    searchable: bool,
+}
+
+/// The first letters of a name's first two words, for a tile without a cover.
+fn monogram(name: &str) -> String {
+    name.split_whitespace().filter_map(|word| word.chars().find(|c| c.is_alphanumeric()))
+        .take(2).flat_map(char::to_uppercase).collect()
+}
+
+/// A tile for a game whose cover is missing or still on its way: a colour
+/// of its own from the name, and `mark`, its first letters, large.
+fn placeholder(name: &str, mark: String, unit: f32) -> Div {
+    let s = |p| px(p * unit);
+    let hue = name.bytes().fold(7u32, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte.into())) % 360;
+    let hue = hue as f32 / 360.;
+    div().size_full().relative().flex().flex_col().items_center().justify_center()
+        .bg(linear_gradient(160., linear_color_stop(hsla(hue, 0.45, 0.36, 1.), 0.),
+            linear_color_stop(hsla((hue + 0.1) % 1., 0.5, 0.16, 1.), 1.)))
+        .child(div().text_size(s(52.)).font_weight(FontWeight::BOLD).text_color(rgba(0xffffffd9)).child(mark))
+}
+
+fn library(v: &RemotePlay, list: Library, accent: u32, unit: f32, cx: &mut Context<RemotePlay>) -> Div {
+    let s = |p| px(p * unit);
+    let t = Text(v.prefs.russian());
+    let games = &list.names;
+    let actions = order(v);
+    let view = if list.searchable { library_view(games, &v.menu.search) } else { (0..games.len()).collect() };
+    let columns = if v.menu.columns == 0 { 3 } else { v.menu.columns };
+    let mut header = div().flex().items_center().gap(s(16.))
+        .child(div().text_size(s(34.)).font_weight(FontWeight::SEMIBOLD).child(list.title.to_owned()));
+    // With names on show, a refresh is a note in the header, so the grid
+    // does not jump.
+    if let (Some(loading), false) = (list.loading, games.is_empty()) {
+        header = header.child(div().text_size(s(15.)).text_color(rgb(MUTED)).child(loading));
+    }
+    if list.searchable && !games.is_empty() {
+        header = header.child(div().text_color(rgb(MUTED)).child(if view.len() == games.len() {
+            games.len().to_string() } else { format!("{} / {}", view.len(), games.len()) }));
+        let typing = v.menu.searching;
+        let field = if v.menu.search.is_empty() && !typing {
+            div().text_color(rgb(MUTED)).child(t.t("Поиск · View", "Search · View"))
+        } else {
+            div().child(format!("{}{}", v.menu.search, if typing { "▏" } else { "" }))
+        };
+        header = header.child(div().flex_1()).child(div().id((list.id, usize::MAX - 1)).w(s(320.)).h(s(40.)).px(s(14.))
+            .flex().items_center().rounded(s(10.)).bg(rgb(CARD)).border(s(2.))
+            .border_color(rgb(if typing { accent } else { LINE })).cursor_pointer().child(field)
+            .on_click(cx.listener(|view, _, window, cx| { view.activate(Action::Search, 1, window, cx); cx.notify(); })));
+    }
+    let mut page = div().p(s(LIBRARY_PAD)).pb(s(12.)).size_full().flex().flex_col().gap(s(16.)).child(header);
+    if let (Some(loading), true) = (list.loading, games.is_empty()) {
+        page = page.child(div().text_color(rgb(MUTED)).child(loading));
+    }
+    if let Some(error) = list.error {
+        page = page.child(div().text_color(rgb(MUTED)).child(error.to_owned()));
+    }
+    if games.is_empty() && list.loading.is_none() {
+        if list.error.is_none() {
+            page = page.child(list.empty);
+        }
+        return page.child(action((list.id, usize::MAX), div().p(s(12.))
+            .child(list.refresh), Action::Refresh,
             v.menu.focused_tab.is_none(), accent, unit, cx).w(s(240.)));
     }
-    for (row, chunk) in games[start..end].chunks(CLOUD_COLUMNS).enumerate() {
-        page = page.child(div().flex().gap(s(14.)).children(chunk.iter().enumerate().map(|(column, game)| {
-            let index = start + row * CLOUD_COLUMNS + column;
-            let card = div().w(s(335.)).h(s(76.)).px(s(14.)).flex().items_center()
-                .bg(rgb(CARD)).rounded(s(10.)).text_size(s(18.)).child(game.name.clone());
-            action(("cloud-game", index), card, Action::CloudGame(index),
-                v.menu.cloud_game == index && v.menu.focused_tab.is_none(), accent, unit, cx)
+    if view.is_empty() {
+        return page.child(div().text_color(rgb(MUTED)).child(format!("{} «{}»",
+            t.t("Ничего не найдено по", "Nothing matches"), v.menu.search)));
+    }
+    // The selected row scrolls into sight once, when it changes, so the grid
+    // still scrolls by touch.
+    let selected = list.selected.min(view.len() - 1);
+    if v.library_scrolled.get() != Some((list.id, selected)) {
+        v.library_scroll.scroll_to_item(selected / columns);
+        v.library_scrolled.set(Some((list.id, selected)));
+    }
+    let focused = v.menu.focused_tab.is_none();
+    let rows = view.chunks(columns).enumerate().map(|(row, chunk)| {
+        div().flex().gap(s(TILE_GAP)).children(chunk.iter().enumerate().map(|(column, &index)| {
+            let position = row * columns + column;
+            let selected = list.selected == position && focused;
+            let name = games[index];
+            let key = list.covers.get(index).copied().flatten();
+            let cover = key.and_then(|key| crate::covers::file(list.cover_set, key));
+            let command = actions.get(position).copied().unwrap_or(Action::Refresh);
+            let mark = if command == Action::PcAdd { "+".to_owned() } else { monogram(name) };
+            let art = match cover {
+                Some(path) => img(path).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                None if key.is_some() && v.covers_loading > 0 => placeholder(name, mark, unit)
+                    .with_animation(("cover-loading", index), Animation::new(std::time::Duration::from_millis(1400))
+                        .repeat().with_easing(pulsating_between(0.55, 1.)), |tile, delta| tile.opacity(delta))
+                    .into_any_element(),
+                None => placeholder(name, mark, unit).into_any_element(),
+            };
+            let mut tile = div().w(s(TILE_W)).h(s(TILE_H)).rounded(s(10.)).overflow_hidden().relative().bg(rgb(CARD)).child(art);
+            if list.running == Some(index) {
+                let chip = |label: &'static str| div().px(s(8.)).py(s(3.)).rounded(s(7.)).bg(rgba(0x000000b3)).text_size(s(13.)).child(label);
+                tile = tile.child(div().absolute().top(s(8.)).left(s(8.)).child(chip(t.t("● Запущено", "● Running"))))
+                    .child(div().absolute().bottom(s(8.)).left(s(8.)).right(s(8.)).flex().justify_between()
+                        .child(chip(t.t("▶ A", "▶ A")))
+                        .child(chip(t.t("■ X", "■ X")).id(("pc-quit", index)).cursor_pointer()
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                cx.stop_propagation();
+                                view.activate(Action::PcQuit(index), 1, window, cx);
+                                cx.notify();
+                            }))));
+            }
+            div().flex().flex_col().gap(s(6.))
+                // The selected cover has a heavier frame, seen from across the room.
+                .child(action((list.id, index), tile, command, selected, accent, unit, cx)
+                    .when(selected, |frame| frame.border(s(4.)).rounded(s(14.))))
+                .child(div().w(s(TILE_W)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(s(14.))
+                    .text_color(rgb(if selected { TEXT } else { MUTED }))
+                    .when(selected, |label| label.font_weight(FontWeight::SEMIBOLD)).child(name.to_owned()))
+        }))
+    });
+    let grid = div().id((list.id, usize::MAX - 2)).flex_1().min_h(px(0.)).overflow_y_scroll().track_scroll(&v.library_scroll)
+        .flex().flex_col().gap(s(14.)).children(rows);
+    // Letters to jump to, while the names are in their own order.
+    let mut letters: Vec<char> = Vec::new();
+    if list.searchable && v.menu.search.is_empty() {
+        for &index in &view {
+            let letter = initial(games[index]);
+            if letters.last() != Some(&letter) { letters.push(letter); }
+        }
+    }
+    let current = view.get(list.selected).map(|&index| initial(games[index]));
+    let rail = (letters.len() > 1).then(|| div().w(s(RAIL_W)).flex().flex_col().items_center().gap(s(1.))
+        .children(letters.into_iter().enumerate().map(|(at, letter)| {
+            let on = current == Some(letter);
+            div().id(("letter", at)).w_full().text_center().rounded(s(6.)).text_size(s(13.)).cursor_pointer()
+                .text_color(rgb(if on { CANVAS } else { MUTED })).when(on, |el| el.bg(rgb(accent)).font_weight(FontWeight::BOLD))
+                .child(letter.to_string())
+                .on_click(cx.listener(move |view, _, window, cx| { view.activate(Action::Letter(letter), 1, window, cx); cx.notify(); }))
         })));
-    }
-    if !games.is_empty() {
-        page = page.child(div().text_color(rgb(MUTED)).child(format!("{}–{} / {}", start + 1, end, games.len())));
-        if !v.status.is_empty() { page = page.child(div().text_color(rgb(MUTED)).child(v.status.clone())); }
-    }
+    page = page.child(div().flex_1().min_h(px(0.)).flex().gap(s(RAIL_GAP)).child(grid).children(rail));
+    if !v.status.is_empty() { page = page.child(div().text_color(rgb(MUTED)).child(v.status.clone())); }
     page
 }
 
@@ -1254,7 +1841,17 @@ fn hero(body: Div, unit: f32) -> Div {
 
 #[cfg(test)]
 mod navigation_tests {
-    use super::{Action, Key, Menu, Tab};
+    use super::{Action, Confirm, Key, Menu, Tab};
+
+    #[test]
+    fn a_held_key_does_not_confirm_the_dialog_it_opened() {
+        let ms = std::time::Duration::from_millis;
+        let opened = std::time::Instant::now();
+        let mut confirm = Confirm::opened(opened);
+        // The key repeats after half a second and then every 40 ms.
+        assert!((0..50).all(|repeat| !confirm.press(opened + ms(500 + repeat * 40))));
+        assert!(confirm.press(opened + ms(500 + 49 * 40 + 1000)));
+    }
 
     #[test]
     fn focus_and_active_tab_are_independent() {
@@ -1310,5 +1907,177 @@ mod navigation_tests {
         menu.navigate(Key::Up, &rows, &[]);
         assert!(!menu.editing_value);
         assert_eq!(menu.focused_tab, Some(Tab::Settings));
+    }
+
+    #[test]
+    fn the_pc_tab_is_reachable_only_where_it_is_available() {
+        let mut menu = Menu::default();
+        menu.select_tab(Tab::Cloud);
+        assert_eq!(menu.navigate(Key::NextTab, &[], &[]), Some((Action::Settings, 1)));
+        menu.pc_available = true;
+        assert_eq!(menu.navigate(Key::NextTab, &[], &[]), Some((Action::Pc, 1)));
+        menu.select_tab(Tab::Settings);
+        assert_eq!(menu.navigate(Key::PreviousTab, &[], &[]), Some((Action::Pc, 1)));
+    }
+
+    #[test]
+    fn the_pc_grid_moves_by_columns_and_starts_the_selected_game() {
+        let mut menu = Menu::default();
+        menu.select_tab(Tab::Pc);
+        menu.open_pc("den");
+        let games: Vec<Action> = (0..5).map(Action::PcGame).collect();
+        menu.navigate(Key::Down, &[], &games);
+        menu.navigate(Key::Right, &[], &games);
+        assert_eq!(menu.pc_game, 4);
+        assert_eq!(menu.cloud_game, 0);
+        assert_eq!(menu.navigate(Key::Accept, &[], &games), Some((Action::PcGame(4), 1)));
+    }
+
+    #[test]
+    fn the_search_finds_names_loosely_best_first() {
+        let names = ["BALL x PIT", "Balatro", "Diablo® IV", "No Man's Sky", "Desktop"];
+        assert_eq!(super::library_view(&names, ""), [0, 1, 2, 3, 4]);
+        assert_eq!(super::library_view(&names, "diablo")[0], 2);
+        assert_eq!(super::library_view(&names, "nms")[0], 3);
+        assert!(super::library_view(&names, "zzz").is_empty());
+    }
+
+    #[test]
+    fn names_are_filed_under_their_first_letter() {
+        assert_eq!(super::initial("ball x pit"), 'B');
+        assert_eq!(super::initial("“Nodebuster”"), 'N');
+        assert_eq!(super::initial("7 Days to Die"), '#');
+        assert_eq!(super::monogram("No Man's Sky"), "NM");
+        assert_eq!(super::monogram("Desktop"), "D");
+    }
+
+    #[test]
+    fn the_triggers_jump_between_letters() {
+        let names = ["Balatro", "BALL x PIT", "Cyberpunk 2077", "Desktop", "Diablo IV"];
+        let view: Vec<usize> = (0..names.len()).collect();
+        assert_eq!(super::letter_jump(&names, &view, 0, 1), 2);
+        assert_eq!(super::letter_jump(&names, &view, 2, 1), 3);
+        assert_eq!(super::letter_jump(&names, &view, 4, 1), 4);
+        // Back goes to the start of the letter before, from anywhere in a letter.
+        assert_eq!(super::letter_jump(&names, &view, 4, -1), 2);
+        assert_eq!(super::letter_jump(&names, &view, 2, -1), 0);
+        assert_eq!(super::letter_jump(&names, &view, 1, -1), 0);
+        assert_eq!(super::letter_position(&names, &view, 'D'), Some(3));
+    }
+
+    #[test]
+    fn x_quits_the_app_of_the_selected_tile_even_in_a_search() {
+        let mut menu = Menu::default();
+        menu.select_tab(Tab::Pc);
+        menu.open_pc("den");
+        // A search left one match: the catalog's fifth app.
+        assert_eq!(menu.navigate(Key::Quit, &[], &[Action::PcGame(5)]), Some((Action::PcQuit(5), 1)));
+        assert_eq!(menu.navigate(Key::Quit, &[], &[]), None);
+    }
+
+    #[test]
+    fn down_moves_a_whole_row_of_the_grid() {
+        let mut menu = Menu { columns: 4, ..Menu::default() };
+        menu.select_tab(Tab::Cloud);
+        let games: Vec<Action> = (0..12).map(Action::CloudGame).collect();
+        menu.navigate(Key::Down, &[], &games);
+        assert_eq!(menu.cloud_game, 4);
+        menu.navigate(Key::Right, &[], &games);
+        assert_eq!(menu.cloud_game, 5);
+    }
+
+    #[test]
+    fn each_letter_is_one_run_of_names() {
+        let mut names = vec!["!Zelda", "Apex", "Zork", "Élan", "apple"];
+        names.sort_by_key(|name| super::library_order(name));
+        assert_eq!(names, ["Apex", "apple", "!Zelda", "Zork", "Élan"]);
+    }
+
+    #[test]
+    fn the_grid_fits_as_many_tiles_as_the_width_takes() {
+        // Seven 150-point covers across a Steam Deck.
+        assert_eq!(super::library_columns(1280.), 7);
+        assert_eq!(super::library_columns(400.), 1);
+    }
+
+    #[test]
+    fn the_jitter_buffer_is_offered_for_an_xbox_only() {
+        let actions = |pc| super::rows(crate::session_store::Preferences::default(), &super::Text(false), false, 0, 1, None, pc)
+            .into_iter().filter_map(|row| row.action).collect::<Vec<_>>();
+        assert!(actions(false).contains(&Action::Jitter));
+        assert!(!actions(true).contains(&Action::Jitter));
+        assert!(actions(true).contains(&Action::PcHdr));
+    }
+
+    #[test]
+    fn switching_the_video_settings_leaves_no_row_being_edited() {
+        let mut menu = Menu { row: Some(3), editing_value: true, ..Menu::default() };
+        menu.switch_video_target();
+        assert!(menu.video_pc);
+        assert_eq!((menu.row, menu.editing_value), (Some(0), false));
+    }
+
+    #[test]
+    fn back_leaves_a_pcs_apps_for_the_pc_list_and_keeps_its_selection() {
+        let mut menu = Menu::default();
+        menu.select_tab(Tab::Pc);
+        let pcs = [Action::PcHost(0), Action::PcHost(1), Action::PcAdd];
+        menu.navigate(Key::Right, &[], &pcs);
+        assert_eq!(menu.navigate(Key::Accept, &[], &pcs), Some((Action::PcHost(1), 1)));
+        menu.open_pc("den");
+        let apps = [Action::PcGame(0), Action::PcGame(1)];
+        menu.navigate(Key::Right, &[], &apps);
+        assert_eq!((menu.pc, menu.pc_game), (1, 1));
+        assert_eq!(menu.navigate(Key::Back, &[], &apps), Some((Action::PcList, 1)));
+        menu.pc_open = None;
+        assert_eq!(menu.navigate(Key::Back, &[], &pcs), Some((Action::Home, 1)));
+        // Back on the home screen asks before closing Playwake.
+        menu.select_tab(Tab::Xbox);
+        assert_eq!(menu.navigate(Key::Back, &[], &[]), Some((Action::AskExit, 1)));
+        // X on an app of a PC asks to quit it.
+        menu.select_tab(Tab::Pc);
+        menu.open_pc("den");
+        assert_eq!(menu.navigate(Key::Quit, &[], &apps), Some((Action::PcQuit(menu.pc_game), 1)));
+        // A stream started from the grid returns to it.
+        menu.open_pc("den");
+        menu.select_tab(Tab::Pc);
+        assert_eq!(menu.pc_open.as_deref(), Some("den"));
+    }
+
+    #[test]
+    fn a_new_catalog_closes_a_pc_that_is_gone_and_keeps_the_selections_inside() {
+        let mut menu = Menu { pc: 5, pc_game: 7, ..Menu::default() };
+        menu.pc_open = Some("den".into());
+        let den = crate::pc::Catalog::one_pc("den", &["Desktop", "Hades"]);
+        menu.follow_pcs(&den);
+        assert_eq!((menu.pc_open.as_deref(), menu.pc, menu.pc_game), (Some("den"), 1, 1));
+        menu.follow_pcs(&crate::pc::Catalog::default());
+        assert_eq!((menu.pc_open, menu.pc, menu.pc_game), (None, 0, 0));
+    }
+
+    #[test]
+    fn quitting_the_app_or_playwake_asks_first() {
+        use super::{PcDialog, PcStep, pc_dialog_step};
+        let game = crate::pc::Catalog::one_pc("den", &["Hades"]).games[0].clone();
+        // Both open with another button than A, so A answers at once.
+        let mut exit = PcDialog::Exit;
+        assert_eq!(pc_dialog_step(&mut exit, Key::Accept), Some(PcStep::Exit));
+        assert_eq!(pc_dialog_step(&mut exit, Key::Back), Some(PcStep::Close));
+        let mut quit = PcDialog::Quit(game);
+        assert_eq!(pc_dialog_step(&mut quit, Key::Accept), Some(PcStep::QuitApp));
+        let mut address = PcDialog::Address(String::new());
+        assert_eq!(pc_dialog_step(&mut address, Key::Accept), None);
+        address = PcDialog::Address("192.0.2.10".into());
+        assert_eq!(pc_dialog_step(&mut address, Key::Accept), Some(PcStep::Add));
+    }
+
+    #[test]
+    fn typing_an_address_takes_host_characters_and_backspace() {
+        let mut address = String::new();
+        for typed in ["1", "9", "2", ".", "a"] { assert!(super::edit_address(&mut address, typed, Some(typed))); }
+        assert!(!super::edit_address(&mut address, "space", Some(" ")));
+        assert!(!super::edit_address(&mut address, "enter", None));
+        assert!(super::edit_address(&mut address, "backspace", None));
+        assert_eq!(address, "192.");
     }
 }

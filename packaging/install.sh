@@ -197,6 +197,16 @@ if [[ $restart_steam == 1 && $closed_steam == 1 ]]; then
     start_steam
 fi
 
+# The Steam client caches its grid/ scan; after an upgrade it keeps stale
+# placeholders until its own artwork API rescans. Best-effort, never fatal.
+if [[ $do_shortcut == 1 ]]; then
+    if python3 "$dir/packaging/steam_shortcut.py" refresh-artwork --dir "$dir" >>"$log" 2>&1; then
+        say "Library artwork refreshed in the running Steam client"
+    else
+        say "note: artwork refresh skipped (Steam CEF debug unavailable)"
+    fi
+fi
+
 say "==> Done"
 say "Installed: $dir"
 if [[ $do_shortcut == 1 ]]; then
