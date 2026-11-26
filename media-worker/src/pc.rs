@@ -2,7 +2,8 @@
 //! frames and sound it sends into the branches an Xbox stream uses.
 
 use crate::{Slot, pipeline, protocol};
-use gamestream::{Codec, Config, Event, Host, Identity, Launch, Stream};
+use gamestream::{Codec, Event};
+use playwake_core::pc::{StreamRequest, connect, video_format};
 use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
@@ -23,23 +24,12 @@ fn source(caps: &str, delay: Duration) -> Result<AppSrc, String> {
 /// What the sources report as the most they hold back; sinks need some.
 const MOST_BUFFERED: Duration = Duration::from_millis(200);
 
-/// The codec of a PC stream and whether it asks for HDR. HDR needs 10-bit
-/// HEVC; an SDR stream is H.264. `forced` (ALLY_PC_CODEC) names the codec of
-/// an SDR stream instead.
-fn video_format(forced: Option<&str>, hdr: bool) -> (Codec, bool) {
-    match forced {
-        Some("hevc") => (Codec::Hevc, false),
-        Some("h264") => (Codec::H264, false),
-        _ if hdr => (Codec::Hevc, true),
-        _ => (Codec::H264, false),
-    }
-}
-
-pub fn start(slot: &Slot, pipeline: &gst::Pipeline, pc: protocol::Pc, width: u32, height: u32,
+pub fn start(slot: &Slot, pipeline: &gst::Pipeline, pc: StreamRequest, width: u32, height: u32,
     bitrate_kbps: u32, jitter: Duration, quit: glib::MainLoop) -> Result<(), String>
 {
     // HDR when it was asked for, the display shows it and the GPU decodes it.
     let hdr = pc.hdr && crate::x11::hdr_output() && gst::ElementFactory::find("vah265dec").is_some();
+    // ALLY_PC_CODEC names the codec of an SDR stream instead.
     let (codec, hdr) = video_format(std::env::var("ALLY_PC_CODEC").ok().as_deref(), hdr);
     let format = if codec == Codec::Hevc { "h265" } else { "h264" };
     // Video is shown as it arrives; sound waits out the network's jitter.
@@ -67,18 +57,8 @@ pub fn start(slot: &Slot, pipeline: &gst::Pipeline, pc: protocol::Pc, width: u32
     let slot = slot.clone();
     std::thread::spawn(move || {
         let run = || -> Result<(), String> {
-            let identity = Identity::from_pem(&pc.client_key, &pc.client_certificate)?;
-            let mut host = Host::new(&pc.address);
-            host.certificate = Some(pc.certificate.clone());
-            let info = host.info(&identity)?;
-            if !info.paired { return Err("This PC is no longer paired with Playwake".into()); }
-            if hdr && !info.encodes_hdr() { return Err("This PC cannot encode HDR".into()); }
-            let request = Launch { app: pc.app, width, height, fps: pc.fps, hdr, host_audio: false,
-                end_other: pc.end_other };
-            let session = host.launch(&identity, &info, &request)?;
             // Full range only where the worker's own presenter converts the picture.
-            let config = Config { width, height, fps: pc.fps, bitrate_kbps, codec, hdr, full_range: hdr };
-            let (stream, events) = Stream::start(&host, &session, &config)?;
+            let (stream, events) = connect(&pc, width, height, bitrate_kbps, codec, hdr, hdr)?;
             let stream = Arc::new(stream);
             {
                 let mut guard = slot.lock().unwrap();
@@ -113,15 +93,6 @@ pub fn start(slot: &Slot, pipeline: &gst::Pipeline, pc: protocol::Pc, width: u32
 mod tests {
     use super::*;
     use std::sync::mpsc;
-
-    #[test]
-    fn hdr_is_asked_for_only_with_ten_bit_hevc() {
-        assert_eq!(video_format(None, false), (Codec::H264, false));
-        assert_eq!(video_format(None, true), (Codec::Hevc, true));
-        // A forced codec means an SDR stream, also where HDR is possible.
-        assert_eq!(video_format(Some("hevc"), true), (Codec::Hevc, false));
-        assert_eq!(video_format(Some("h264"), true), (Codec::H264, false));
-    }
 
     #[test]
     fn sources_deliver_their_data_once_the_built_pipeline_plays() {

@@ -4,30 +4,9 @@
 //! to the Python worker's protocol.
 
 use serde::Deserialize;
+pub use playwake_core::pc::StreamRequest as Pc;
 use serde_json::{Value, json};
 use std::io::Write;
-
-/// A paired Sunshine host and the app to stream from it.
-#[derive(Clone, Debug, Deserialize)]
-pub struct Pc {
-    pub address: String,
-    /// PEM of the certificate the host showed while pairing.
-    pub certificate: String,
-    /// PEM of this client's key and certificate.
-    pub client_key: String,
-    pub client_certificate: String,
-    pub app: u32,
-    pub fps: u32,
-    /// The other app the user agreed to end if the PC still runs it.
-    #[serde(default)]
-    pub end_other: Option<u32>,
-    /// The user wants HDR and the PC can encode it.
-    #[serde(default)]
-    pub hdr: bool,
-    /// The stream is smaller than the screen and SteamOS scales it up.
-    #[serde(default)]
-    pub scaled: bool,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]

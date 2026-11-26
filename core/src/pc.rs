@@ -2,10 +2,9 @@
 //! and pairing PCs, and listing what they can stream.
 
 use crate::{device::Device, session_store};
-use gamestream::{Host, Identity};
+use gamestream::{Codec, Config, Event, Host, Identity, Launch, Stream};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::{sync::{Mutex, MutexGuard}, thread, time::Duration};
+use std::{sync::{Mutex, MutexGuard, mpsc}, thread, time::Duration};
 
 pub type Result<T> = gamestream::Result<T>;
 
@@ -168,17 +167,90 @@ impl Game {
         Self { end_other: None, ..self }
     }
 
-    /// What the media worker needs to start this stream; with HDR if the
-    /// user wants it and the PC can encode it.
-    pub fn start(&self, panel: Panel, hdr: bool) -> Value {
+    /// What a player needs to start this stream; with HDR if the user wants
+    /// it and the PC can encode it.
+    pub fn start(&self, panel: Panel, hdr: bool) -> StreamRequest {
         let saved = load();
-        json!({
-            "address": self.pc.address, "certificate": self.pc.certificate,
-            "client_key": saved.key, "client_certificate": saved.certificate,
-            "app": self.app, "fps": panel.fps, "end_other": self.end_other, "hdr": hdr && self.hdr,
+        StreamRequest {
+            address: self.pc.address.clone(), certificate: self.pc.certificate.clone(),
+            client_key: saved.key, client_certificate: saved.certificate,
+            app: self.app, fps: panel.fps, end_other: self.end_other, hdr: hdr && self.hdr,
             // Only a smaller stream is left to SteamOS to scale up.
-            "scaled": panel.height < Panel::of(crate::device::current()).height,
-        })
+            scaled: panel.height < Panel::of(crate::device::current()).height,
+        }
+    }
+}
+
+/// A paired Sunshine host and the app to stream from it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StreamRequest {
+    pub address: String,
+    /// PEM of the certificate the host showed while pairing.
+    pub certificate: String,
+    /// PEM of this client's key and certificate.
+    pub client_key: String,
+    pub client_certificate: String,
+    pub app: u32,
+    pub fps: u32,
+    /// The other app the user agreed to end if the PC still runs it.
+    #[serde(default)]
+    pub end_other: Option<u32>,
+    /// The user wants HDR and the PC can encode it.
+    #[serde(default)]
+    pub hdr: bool,
+    /// The stream is smaller than the screen and SteamOS scales it up.
+    #[serde(default)]
+    pub scaled: bool,
+}
+
+/// The codec of a PC stream and whether it asks for HDR. HDR needs 10-bit
+/// HEVC; an SDR stream is H.264. `forced` names the codec of an SDR stream
+/// instead. `hdr`: the request wants HDR and the player can show it.
+pub fn video_format(forced: Option<&str>, hdr: bool) -> (Codec, bool) {
+    match forced {
+        Some("hevc") => (Codec::Hevc, false),
+        Some("h264") => (Codec::H264, false),
+        _ if hdr => (Codec::Hevc, true),
+        _ => (Codec::H264, false),
+    }
+}
+
+/// Starts the request's app on its PC and the stream from it, in the codec
+/// and HDR mode `video_format` chose. `full_range` where the player converts
+/// the picture itself. The player decodes and shows what the events carry.
+pub fn connect(request: &StreamRequest, width: u32, height: u32, bitrate_kbps: u32, codec: Codec, hdr: bool,
+    full_range: bool) -> Result<(Stream, mpsc::Receiver<Event>)>
+{
+    let identity = Identity::from_pem(&request.client_key, &request.client_certificate)?;
+    let mut host = Host::new(&request.address);
+    host.certificate = Some(request.certificate.clone());
+    let info = host.info(&identity)?;
+    if !info.paired { return Err("This PC is no longer paired with Playwake".into()); }
+    if hdr && !info.encodes_hdr() { return Err("This PC cannot encode HDR".into()); }
+    let launch = Launch { app: request.app, width, height, fps: request.fps, hdr, host_audio: false,
+        end_other: request.end_other };
+    let session = host.launch(&identity, &info, &launch)?;
+    let config = Config { width, height, fps: request.fps, bitrate_kbps, codec, hdr, full_range };
+    Stream::start(&host, &session, &config)
+}
+
+/// A routed pad state in the PC protocol's buttons, ranges and stick signs.
+pub fn gamepad(state: &crate::route::Routed) -> gamestream::Gamepad {
+    use gamestream::*;
+    const BUTTONS: [(u16, u32); 15] = [
+        (2, BUTTON_GUIDE), (4, BUTTON_START), (8, BUTTON_BACK), (16, BUTTON_A), (32, BUTTON_B),
+        (64, BUTTON_X), (128, BUTTON_Y), (256, BUTTON_UP), (512, BUTTON_DOWN), (1024, BUTTON_LEFT),
+        (2048, BUTTON_RIGHT), (4096, BUTTON_LEFT_BUMPER), (8192, BUTTON_RIGHT_BUMPER),
+        (16384, BUTTON_LEFT_STICK), (32768, BUTTON_RIGHT_STICK),
+    ];
+    let [left_x, left_y, right_x, right_y] = state.axes;
+    Gamepad {
+        buttons: BUTTONS.iter().filter(|(xbox, _)| state.buttons & xbox != 0).map(|(_, pc)| pc).sum(),
+        left_trigger: (state.lt >> 8) as u8,
+        right_trigger: (state.rt >> 8) as u8,
+        // Routed sticks point down for positive Y, as evdev's do; the host expects up.
+        left_stick: (left_x, left_y.saturating_neg()),
+        right_stick: (right_x, right_y.saturating_neg()),
     }
 }
 
@@ -422,6 +494,31 @@ fn remember(hosts: &mut Vec<Pc>, pc: Pc) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn hdr_is_asked_for_only_with_ten_bit_hevc() {
+        assert_eq!(video_format(None, false), (Codec::H264, false));
+        assert_eq!(video_format(None, true), (Codec::Hevc, true));
+        // A forced codec means an SDR stream, also where HDR is possible.
+        assert_eq!(video_format(Some("hevc"), true), (Codec::Hevc, false));
+        assert_eq!(video_format(Some("h264"), true), (Codec::H264, false));
+    }
+
+    #[test]
+    fn maps_the_xbox_state_to_the_gamepad() {
+        let state = crate::route::Routed { axes: [100, -200, i16::MIN, i16::MAX], buttons: 16 | 8 | 256 | 2 | 32768, lt: 65534, rt: 300 };
+        let pad = gamepad(&state);
+        assert_eq!(pad.buttons, gamestream::BUTTON_A | gamestream::BUTTON_BACK | gamestream::BUTTON_UP
+            | gamestream::BUTTON_GUIDE | gamestream::BUTTON_RIGHT_STICK);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (255, 1));
+        assert_eq!(pad.left_stick, (100, 200));
+        assert_eq!(pad.right_stick, (i16::MIN, -i16::MAX));
+        // Pushing a stick fully down must not wrap around to up.
+        let down = crate::route::Routed { axes: [0, i16::MIN, 0, 0], ..crate::route::Routed { axes: [0; 4], buttons: 0, lt: 0, rt: 0 } };
+        assert_eq!(gamepad(&down).left_stick, (0, i16::MAX));
+    }
+
 
     fn game(name: &str, pc: &str) -> Game {
         Game { name: name.into(), pc: paired(pc, "10.0.0.1"), app: 1, running: false, hdr: false, end_other: None }
@@ -458,14 +555,14 @@ mod tests {
         let panel = Panel { width: 1, height: 1, fps: 60 };
         // The consent names the app it was given for, and a reconnect drops it.
         let agreed = catalog.games[0].clone().ending(&catalog.games[1]);
-        assert_eq!(agreed.start(panel, false)["end_other"], 2);
-        assert!(catalog.games[0].start(panel, false)["end_other"].is_null());
-        assert!(agreed.asking_again().start(panel, false)["end_other"].is_null());
+        assert_eq!(agreed.start(panel, false).end_other, Some(2));
+        assert_eq!(catalog.games[0].start(panel, false).end_other, None);
+        assert_eq!(agreed.asking_again().start(panel, false).end_other, None);
         // HDR is asked for only when the user wants it and the PC can encode it.
         let capable = Game { hdr: true, ..game("Desktop", "den") };
-        assert_eq!(capable.start(panel, true)["hdr"], true);
-        assert_eq!(capable.start(panel, false)["hdr"], false);
-        assert_eq!(catalog.games[0].start(panel, true)["hdr"], false);
+        assert!(capable.start(panel, true).hdr);
+        assert!(!capable.start(panel, false).hdr);
+        assert!(!catalog.games[0].start(panel, true).hdr);
     }
 
     fn paired(name: &str, address: &str) -> Pc {

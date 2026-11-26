@@ -66,27 +66,7 @@ impl Link for gamestream::Stream {
     }
 
     fn send(&self, _sequence: u32, _time: f64, state: &Routed) {
-        self.gamepad(&pc_gamepad(state));
-    }
-}
-
-/// The routed Xbox state in the PC protocol's buttons, ranges and stick signs.
-pub fn pc_gamepad(state: &Routed) -> gamestream::Gamepad {
-    use gamestream::*;
-    const BUTTONS: [(u16, u32); 15] = [
-        (2, BUTTON_GUIDE), (4, BUTTON_START), (8, BUTTON_BACK), (16, BUTTON_A), (32, BUTTON_B),
-        (64, BUTTON_X), (128, BUTTON_Y), (256, BUTTON_UP), (512, BUTTON_DOWN), (1024, BUTTON_LEFT),
-        (2048, BUTTON_RIGHT), (4096, BUTTON_LEFT_BUMPER), (8192, BUTTON_RIGHT_BUMPER),
-        (16384, BUTTON_LEFT_STICK), (32768, BUTTON_RIGHT_STICK),
-    ];
-    let [left_x, left_y, right_x, right_y] = state.axes;
-    Gamepad {
-        buttons: BUTTONS.iter().filter(|(xbox, _)| state.buttons & xbox != 0).map(|(_, pc)| pc).sum(),
-        left_trigger: (state.lt >> 8) as u8,
-        right_trigger: (state.rt >> 8) as u8,
-        // evdev sticks point down for positive Y; the host expects up.
-        left_stick: (left_x, left_y.saturating_neg()),
-        right_stick: (right_x, right_y.saturating_neg()),
+        self.gamepad(&playwake_core::pc::gamepad(state));
     }
 }
 
@@ -388,20 +368,6 @@ mod tests {
         let dropped = Arc::downgrade(&input.device_alive);
         drop(input);
         assert_eq!(dropped.strong_count(), 0);
-    }
-
-    #[test]
-    fn maps_the_xbox_state_to_the_pc_gamepad() {
-        let state = Routed { axes: [100, -200, i16::MIN, i16::MAX], buttons: 16 | 8 | 256 | 2 | 32768, lt: 65534, rt: 300 };
-        let pad = pc_gamepad(&state);
-        assert_eq!(pad.buttons, gamestream::BUTTON_A | gamestream::BUTTON_BACK | gamestream::BUTTON_UP
-            | gamestream::BUTTON_GUIDE | gamestream::BUTTON_RIGHT_STICK);
-        assert_eq!((pad.left_trigger, pad.right_trigger), (255, 1));
-        assert_eq!(pad.left_stick, (100, 200));
-        assert_eq!(pad.right_stick, (i16::MIN, -i16::MAX));
-        // Pushing a stick fully down must not wrap around to up.
-        let down = Routed { axes: [0, i16::MIN, 0, 0], ..Routed { axes: [0; 4], buttons: 0, lt: 0, rt: 0 } };
-        assert_eq!(pc_gamepad(&down).left_stick, (0, i16::MAX));
     }
 
     #[test]
