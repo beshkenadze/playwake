@@ -8,6 +8,8 @@ use playwake_core::{cloud, handshake, library, route, sdp, session_store, wire, 
 
 mod bridge;
 mod input_route;
+mod pc_bridge;
 
 pub use bridge::*;
 pub use input_route::*;
+pub use pc_bridge::*;

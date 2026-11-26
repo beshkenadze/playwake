@@ -39,17 +39,17 @@ fn stream_cancel_slot() -> &'static Mutex<Option<Arc<AtomicBool>>> {
     STREAM_CANCEL.get_or_init(|| Mutex::new(None))
 }
 
-fn lock<T>(slot: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+pub(crate) fn lock<T>(slot: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn emit_event(callback: Emit, value: Value) {
+pub(crate) fn emit_event(callback: Emit, value: Value) {
     if let Ok(text) = CString::new(value.to_string()) {
         callback(text.as_ptr());
     }
 }
 
-fn emit_error(callback: Emit, message: impl AsRef<str>) {
+pub(crate) fn emit_error(callback: Emit, message: impl AsRef<str>) {
     emit_event(callback, json!({ "event": "error", "message": message.as_ref() }));
 }
 
@@ -57,7 +57,7 @@ fn json_pointer(value: Value) -> *mut c_char {
     CString::new(value.to_string()).unwrap_or_default().into_raw()
 }
 
-unsafe fn read_string(pointer: *const c_char) -> Option<String> {
+pub(crate) unsafe fn read_string(pointer: *const c_char) -> Option<String> {
     if pointer.is_null() {
         return None;
     }

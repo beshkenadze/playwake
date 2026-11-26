@@ -152,6 +152,11 @@ impl Game {
         &self.pc.name
     }
 
+    /// The ID of the game's PC.
+    pub fn pc_id(&self) -> &str {
+        &self.pc.id
+    }
+
     /// The key of the game's cover in the cover cache.
     pub fn cover(&self) -> String {
         format!("gamestream://{}/{}", self.pc.id, self.app)

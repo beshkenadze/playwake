@@ -91,6 +91,31 @@ uint32_t pw_route_input(pw_route *route, pw_pad *pad, double now_ms);
 uint32_t pw_route_open(pw_route *route);
 uint32_t pw_route_close(pw_route *route, bool guide);
 
+/* PCs with Sunshine (GameStream), from the same core as on SteamOS. */
+
+/// Emits `pcs` with the PCs (`state`: paired, unpaired or offline) and the
+/// apps of the paired ones, then `pcs` again as their covers arrive. PC
+/// failures come as `pcError`, which leaves a running stream alone.
+void pw_pc_catalog(pw_emit callback);
+/// Pairs with the unpaired PC at `address`: emits `pcPin` with the PIN to
+/// enter in Sunshine, then `pcPaired` or `error`.
+void pw_pc_pair(pw_emit callback, const char *address);
+/// One encoded frame: `data` holds 4-byte length-prefixed NAL units; a key
+/// frame also brings its `count` parameter sets. Valid for the call only.
+typedef void (*pw_pc_video)(const uint8_t *data, size_t length, const uint8_t *const *sets,
+                            const size_t *set_lengths, size_t count, bool hevc, bool key);
+/// One Opus packet, 48 kHz stereo, 5 ms. Valid for the call only.
+typedef void (*pw_pc_audio)(const uint8_t *data, size_t length);
+/// Streams the app with this `id` (from `pcs`). Emits `status`,
+/// `pcStreaming`, `pcHdr` and `pcEnded`; `video` and `audio` are called on
+/// the stream's own thread.
+void pw_pc_stream(pw_emit callback, const char *game_id, uint32_t width, uint32_t height, uint32_t fps,
+                  uint32_t bitrate_kbps, bool hdr, pw_pc_video video, pw_pc_audio audio);
+/// Sends a routed pad state (after `pw_route_input`) to the PC stream.
+void pw_pc_gamepad(const pw_pad *pad);
+/// Ends the PC stream; `pcEnded` follows.
+void pw_pc_stop(void);
+
 #ifdef __cplusplus
 }
 #endif

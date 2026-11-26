@@ -8,9 +8,13 @@ pub mod device;
 pub mod handshake;
 pub mod journal;
 pub mod library;
+pub mod nal;
 pub mod pc;
 pub mod route;
 pub mod sdp;
 pub mod session_store;
 pub mod wire;
 pub mod xbox;
+
+/// The GameStream protocol the PC streams use, for the frontends.
+pub use gamestream;

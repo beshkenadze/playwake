@@ -1,11 +1,17 @@
 import SwiftUI
 
+/// The items that match `query`, best first, by the core's fuzzy search; all
+/// of them in letter order for an empty query.
+func searched<Item: LibraryItem>(_ all: [Item], _ query: String) -> [Item] {
+    query.isEmpty ? all : PlaywakeCore.shared.search(all.map(\.name), query: query).map { all[$0] }
+}
+
 /// A scrolling grid of game covers with a letter rail beside it while the
 /// whole catalog is on show.
-struct LibraryGrid: View {
-    let games: [CloudGame]
+struct LibraryGrid<Item: LibraryItem>: View {
+    let games: [Item]
     let query: String
-    let play: (CloudGame) -> Void
+    let play: (Item) -> Void
 
     /// Each letter with the first game filed under it, in grid order.
     private var letters: [(letter: String, id: String)] {
@@ -46,8 +52,8 @@ struct LibraryGrid: View {
 }
 
 /// A 2:3 cover with the game's name below it.
-struct CoverTile: View {
-    let game: CloudGame
+struct CoverTile<Item: LibraryItem>: View {
+    let game: Item
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -59,10 +65,10 @@ struct CoverTile: View {
                         switch phase {
                         case .success(let image):
                             image.resizable().scaledToFill()
-                        case .empty where game.cover != nil:
-                            CoverPlaceholder(game: game, loading: true)
+                        case .empty where game.hasCover:
+                            CoverPlaceholder(monogram: game.monogram, hue: game.hue, loading: true)
                         default:
-                            CoverPlaceholder(game: game, loading: false)
+                            CoverPlaceholder(monogram: game.monogram, hue: game.hue, loading: false)
                         }
                     }
                 }
@@ -78,18 +84,19 @@ struct CoverTile: View {
 /// A tile for a game whose cover is missing or still on its way: a colour of
 /// its own and its first letters, pulsing while the cover loads.
 struct CoverPlaceholder: View {
-    let game: CloudGame
+    let monogram: String
+    let hue: Double
     let loading: Bool
 
     var body: some View {
         // The SteamOS gradient, hsl(h, 45%, 36%) to hsl(h + 36°, 50%, 16%),
         // in SwiftUI's HSB.
         let tint = LinearGradient(
-            colors: [Color(hue: game.hue / 360, saturation: 0.62, brightness: 0.52),
-                     Color(hue: (game.hue + 36).truncatingRemainder(dividingBy: 360) / 360,
+            colors: [Color(hue: hue / 360, saturation: 0.62, brightness: 0.52),
+                     Color(hue: (hue + 36).truncatingRemainder(dividingBy: 360) / 360,
                            saturation: 0.67, brightness: 0.24)],
             startPoint: .top, endPoint: .bottom)
-        let mark = Text(game.monogram)
+        let mark = Text(monogram)
             .font(.system(size: 40, weight: .bold))
             .foregroundStyle(.white.opacity(0.85))
             .frame(maxWidth: .infinity, maxHeight: .infinity)

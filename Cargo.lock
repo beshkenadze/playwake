@@ -5382,7 +5382,6 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "playwake"
 version = "0.2.0"
 dependencies = [
- "gamestream",
  "gilrs",
  "gpui-kit",
  "playwake-core",

@@ -26,11 +26,18 @@ final class SessionController: ObservableObject {
     enum StreamTarget: Equatable {
         case console(XboxConsole)
         case game(CloudGame)
+        case pc(PcGame)
+    }
+
+    /// The PIN to enter in Sunshine on a PC being paired.
+    struct Pairing: Equatable {
+        let name: String
+        let pin: String
     }
 
     /// Home navigation: tabs on iPhone, sidebar on iPad and Mac.
     enum Section: Hashable, CaseIterable {
-        case consoles, cloud, settings
+        case consoles, cloud, pcs, settings
     }
 
     enum MenuItem: CaseIterable {
@@ -41,6 +48,10 @@ final class SessionController: ObservableObject {
     @Published private(set) var device: DeviceCode?
     @Published private(set) var consoles: [XboxConsole] = []
     @Published private(set) var cloud: [CloudGame] = []
+    @Published private(set) var pcs: [PcComputer] = []
+    @Published private(set) var pcGames: [PcGame] = []
+    @Published private(set) var pcLoading = true
+    @Published private(set) var pairing: Pairing?
     @Published private(set) var status = ""
     @Published private(set) var streaming = false
     @Published private(set) var stats = LabStats()
@@ -65,6 +76,7 @@ final class SessionController: ObservableObject {
     private let autoStream = ProcessInfo.processInfo.arguments.contains("-autostream")
     private var autoStarted = false
     private var rtc: XboxRTC?
+    private var pcPlayer: PcPlayer?
     private var streamStart: DispatchTime?
     private var accountActive = false
     private var lastTarget: StreamTarget?
@@ -84,6 +96,7 @@ final class SessionController: ObservableObject {
         core.onEvent = { [weak self] event in
             self?.handle(event)
         }
+        core.pcCatalog()
         #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
         if let i = arguments.firstIndex(of: "-uiFixture"), i + 1 < arguments.count {
@@ -95,6 +108,28 @@ final class SessionController: ObservableObject {
             section = opened
         }
         #endif
+    }
+
+    func refreshPcs() {
+        pcLoading = true
+        core.pcCatalog()
+    }
+
+    /// Pairs with an unpaired PC; `pairing` shows the PIN meanwhile.
+    func pair(_ computer: PcComputer) {
+        guard let address = computer.address else { return }
+        status = "Pairing with \(computer.name)…"
+        core.pairPc(address: address)
+    }
+
+    func startPc(_ game: PcGame) {
+        beginStreaming(.pc(game), title: game.name, status: "Starting \(game.name) on the PC…")
+        let player = PcPlayer(renderer: renderer)
+        player.onFirstFrame = { [weak self] in self?.firstFrame = true }
+        player.onMenu = { [weak self] events in self?.handleMenu(events) }
+        pcPlayer = player
+        let size = resolution(height)
+        player.start(game: game.id, width: size.0, height: size.1, fps: 60, bitrateKbps: 20_000)
     }
 
     func refreshConsoles() {
@@ -164,6 +199,8 @@ final class SessionController: ObservableObject {
     func stop() {
         rtc?.stop()
         rtc = nil
+        pcPlayer?.stop()
+        pcPlayer = nil
         core.stop()
         streaming = false
         firstFrame = false
@@ -177,17 +214,18 @@ final class SessionController: ObservableObject {
         switch target {
         case .console(let console): startHome(console)
         case .game(let game): startCloud(game)
+        case .pc(let game): startPc(game)
         }
     }
 
     // MARK: - Stream menu
 
     func openMenu() {
-        if let rtc { rtc.openMenu() } else if fixture { handleMenu(UInt32(PW_ROUTE_MENU_OPENED)) }
+        if let pcPlayer { pcPlayer.openMenu() } else if let rtc { rtc.openMenu() } else if fixture { handleMenu(UInt32(PW_ROUTE_MENU_OPENED)) }
     }
 
     func closeMenu(guide: Bool = false) {
-        if let rtc { rtc.closeMenu(guide: guide) } else if fixture { handleMenu(UInt32(PW_ROUTE_MENU_CLOSED)) }
+        if let pcPlayer { pcPlayer.closeMenu() } else if let rtc { rtc.closeMenu(guide: guide) } else if fixture { handleMenu(UInt32(PW_ROUTE_MENU_CLOSED)) }
     }
 
     func perform(_ item: MenuItem) {
@@ -223,7 +261,7 @@ final class SessionController: ObservableObject {
         }
     }
 
-    private func beginStreaming(_ target: StreamTarget, title: String) {
+    private func beginStreaming(_ target: StreamTarget, title: String, status: String = "Starting the Xbox session…") {
         lastTarget = target
         streamTitle = title
         firstFrame = false
@@ -232,7 +270,7 @@ final class SessionController: ObservableObject {
         streamStart = .now()
         streamStartedAt = CFAbsoluteTimeGetCurrent()
         stats = LabStats()
-        status = "Starting the Xbox session…"
+        self.status = status
         UIApplication.shared.isIdleTimerDisabled = true
     }
 
@@ -285,6 +323,35 @@ final class SessionController: ObservableObject {
             if case .signingIn = phase {
                 phase = .signedOut
             }
+        case .pcs(let computers, let games):
+            pcs = computers
+            pcGames = games
+            pcLoading = false
+            #if DEBUG
+            autoPc()
+            #endif
+        case .pcPin(let pin, let name):
+            pairing = Pairing(name: name, pin: pin)
+            status = "Enter \(pin) in Sunshine on \(name)"
+            LabLog.write("pc: pairing PIN \(pin) for \(name)")
+        case .pcPaired(let name):
+            pairing = nil
+            status = "Paired with \(name)"
+            refreshPcs()
+        case .pcStreaming(let hevc, let hdr):
+            status = "Streaming \(hevc ? "HEVC" : "H.264")\(hdr ? " HDR" : "")"
+            LabLog.write("pc: \(status)")
+        case .pcEnded(let error):
+            LabLog.write("pc: stream ended \(error ?? "")")
+            if case .pc = lastTarget, streaming {
+                stop()
+                status = error ?? ""
+            }
+        case .pcError(let message):
+            pairing = nil
+            pcLoading = false
+            status = message
+            LabLog.write("pc: \(message)")
         }
     }
 
@@ -334,6 +401,24 @@ final class SessionController: ObservableObject {
     }
 
     #if DEBUG
+    /// `-pcPair <address>` pairs with that PC; `-pcPlay <name>` starts the
+    /// first app whose name has it, for checks without touch or pointer.
+    private func autoPc() {
+        let arguments = ProcessInfo.processInfo.arguments
+        func value(_ flag: String) -> String? {
+            arguments.firstIndex(of: flag).flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil }
+        }
+        if let address = value("-pcPair"), pairing == nil,
+           let computer = pcs.first(where: { $0.address == address && $0.state == .unpaired }) {
+            pair(computer)
+        }
+        if let name = value("-pcPlay"), !autoStarted, !streaming,
+           let game = pcGames.first(where: { $0.name.localizedCaseInsensitiveContains(name) }) {
+            autoStarted = true
+            startPc(game)
+        }
+    }
+
     /// `-uiFixture <state>`: fills the screens with sample data so every state
     /// can be checked without a console (welcome, signin, code, consoles,
     /// cloud, settings, connecting, stream, menu).

@@ -3,7 +3,7 @@ mod input;
 mod lsfg;
 mod media;
 
-use playwake_core::{cloud, covers, device, journal, library, pc, session_store, xbox};
+use playwake_core::{cloud, covers, device, gamestream, journal, library, pc, session_store, xbox};
 
 use deck::{Action, Key, Menu, Tab};
 use session_store::{Language, Preferences};

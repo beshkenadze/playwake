@@ -7,15 +7,28 @@ struct XboxConsole: Decodable, Identifiable, Equatable {
     let power: String
 }
 
-/// A cloud game in the core's letter order, with what its tile shows while
-/// the cover is missing (the same letter, monogram and hue as on SteamOS).
-struct CloudGame: Decodable, Identifiable, Equatable {
+/// A game a library grid shows: its cover, or while that is missing the same
+/// letter, monogram and hue as on SteamOS, all from the core.
+protocol LibraryItem: Identifiable where ID == String {
+    var name: String { get }
+    var letter: String { get }
+    var monogram: String { get }
+    var hue: Double { get }
+    /// Whether a cover is on its way; false shows the placeholder for good.
+    var hasCover: Bool { get }
+    func cover(width: Int) -> URL?
+}
+
+/// A cloud game in the core's letter order.
+struct CloudGame: Decodable, LibraryItem, Equatable {
     let id: String
     let name: String
     let cover: URL?
     let letter: String
     let monogram: String
     let hue: Double
+
+    var hasCover: Bool { cover != nil }
 
     /// The cover `width` pixels wide: the Microsoft Store scales it on request.
     func cover(width: Int) -> URL? {
@@ -24,6 +37,33 @@ struct CloudGame: Decodable, Identifiable, Equatable {
                             URLQueryItem(name: "h", value: "\(width * 3 / 2)")]
         return parts.url
     }
+}
+
+/// A PC with Sunshine as the core found it.
+struct PcComputer: Decodable, Identifiable, Equatable {
+    enum State: String, Decodable { case paired, unpaired, offline }
+    let id: String
+    let name: String
+    /// Set for an unpaired PC: pairing asks for it.
+    let address: String?
+    let state: State
+}
+
+/// An app of a paired PC, in the core's letter order.
+struct PcGame: Decodable, LibraryItem, Equatable {
+    let id: String
+    let name: String
+    /// The ID of its PC.
+    let pc: String
+    let running: Bool
+    /// The cover the PC keeps, once the core has it on disk.
+    let cover: String?
+    let letter: String
+    let monogram: String
+    let hue: Double
+
+    var hasCover: Bool { cover != nil }
+    func cover(width: Int) -> URL? { cover.map { URL(fileURLWithPath: $0) } }
 }
 
 enum CoreEvent {
@@ -36,6 +76,12 @@ enum CoreEvent {
     case status(String)
     case ready(stun: [String], heartbeatMs: UInt64)
     case done
+    case pcs(computers: [PcComputer], games: [PcGame])
+    case pcPin(pin: String, name: String)
+    case pcPaired(name: String)
+    case pcStreaming(hevc: Bool, hdr: Bool)
+    case pcEnded(error: String?)
+    case pcError(String)
 }
 
 struct Handshake {
@@ -103,6 +149,16 @@ final class PlaywakeCore {
 
     func streamCloud(game id: String, height: UInt32) {
         pw_stream_cloud(trampoline, id, height)
+    }
+
+    // MARK: - PCs
+
+    func pcCatalog() { pw_pc_catalog(trampoline) }
+    func pairPc(address: String) { pw_pc_pair(trampoline, address) }
+
+    func streamPc(game id: String, width: UInt32, height: UInt32, fps: UInt32, bitrateKbps: UInt32,
+                  video: pw_pc_video, audio: pw_pc_audio) {
+        pw_pc_stream(trampoline, id, width, height, fps, bitrateKbps, false, video, audio)
     }
 
     /// The positions of `names` that match `query`, best first.
@@ -225,6 +281,19 @@ final class PlaywakeCore {
                 heartbeatMs: (object["heartbeatMs"] as? NSNumber)?.uint64Value ?? 0)
         case "done":
             event = .done
+        case "pcs":
+            event = .pcs(computers: Self.decode([PcComputer].self, from: object["pcs"]) ?? [],
+                         games: Self.decode([PcGame].self, from: object["games"]) ?? [])
+        case "pcPin":
+            event = .pcPin(pin: object["pin"] as? String ?? "", name: object["name"] as? String ?? "")
+        case "pcPaired":
+            event = .pcPaired(name: object["name"] as? String ?? "")
+        case "pcStreaming":
+            event = .pcStreaming(hevc: object["hevc"] as? Bool ?? false, hdr: object["hdr"] as? Bool ?? false)
+        case "pcEnded":
+            event = .pcEnded(error: object["error"] as? String)
+        case "pcError":
+            event = .pcError(object["message"] as? String ?? "Unknown error")
         default:
             event = nil
         }

@@ -16,6 +16,9 @@ struct HomeView: View {
                 NavigationStack { CloudView(controller: controller) }
                     .tabItem { Label("Cloud", systemImage: "cloud.fill") }
                     .tag(SessionController.Section.cloud)
+                NavigationStack { PcView(controller: controller) }
+                    .tabItem { Label("PC", systemImage: "desktopcomputer") }
+                    .tag(SessionController.Section.pcs)
                 NavigationStack { SettingsView(controller: controller) }
                     .tabItem { Label("Settings", systemImage: "gearshape.fill") }
                     .tag(SessionController.Section.settings)
@@ -29,6 +32,8 @@ struct HomeView: View {
                         .tag(SessionController.Section.consoles)
                     Label("Xbox Cloud", systemImage: "cloud.fill")
                         .tag(SessionController.Section.cloud)
+                    Label("PC", systemImage: "desktopcomputer")
+                        .tag(SessionController.Section.pcs)
                     Label("Settings", systemImage: "gearshape.fill")
                         .tag(SessionController.Section.settings)
                 }
@@ -39,6 +44,7 @@ struct HomeView: View {
                     switch controller.section {
                     case .consoles: ConsolesView(controller: controller)
                     case .cloud: CloudView(controller: controller)
+                    case .pcs: PcView(controller: controller)
                     case .settings: SettingsView(controller: controller)
                     }
                 }
@@ -182,13 +188,8 @@ struct CloudView: View {
     @ObservedObject var controller: SessionController
     @State private var query = ""
 
-    private var games: [CloudGame] {
-        let all = controller.cloud
-        return query.isEmpty ? all : PlaywakeCore.shared.search(all.map(\.name), query: query).map { all[$0] }
-    }
-
     var body: some View {
-        let games = games
+        let games = searched(controller.cloud, query)
         Group {
             if controller.cloud.isEmpty {
                 VStack(spacing: 14) {
@@ -203,6 +204,67 @@ struct CloudView: View {
         .background(Theme.canvas)
         .navigationTitle("Xbox Cloud")
         .searchable(text: $query, prompt: "Search \(controller.cloud.count) games")
+    }
+}
+
+// MARK: - PC
+
+/// The PCs with Sunshine and the apps of the paired ones, from the same core
+/// as on SteamOS.
+struct PcView: View {
+    @ObservedObject var controller: SessionController
+    @State private var query = ""
+
+    var body: some View {
+        let games = searched(controller.pcGames, query)
+        let others = controller.pcs.filter { $0.state != .paired }
+        VStack(alignment: .leading, spacing: 0) {
+            if !others.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(others) { computer in
+                            if computer.state == .unpaired {
+                                Button("Pair \(computer.name)") { controller.pair(computer) }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(Theme.mint)
+                                    .foregroundStyle(Theme.onMint)
+                            } else {
+                                Chip(text: "\(computer.name) · offline")
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                }
+            }
+            if controller.pcGames.isEmpty {
+                VStack(spacing: 14) {
+                    if controller.pcLoading {
+                        ProgressView().tint(Theme.mint)
+                        Text("Looking for PCs with Sunshine…").foregroundStyle(Theme.muted)
+                    } else {
+                        Text(controller.pcs.isEmpty ? "No PC with Sunshine found on the network."
+                             : "Pair a PC to see its games.")
+                            .foregroundStyle(Theme.muted)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                LibraryGrid(games: games, query: query) { controller.startPc($0) }
+            }
+        }
+        .background(Theme.canvas)
+        .navigationTitle("PC")
+        .searchable(text: $query, prompt: "Search \(controller.pcGames.count) apps")
+        .toolbar {
+            Button { controller.refreshPcs() } label: { Image(systemName: "arrow.clockwise") }
+        }
+        .alert("Enter the PIN in Sunshine", isPresented: .constant(controller.pairing != nil)) {
+        } message: {
+            if let pairing = controller.pairing {
+                Text("Open Sunshine on \(pairing.name), go to PIN and enter \(pairing.pin).")
+            }
+        }
     }
 }
 
