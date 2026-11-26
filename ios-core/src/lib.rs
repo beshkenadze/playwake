@@ -16,8 +16,16 @@ mod journal;
 mod session_store;
 #[path = "../../src/xbox.rs"]
 mod xbox;
+// The cover cache (`cloud::COVERS`) is the desktop's; SwiftUI loads covers.
+#[allow(dead_code)]
 #[path = "../../src/cloud.rs"]
 mod cloud;
+#[allow(dead_code)]
+#[path = "../../src/covers.rs"]
+mod covers;
+#[allow(dead_code)]
+#[path = "../../src/library.rs"]
+mod library;
 #[path = "../../media-worker/src/route.rs"]
 mod route;
 

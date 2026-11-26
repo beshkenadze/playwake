@@ -99,46 +99,6 @@ struct StatusDot: View {
     }
 }
 
-/// Cloud games come without artwork: a tile tinted from the title's hash with
-/// its initials, the same rule as the mockups.
-struct GameTile: View {
-    let name: String
-    var height: CGFloat = 104
-
-    private var hue: Double {
-        var hash = 0
-        for scalar in name.unicodeScalars { hash = (hash * 31 + Int(scalar.value)) % 360 }
-        return Double(hash)
-    }
-
-    private var initials: String {
-        let words = name.split(separator: " ").filter { $0.first?.isLetter == true }
-        return words.prefix(2).compactMap { $0.first.map(String.init) }.joined().uppercased()
-    }
-
-    var body: some View {
-        ZStack(alignment: .bottomLeading) {
-            LinearGradient(colors: [Color(hue: hue / 360, saturation: 0.38, brightness: 0.42),
-                                    Color(hue: (hue + 40).truncatingRemainder(dividingBy: 360) / 360,
-                                          saturation: 0.30, brightness: 0.21)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing)
-            Text(initials)
-                .font(.system(size: 30, weight: .heavy))
-                .foregroundStyle(.white.opacity(0.22))
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .padding(10)
-            Text(name)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Theme.text)
-                .multilineTextAlignment(.leading)
-                .lineLimit(2)
-                .padding(12)
-        }
-        .frame(height: height)
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-    }
-}
-
 struct PrimaryButtonStyle: ButtonStyle {
     var prominent = true
 

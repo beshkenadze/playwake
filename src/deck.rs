@@ -160,6 +160,8 @@ impl Tab {
     }
 }
 
+pub use crate::library::{hue, initial, letter_jump, letter_position, library_order, library_view, monogram};
+
 /// A cover tile, 2:3 like a game's box, and the space around it.
 const TILE_W: f32 = 150.;
 const TILE_H: f32 = 225.;
@@ -172,56 +174,6 @@ const RAIL_GAP: f32 = 12.;
 /// How many tiles fit across a library `width` points wide.
 pub fn library_columns(width: f32) -> usize {
     (((width - 2. * LIBRARY_PAD - RAIL_W - RAIL_GAP + TILE_GAP) / (TILE_W + TILE_GAP)).floor() as usize).max(1)
-}
-
-/// The order a library shows its names in: all of them, or those that match
-/// the search, best first.
-pub fn library_view(names: &[&str], search: &str) -> Vec<usize> {
-    use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::{CaseMatching, Normalization, Pattern}};
-    if search.trim().is_empty() { return (0..names.len()).collect(); }
-    let pattern = Pattern::parse(search, CaseMatching::Ignore, Normalization::Smart);
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let mut buffer = Vec::new();
-    let mut scored: Vec<(u32, usize)> = names.iter().enumerate()
-        .filter_map(|(index, name)| pattern.score(Utf32Str::new(name, &mut buffer), &mut matcher).map(|score| (score, index)))
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, index)| index).collect()
-}
-
-/// The letter a name is filed under: its first letter, or '#' for a name
-/// that starts with a digit or a sign.
-pub fn initial(name: &str) -> char {
-    name.chars().find(|c| c.is_alphanumeric())
-        .filter(|c| c.is_alphabetic())
-        .and_then(|c| c.to_uppercase().next())
-        .unwrap_or('#')
-}
-
-/// The order of names in a library: by the letter they are filed under,
-/// then by name, so each letter of the rail is one run of names.
-pub fn library_order(name: &str) -> (char, String) {
-    (initial(name), name.to_lowercase())
-}
-
-/// The position of the first name of the next (`direction` 1) or previous
-/// (-1) letter in `view`, or `position` when there is none.
-pub fn letter_jump(names: &[&str], view: &[usize], position: usize, direction: isize) -> usize {
-    let letter_at = |at: usize| view.get(at).map(|&index| initial(names[index]));
-    let Some(current) = letter_at(position) else { return position };
-    if direction > 0 {
-        (position..view.len()).find(|&at| letter_at(at) != Some(current)).unwrap_or(position)
-    } else {
-        // The start of the group before the current one.
-        let start = (0..=position).rev().take_while(|&at| letter_at(at) == Some(current)).last().unwrap_or(position);
-        let Some(previous) = start.checked_sub(1).and_then(letter_at) else { return start };
-        (0..start).find(|&at| letter_at(at) == Some(previous)).unwrap_or(start)
-    }
-}
-
-/// The position of the first name filed under `letter` in `view`.
-pub fn letter_position(names: &[&str], view: &[usize], letter: char) -> Option<usize> {
-    view.iter().position(|&index| initial(names[index]) == letter)
 }
 
 #[derive(Default)]
@@ -1688,18 +1640,11 @@ struct Library<'a> {
     searchable: bool,
 }
 
-/// The first letters of a name's first two words, for a tile without a cover.
-fn monogram(name: &str) -> String {
-    name.split_whitespace().filter_map(|word| word.chars().find(|c| c.is_alphanumeric()))
-        .take(2).flat_map(char::to_uppercase).collect()
-}
-
 /// A tile for a game whose cover is missing or still on its way: a colour
 /// of its own from the name, and `mark`, its first letters, large.
 fn placeholder(name: &str, mark: String, unit: f32) -> Div {
     let s = |p| px(p * unit);
-    let hue = name.bytes().fold(7u32, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte.into())) % 360;
-    let hue = hue as f32 / 360.;
+    let hue = f32::from(hue(name)) / 360.;
     div().size_full().relative().flex().flex_col().items_center().justify_center()
         .bg(linear_gradient(160., linear_color_stop(hsla(hue, 0.45, 0.36, 1.), 0.),
             linear_color_stop(hsla((hue + 0.1) % 1., 0.5, 0.16, 1.), 1.)))
@@ -1934,38 +1879,6 @@ mod navigation_tests {
     }
 
     #[test]
-    fn the_search_finds_names_loosely_best_first() {
-        let names = ["BALL x PIT", "Balatro", "Diablo® IV", "No Man's Sky", "Desktop"];
-        assert_eq!(super::library_view(&names, ""), [0, 1, 2, 3, 4]);
-        assert_eq!(super::library_view(&names, "diablo")[0], 2);
-        assert_eq!(super::library_view(&names, "nms")[0], 3);
-        assert!(super::library_view(&names, "zzz").is_empty());
-    }
-
-    #[test]
-    fn names_are_filed_under_their_first_letter() {
-        assert_eq!(super::initial("ball x pit"), 'B');
-        assert_eq!(super::initial("“Nodebuster”"), 'N');
-        assert_eq!(super::initial("7 Days to Die"), '#');
-        assert_eq!(super::monogram("No Man's Sky"), "NM");
-        assert_eq!(super::monogram("Desktop"), "D");
-    }
-
-    #[test]
-    fn the_triggers_jump_between_letters() {
-        let names = ["Balatro", "BALL x PIT", "Cyberpunk 2077", "Desktop", "Diablo IV"];
-        let view: Vec<usize> = (0..names.len()).collect();
-        assert_eq!(super::letter_jump(&names, &view, 0, 1), 2);
-        assert_eq!(super::letter_jump(&names, &view, 2, 1), 3);
-        assert_eq!(super::letter_jump(&names, &view, 4, 1), 4);
-        // Back goes to the start of the letter before, from anywhere in a letter.
-        assert_eq!(super::letter_jump(&names, &view, 4, -1), 2);
-        assert_eq!(super::letter_jump(&names, &view, 2, -1), 0);
-        assert_eq!(super::letter_jump(&names, &view, 1, -1), 0);
-        assert_eq!(super::letter_position(&names, &view, 'D'), Some(3));
-    }
-
-    #[test]
     fn x_quits_the_app_of_the_selected_tile_even_in_a_search() {
         let mut menu = Menu::default();
         menu.select_tab(Tab::Pc);
@@ -1984,13 +1897,6 @@ mod navigation_tests {
         assert_eq!(menu.cloud_game, 4);
         menu.navigate(Key::Right, &[], &games);
         assert_eq!(menu.cloud_game, 5);
-    }
-
-    #[test]
-    fn each_letter_is_one_run_of_names() {
-        let mut names = vec!["!Zelda", "Apex", "Zork", "Élan", "apple"];
-        names.sort_by_key(|name| super::library_order(name));
-        assert_eq!(names, ["Apex", "apple", "!Zelda", "Zork", "Élan"]);
     }
 
     #[test]

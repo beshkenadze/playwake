@@ -2,7 +2,7 @@
 //! Event callbacks receive a pointer that is only valid for the duration of
 //! the call; the Swift layer copies it immediately.
 
-use crate::{cloud, handshake, sdp, session_store, wire, xbox};
+use crate::{cloud, handshake, library, sdp, session_store, wire, xbox};
 use serde_json::{Value, json};
 use std::ffi::{CStr, CString, c_char};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,8 +84,32 @@ fn console_json(console: &xbox::Console) -> Value {
     json!({ "id": console.id, "name": console.name, "model": console.model, "power": console.power })
 }
 
+/// The catalog in letter order, with what a tile shows while its cover is
+/// missing.
 fn games_json(games: &[cloud::Game]) -> Value {
-    Value::Array(games.iter().map(|game| json!({ "id": game.id, "name": game.name })).collect())
+    let mut games: Vec<&cloud::Game> = games.iter().collect();
+    games.sort_by_cached_key(|game| library::library_order(&game.name));
+    Value::Array(games.into_iter().map(|game| json!({
+        "id": game.id,
+        "name": game.name,
+        "cover": game.cover,
+        "letter": library::initial(&game.name).to_string(),
+        "monogram": library::monogram(&game.name),
+        "hue": library::hue(&game.name),
+    })).collect())
+}
+
+/// The positions in `names_json` (a JSON array of names) that match
+/// `query`, best first; every position for an empty query. Release the
+/// result with `pw_free_string`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pw_library_search(names_json: *const c_char, query: *const c_char) -> *mut c_char {
+    let names: Vec<String> = unsafe { read_string(names_json) }
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let query = unsafe { read_string(query) }.unwrap_or_default();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    json_pointer(json!(library::library_view(&names, &query)))
 }
 
 // MARK: - Lifecycle
@@ -293,17 +317,21 @@ pub extern "C" fn pw_stream_home(callback: Emit, console_index: usize, height: u
     });
 }
 
-/// Reserve and provision by index into the full cloud catalog.
+/// Reserve and provision the cloud game with this ID.
 #[unsafe(no_mangle)]
-pub extern "C" fn pw_stream_cloud(callback: Emit, game_index: usize, height: u32) {
+pub unsafe extern "C" fn pw_stream_cloud(callback: Emit, game_id: *const c_char, height: u32) {
     let Some(account) = current_account() else {
         emit_error(callback, "Not signed in");
+        return;
+    };
+    let Some(game_id) = (unsafe { read_string(game_id) }) else {
+        emit_error(callback, "Game not found");
         return;
     };
     start_stream(callback, move |emit, cancel| {
         emit_event(emit, json!({ "event": "status", "message": "Loading Xbox Cloud catalog…" }));
         let games = cloud::catalog(&account)?;
-        let game = games.get(game_index).ok_or("Game not found")?;
+        let game = games.iter().find(|game| game.id == game_id).ok_or("Game not found")?;
         let (stream, _market) = cloud::connect(&account)?;
         emit_event(emit, json!({ "event": "status", "message": "Starting the game…" }));
         let path = cloud::reserve(&stream, game, resolution(height))?;
@@ -431,4 +459,46 @@ pub unsafe extern "C" fn pw_connect_packet(start_time: f64, out: *mut u8, capaci
     }
     unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), out, packet.len()) };
     packet.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game(name: &str) -> cloud::Game {
+        cloud::Game { id: format!("id-{name}"), name: name.into(), cover: None }
+    }
+
+    #[test]
+    fn the_catalog_goes_out_in_letter_order_with_its_placeholder() {
+        let mut zork = game("Zork");
+        zork.cover = Some("https://store-images.s-microsoft.com/zork".into());
+        // A quoted title sorts last by its characters, but is filed under its letter.
+        let games = games_json(&[zork, game("“Quake”"), game("7 Days to Die"), game("apex"), game("No Man's Sky")]);
+        let names: Vec<&str> = games.as_array().unwrap().iter().map(|game| game["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["7 Days to Die", "apex", "No Man's Sky", "“Quake”", "Zork"]);
+        assert_eq!(games[4]["id"], "id-Zork");
+        assert_eq!(games[4]["cover"], "https://store-images.s-microsoft.com/zork");
+        assert!(games[3]["cover"].is_null());
+        assert_eq!(games[0]["letter"], "#");
+        assert_eq!(games[2]["letter"], "N");
+        assert_eq!(games[2]["monogram"], "NM");
+        assert_eq!(games[2]["hue"], library::hue("No Man's Sky"));
+    }
+
+    #[test]
+    fn the_search_answers_positions_best_first() {
+        let names = c"[\"Balatro\",\"No Man's Sky\",\"Diablo IV\",\"HxAxLxO\",\"Halo\"]";
+        let search = |query: &std::ffi::CStr| {
+            let answer = unsafe { pw_library_search(names.as_ptr(), query.as_ptr()) };
+            let text = unsafe { CStr::from_ptr(answer) }.to_str().unwrap().to_owned();
+            pw_free_string(answer);
+            text
+        };
+        assert_eq!(search(c"nms"), "[1]");
+        // Both match; the closer match comes first, whatever the input order.
+        assert_eq!(search(c"halo"), "[4,3]");
+        assert_eq!(search(c""), "[0,1,2,3,4]");
+        assert_eq!(search(c"zzz"), "[]");
+    }
 }

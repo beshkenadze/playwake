@@ -89,6 +89,11 @@ final class SessionController: ObservableObject {
         if let i = arguments.firstIndex(of: "-uiFixture"), i + 1 < arguments.count {
             loadFixture(arguments[i + 1])
         }
+        // `-section cloud`: opens a section with live data.
+        if let i = arguments.firstIndex(of: "-section"), i + 1 < arguments.count,
+           let opened = Section.allCases.first(where: { "\($0)" == arguments[i + 1] }) {
+            section = opened
+        }
         #endif
     }
 
@@ -152,12 +157,8 @@ final class SessionController: ObservableObject {
     }
 
     func startCloud(_ game: CloudGame) {
-        guard let index = cloud.firstIndex(where: { $0.id == game.id }) else {
-            status = "\(game.name) is no longer in the catalog"
-            return
-        }
         beginStreaming(.game(game), title: game.name)
-        core.streamCloud(game: index, height: height)
+        core.streamCloud(game: game.id, height: height)
     }
 
     func stop() {
@@ -344,7 +345,12 @@ final class SessionController: ObservableObject {
         ]
         cloud = ["Forza Horizon 5", "Starfield", "Halo Infinite", "Sea of Thieves", "Hellblade II",
                  "Grounded", "Indiana Jones", "Microsoft Flight Simulator", "Gears 5", "Avowed",
-                 "Doom: The Dark Ages", "Palworld"].enumerated().map { CloudGame(id: "\($0.offset)", name: $0.element) }
+                 "Doom: The Dark Ages", "Palworld"].sorted().enumerated().map { index, name in
+            // Sample tiles without covers; the real fields come from the core.
+            CloudGame(id: "\(index)", name: name, cover: nil, letter: String(name.prefix(1)),
+                      monogram: name.split(separator: " ").prefix(2).compactMap(\.first).map(String.init).joined().uppercased(),
+                      hue: Double(index * 47 % 360))
+        }
         phase = .ready
         status = ""
         switch name {

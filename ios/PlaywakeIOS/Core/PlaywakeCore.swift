@@ -7,9 +7,23 @@ struct XboxConsole: Decodable, Identifiable, Equatable {
     let power: String
 }
 
+/// A cloud game in the core's letter order, with what its tile shows while
+/// the cover is missing (the same letter, monogram and hue as on SteamOS).
 struct CloudGame: Decodable, Identifiable, Equatable {
     let id: String
     let name: String
+    let cover: URL?
+    let letter: String
+    let monogram: String
+    let hue: Double
+
+    /// The cover `width` pixels wide: the Microsoft Store scales it on request.
+    func cover(width: Int) -> URL? {
+        guard let cover, var parts = URLComponents(url: cover, resolvingAgainstBaseURL: false) else { return nil }
+        parts.queryItems = [URLQueryItem(name: "w", value: "\(width)"),
+                            URLQueryItem(name: "h", value: "\(width * 3 / 2)")]
+        return parts.url
+    }
 }
 
 enum CoreEvent {
@@ -87,8 +101,16 @@ final class PlaywakeCore {
         pw_stream_home(trampoline, index, height)
     }
 
-    func streamCloud(game index: Int, height: UInt32) {
-        pw_stream_cloud(trampoline, index, height)
+    func streamCloud(game id: String, height: UInt32) {
+        pw_stream_cloud(trampoline, id, height)
+    }
+
+    /// The positions of `names` that match `query`, best first.
+    func search(_ names: [String], query: String) -> [Int] {
+        guard let data = try? JSONEncoder().encode(names),
+              let raw = pw_library_search(String(decoding: data, as: UTF8.self), query) else { return [] }
+        defer { pw_free_string(raw) }
+        return (try? JSONDecoder().decode([Int].self, from: Data(String(cString: raw).utf8))) ?? []
     }
 
     func stop() { pw_stop() }

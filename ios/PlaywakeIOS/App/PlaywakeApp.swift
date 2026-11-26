@@ -4,6 +4,11 @@ import SwiftUI
 struct PlaywakeApp: App {
     @StateObject private var session = SessionController()
 
+    init() {
+        // Covers load through URLSession.shared; keep them across scrolls and launches.
+        URLCache.shared = URLCache(memoryCapacity: 64 << 20, diskCapacity: 256 << 20)
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView(session: session)

@@ -183,28 +183,21 @@ struct CloudView: View {
     @State private var query = ""
 
     private var games: [CloudGame] {
-        query.isEmpty ? controller.cloud
-            : controller.cloud.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        let all = controller.cloud
+        return query.isEmpty ? all : PlaywakeCore.shared.search(all.map(\.name), query: query).map { all[$0] }
     }
 
     var body: some View {
-        ScrollView {
+        let games = games
+        Group {
             if controller.cloud.isEmpty {
                 VStack(spacing: 14) {
                     ProgressView().tint(Theme.mint)
                     Text("Loading the cloud catalog…").foregroundStyle(Theme.muted)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.top, 80)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 14)], spacing: 14) {
-                    ForEach(games) { game in
-                        Button { controller.startCloud(game) } label: { GameTile(name: game.name) }
-                            .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 8)
+                LibraryGrid(games: games, query: query) { controller.startCloud($0) }
             }
         }
         .background(Theme.canvas)

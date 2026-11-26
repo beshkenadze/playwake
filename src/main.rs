@@ -4,6 +4,7 @@ mod deck;
 mod device;
 mod input;
 mod journal;
+mod library;
 mod lsfg;
 mod media;
 mod pc;

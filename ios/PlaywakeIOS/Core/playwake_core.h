@@ -38,12 +38,17 @@ void pw_cancel_sign_in(void);
 void pw_sign_out(pw_emit callback);
 
 void pw_consoles(pw_emit callback);
+/// Emits `cloud` with the games in letter order, cached first when there is
+/// a cached list.
 void pw_cloud_catalog(pw_emit callback);
+/// The positions in `names_json` (a JSON array of strings) that fuzzily
+/// match `query`, best first, as a JSON array; all of them for "".
+char *pw_library_search(const char *names_json, const char *query);
 
 /// Reserves and provisions a stream. Emits `status`, then `ready` (with the
 /// STUN list and heartbeat interval), then `done`.
 void pw_stream_home(pw_emit callback, size_t console_index, uint32_t height);
-void pw_stream_cloud(pw_emit callback, size_t game_index, uint32_t height);
+void pw_stream_cloud(pw_emit callback, const char *game_id, uint32_t height);
 void pw_stop(void);
 
 char *pw_sdp(const char *offer);

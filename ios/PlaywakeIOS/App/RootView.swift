@@ -20,8 +20,13 @@ struct RootView: View {
         }
         .task {
             #if DEBUG
-            if ProcessInfo.processInfo.arguments.contains("-uiSnapshot") {
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
+            let arguments = ProcessInfo.processInfo.arguments
+            if arguments.contains("-uiSnapshot") {
+                // `-uiSnapshotDelay <s>` waits longer, e.g. for covers to load.
+                let asked = arguments.firstIndex(of: "-uiSnapshotDelay")
+                    .flatMap { $0 + 1 < arguments.count ? Double(arguments[$0 + 1]) : nil }
+                let delay = asked.flatMap { (0...600).contains($0) ? $0 : nil } ?? 2.5
+                try? await Task.sleep(for: .seconds(delay))
                 Self.snapshotWindow()
             }
             #endif
