@@ -10,7 +10,7 @@ from the desktop engine as a static Rust library.
 ```
 ios/
   Project.swift                Tuist manifest (source of truth)
-  scripts/build-rust-core.sh   builds ios-core and lipos it into Rust/
+  scripts/build-rust-core.sh   builds ios-core and lipos libplaywake_ffi.a into Rust/
   PlaywakeIOS/
     App/                       SwiftUI entry point
     Core/playwake_core.h       C ABI of the Rust core
@@ -20,18 +20,22 @@ ios/
     Session/Gamepad.swift      GCController -> Xbox wire masks
     Media/                     low-latency renderer + loopback lab
     UI/                        SessionView (real client) and LabView
-ios-core/                      Rust staticlib: protocol core + C ABI
+ios-core/                      Rust staticlib `playwake_ffi`: the C ABI over core/
+core/                          `playwake-core`, shared with the SteamOS app
 ```
 
-`ios-core` is a separate Cargo workspace on purpose: it uses `reqwest` with
-`native-tls` (Security.framework) while the desktop binary uses rustls, and
-keeping them apart avoids feature unification.
+There is one core for every device: `core/` (`playwake-core`) holds the Xbox
+and GameStream protocols, catalogs, pairing, library, covers and sessions;
+the SteamOS app, its media worker and this client all depend on it. Only the
+UI and the platform's own media decode and present differ. On Apple targets
+the core's `reqwest` uses `native-tls` (Security.framework), elsewhere rustls.
+`ios-core` stays a separate Cargo workspace with its own lock file.
 
-## What is reused from the desktop engine
+## What the core gives the iOS client
 
 | Desktop | iOS |
 | --- | --- |
-| `src/xbox.rs`, `src/cloud.rs`, `src/session_store.rs`, `src/journal.rs` | compiled unchanged into `ios-core` via `#[path]` |
+| `core/src/{xbox,cloud,session_store,journal,library}.rs` | linked as `playwake-core`, exposed by `ios-core` |
 | OAuth device code, XSTS, xHome/xCloud signaling, provisioning, keepalive | Rust core, async events over a C callback |
 | SDP offer munging (`b=AS`), candidate exchange, Teredo synthesis | Rust core (`pw_munge_offer`, `pw_sdp`, `pw_ice`) |
 | 38-byte input packet, 15-byte connect packet | Rust core (`pw_input_packet`, `pw_connect_packet`) |
@@ -66,7 +70,7 @@ xcodebuild -workspace PlaywakeIOS.xcworkspace -scheme PlaywakeIOS \
 ```
 
 The pre-build phase runs `scripts/build-rust-core.sh`, which builds the core
-for the platform Xcode targets and writes `ios/Rust/libplaywake_core.a`.
+for the platform Xcode targets and writes `ios/Rust/libplaywake_ffi.a`.
 
 Launch arguments:
 

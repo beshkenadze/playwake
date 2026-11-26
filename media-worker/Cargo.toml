@@ -23,3 +23,4 @@ libc = "0.2"
 gamestream = { version = "0.1.0", path = "../gamestream" }
 gstreamer-app = { version = "0.23", features = ["v1_20"] }
 ash = "0.38"
+playwake-core = { version = "0.2.0", path = "../core" }

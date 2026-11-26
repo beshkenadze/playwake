@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds the portable Rust protocol core for the platform Xcode is targeting
-# and drops a universal static library into ios/Rust/libplaywake_core.a.
+# and drops a universal static library into ios/Rust/libplaywake_ffi.a.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"          # ios/
@@ -30,7 +30,7 @@ LIBS=""
 for target in $TARGETS; do
     echo "note: building playwake-ios-core for $target ($PROFILE)" >&2
     ( cd "$CRATE" && cargo build --target "$target" $PROFILE_FLAG )
-    lib="$CRATE/target/$target/$PROFILE/libplaywake_core.a"
+    lib="$CRATE/target/$target/$PROFILE/libplaywake_ffi.a"
     if [ ! -f "$lib" ]; then
         echo "error: missing $lib" >&2
         exit 1
@@ -39,5 +39,5 @@ for target in $TARGETS; do
 done
 
 # shellcheck disable=SC2086
-xcrun lipo -create $LIBS -output "$OUT/libplaywake_core.a"
-echo "note: wrote $OUT/libplaywake_core.a" >&2
+xcrun lipo -create $LIBS -output "$OUT/libplaywake_ffi.a"
+echo "note: wrote $OUT/libplaywake_ffi.a" >&2

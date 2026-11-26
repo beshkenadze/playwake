@@ -4,21 +4,17 @@ version = "0.2.0"
 edition = "2024"
 
 [workspace]
-members = ["gamestream","media-worker"]
+members = ["core", "gamestream", "media-worker"]
 default-members = ["."]
 
 [dependencies]
 gpui-kit = "=0.10.0"
 qrcode = { version = "0.14", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-url = { version = "2", features = ["serde"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 raw-window-handle = "0.6"
-uuid = { version = "1", features = ["v4"] }
 gamestream = { version = "0.1.0", path = "gamestream" }
-nucleo-matcher = "0.3.1"
+playwake-core = { version = "0.2.0", path = "core" }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 gilrs = "0.11"

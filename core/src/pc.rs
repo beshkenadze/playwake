@@ -213,9 +213,10 @@ impl Catalog {
     }
 }
 
-#[cfg(test)]
 impl Catalog {
-    /// One paired PC that answered with these apps; its ID is its name.
+    /// One paired PC that answered with these apps; its ID is its name. For
+    /// the frontends' tests.
+    #[doc(hidden)]
     pub fn one_pc(name: &str, apps: &[&str]) -> Self {
         let pc = Pc { id: name.into(), name: name.into(), address: String::new(), certificate: String::new() };
         let games = apps.iter().zip(1..).map(|(title, app)| Game { name: (*title).into(), pc: pc.clone(), app,
@@ -283,7 +284,7 @@ fn collect(answers: Vec<std::result::Result<(Pc, Vec<Game>), Unpaired>>, saved: 
         catalog.games.extend(games);
         catalog.pcs.push(Computer::Paired(pc));
         // Apps in the order of their names, for the library and its letters.
-        catalog.games.sort_by_cached_key(|game| crate::deck::library_order(&game.name));
+        catalog.games.sort_by_cached_key(|game| crate::library::library_order(&game.name));
     }
     for pc in unpaired.into_iter().filter_map(std::result::Result::err) {
         if seen.contains(&pc.id) { continue; }

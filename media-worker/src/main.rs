@@ -20,7 +20,7 @@ mod overlay;
 #[cfg(target_os = "linux")]
 mod pipeline;
 #[cfg(target_os = "linux")]
-mod route;
+use playwake_core::route;
 #[cfg(target_os = "linux")]
 mod state;
 #[cfg(target_os = "linux")]

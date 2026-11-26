@@ -58,7 +58,7 @@ let project = Project(
                     "SWIFT_OBJC_BRIDGING_HEADER": "PlaywakeIOS/Core/playwake_core.h",
                     "LIBRARY_SEARCH_PATHS": ["$(SRCROOT)/Rust"],
                     "OTHER_LDFLAGS": [
-                        "-lplaywake_core",
+                        "-lplaywake_ffi",
                         "-framework", "Security",
                         "-framework", "CoreFoundation",
                     ],

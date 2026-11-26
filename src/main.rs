@@ -1,15 +1,9 @@
-mod cloud;
-mod covers;
 mod deck;
-mod device;
 mod input;
-mod journal;
-mod library;
 mod lsfg;
 mod media;
-mod pc;
-mod session_store;
-mod xbox;
+
+use playwake_core::{cloud, covers, device, journal, library, pc, session_store, xbox};
 
 use deck::{Action, Key, Menu, Tab};
 use session_store::{Language, Preferences};
