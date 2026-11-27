@@ -106,6 +106,9 @@ impl Default for PadLayout {
 pub struct PadFromKeys {
     layout: PadLayout,
     held: HashSet<Source>,
+    /// Pressed since the last state, so a press and release between two
+    /// ticks still shows in one.
+    pressed: HashSet<Source>,
     motion: (f32, f32),
     /// The right stick before the dead zone, -1…1 each way.
     look: (f32, f32),
@@ -114,7 +117,7 @@ pub struct PadFromKeys {
 
 impl PadFromKeys {
     pub fn new(layout: PadLayout) -> Self {
-        Self { layout, held: HashSet::new(), motion: (0.0, 0.0), look: (0.0, 0.0), last: None }
+        Self { layout, held: HashSet::new(), pressed: HashSet::new(), motion: (0.0, 0.0), look: (0.0, 0.0), last: None }
     }
 
     pub fn event(&mut self, event: &InputEvent) {
@@ -132,12 +135,18 @@ impl PadFromKeys {
             }
             _ => return,
         };
-        if down { self.held.insert(source); } else { self.held.remove(&source); }
+        if down {
+            self.held.insert(source);
+            self.pressed.insert(source);
+        } else {
+            self.held.remove(&source);
+        }
     }
 
     /// Lets go of everything, as when the stream loses focus.
     pub fn release_all(&mut self) {
         self.held.clear();
+        self.pressed.clear();
         self.motion = (0.0, 0.0);
         self.look = (0.0, 0.0);
     }
@@ -146,19 +155,21 @@ impl PadFromKeys {
     /// right stick follows the mouse travel since the last call.
     pub fn state(&mut self, now: f64) -> Routed {
         let mut routed = Routed { axes: [0; 4], buttons: 0, lt: 0, rt: 0 };
-        let (mut up, mut down, mut left, mut right) = (false, false, false, false);
-        for binding in self.layout.bindings.iter().filter(|binding| self.held.contains(&binding.source)) {
+        let (mut up, mut south, mut left, mut right) = (false, false, false, false);
+        let pressed = std::mem::take(&mut self.pressed);
+        let down = |source| self.held.contains(source) || pressed.contains(source);
+        for binding in self.layout.bindings.iter().filter(|binding| down(&binding.source)) {
             match binding.target {
                 Target::LeftTrigger => routed.lt = u16::MAX,
                 Target::RightTrigger => routed.rt = u16::MAX,
                 Target::StickUp => up = true,
-                Target::StickDown => down = true,
+                Target::StickDown => south = true,
                 Target::StickLeft => left = true,
                 Target::StickRight => right = true,
                 target => routed.buttons |= target.bit(),
             }
         }
-        let walk = (f32::from(right) - f32::from(left), f32::from(down) - f32::from(up));
+        let walk = (f32::from(right) - f32::from(left), f32::from(south) - f32::from(up));
         let walk = scaled(walk, length(walk).min(1.0));
         self.look(now);
         let reach = length(self.look);
@@ -181,7 +192,8 @@ impl PadFromKeys {
             let look = (motion.0 * speed, motion.1 * speed);
             self.look = scaled(look, length(look).min(1.0));
         } else {
-            let left = (-elapsed as f32 / self.layout.decay_ms).exp();
+            let decay_ms = self.layout.decay_ms;
+            let left = if decay_ms > 0.0 { (-elapsed as f32 / decay_ms).exp() } else { 0.0 };
             self.look = (self.look.0 * left, self.look.1 * left);
             if length(self.look) < 0.01 { self.look = (0.0, 0.0); }
         }
@@ -272,8 +284,9 @@ mod tests {
         key(&mut pad, ESCAPE, false);
         assert_eq!(pad.state(0.0).buttons, 4);
         key(&mut pad, ENTER, true);
+        assert_eq!(pad.state(8.0).buttons, 4);
         key(&mut pad, ENTER, false);
-        assert_eq!(pad.state(8.0).buttons, 0, "a repeated key-down does not count twice");
+        assert_eq!(pad.state(16.0).buttons, 0, "a repeated key-down does not count twice");
     }
 
     #[test]
@@ -317,6 +330,30 @@ mod tests {
         assert_eq!(pad.state(50.0).axes[2], 0, "nor when the clock goes back");
         assert_eq!(pad.state(f64::NAN).axes[2], 0, "nor when it is no time at all");
         assert_eq!(pad.state(110.0).axes[2], axis(0.36), "the travel counts on the next real tick");
+    }
+
+    #[test]
+    fn a_click_between_two_ticks_shows_in_one() {
+        let mut pad = PadFromKeys::new(PadLayout::default());
+        mouse(&mut pad, MouseButton::Left, true);
+        mouse(&mut pad, MouseButton::Left, false);
+        key(&mut pad, SPACE, true);
+        key(&mut pad, SPACE, false);
+        let state = pad.state(0.0);
+        assert_eq!((state.rt, state.buttons), (u16::MAX, 16));
+        let state = pad.state(8.0);
+        assert_eq!((state.rt, state.buttons), (0, 0));
+    }
+
+    #[test]
+    fn a_decay_of_zero_or_less_stops_the_stick_at_once() {
+        for decay_ms in [0.0, -50.0] {
+            let mut pad = PadFromKeys::new(PadLayout { decay_ms, ..PadLayout::default() });
+            pad.state(0.0);
+            look(&mut pad, 1.0, 0.0);
+            assert!(pad.state(10.0).axes[2] > 0);
+            assert_eq!(pad.state(20.0).axes[2], 0, "decay_ms {decay_ms}");
+        }
     }
 
     #[test]
