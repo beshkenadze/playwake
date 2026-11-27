@@ -287,6 +287,7 @@ struct SettingsView: View {
     @ObservedObject var controller: SessionController
     @State private var controllerName = GCController.current?.vendorName
     @State private var confirmSignOut = false
+    @AppStorage(VirtualPad.Mode.key) private var virtualPad = VirtualPad.Mode.auto
 
     private var version: String {
         let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "–"
@@ -322,7 +323,7 @@ struct SettingsView: View {
                                                                        set: { controller.setVsync($0) }))
             }
             #endif
-            Section("Controls") {
+            Section {
                 LabeledContent("Controller") {
                     HStack(spacing: 6) {
                         StatusDot(color: controllerName == nil ? Color(hex: 0x6B6E6E) : Theme.mint)
@@ -334,6 +335,19 @@ struct SettingsView: View {
                 #else
                 LabeledContent("Stream menu", value: "View + Menu or tap")
                 #endif
+                if VirtualPad.supported {
+                    Picker("On-screen controller", selection: $virtualPad) {
+                        Text("Auto").tag(VirtualPad.Mode.auto)
+                        Text("Always").tag(VirtualPad.Mode.always)
+                        Text("Never").tag(VirtualPad.Mode.never)
+                    }
+                }
+            } header: {
+                Text("Controls")
+            } footer: {
+                if VirtualPad.supported {
+                    Text("Auto shows the on-screen controller during a stream when no controller is connected.")
+                }
             }
             Section("Diagnostics") {
                 Toggle("Statistics overlay", isOn: $controller.showStats)

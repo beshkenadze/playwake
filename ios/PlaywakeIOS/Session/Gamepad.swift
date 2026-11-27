@@ -31,11 +31,34 @@ final class Gamepad {
         static let dpadRight: UInt16 = 2048
     }
 
+    /// The system on-screen pad (`GCVirtualController`) is `touch`; a
+    /// physical pad keeps priority over it.
+    enum Kind {
+        case physical, touch
+
+        init(_ controller: GCController) {
+            self = controller.productCategory == "Touch Controller" ? .touch : .physical
+        }
+    }
+
+    /// Whether a newly connected pad replaces the current one: the last
+    /// physical pad wins, the on-screen pad only fills an empty slot.
+    static func prefers(current: Kind?, new: Kind) -> Bool {
+        current == nil || new == .physical || current == .touch
+    }
+
+    /// The pad to fall back to when the current one goes away.
+    static func fallback<T>(_ candidates: [T], kind: (T) -> Kind) -> T? {
+        candidates.first { kind($0) == .physical } ?? candidates.first
+    }
+
     static let shared = Gamepad()
 
     private let lock = NSLock()
+    private let kind: (GCController) -> Kind
     private var current: GCController?
     private var changeHandler: (() -> Void)?
+    private var overlay: UInt16 = 0
     /// Controller events arrive here instead of the main queue, which UI
     /// work can hold up.
     private let handlerQueue = DispatchQueue(label: "io.playwake.gamepad", qos: .userInteractive)
@@ -45,10 +68,25 @@ final class Gamepad {
         get { lock.lock(); defer { lock.unlock() }; return changeHandler }
         set { lock.lock(); changeHandler = newValue; lock.unlock() }
     }
+    /// Buttons pressed on screen outside the controller (the on-screen
+    /// View and Menu), merged into every snapshot.
+    var overlayButtons: UInt16 {
+        get { lock.lock(); defer { lock.unlock() }; return overlay }
+        set {
+            lock.lock()
+            let changed = overlay != newValue
+            overlay = newValue
+            lock.unlock()
+            if changed { handlerQueue.async { [weak self] in self?.onChange?() } }
+        }
+    }
     private var observing = false
     private var discoveryTimer: DispatchSourceTimer?
 
-    private init() {}
+    /// `kind` is replaceable for tests, which cannot make a touch controller.
+    init(kind: @escaping (GCController) -> Kind = Kind.init) {
+        self.kind = kind
+    }
 
     func start() {
         lock.lock()
@@ -62,9 +100,7 @@ final class Gamepad {
         }
         NotificationCenter.default.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] note in
             guard let controller = note.object as? GCController else { return }
-            self?.lock.lock()
-            if self?.current === controller { self?.current = nil }
-            self?.lock.unlock()
+            self?.disconnected(controller, remaining: GCController.controllers())
         }
         #if os(macOS) || targetEnvironment(macCatalyst)
         // macOS only delivers controller input to the focused app by default.
@@ -73,7 +109,7 @@ final class Gamepad {
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
         let available = GCController.controllers()
         LabLog.write("gamepad scan: \(available.count) controller(s)")
-        adopt(available.first)
+        adopt(best(available))
         // The HID manager comes up asynchronously, and on macOS a pad already
         // connected is only exposed once the app is focused, so keep looking
         // until one shows up instead of guessing a timeout.
@@ -93,31 +129,53 @@ final class Gamepad {
             let found = GCController.controllers()
             if !found.isEmpty {
                 LabLog.write("gamepad retry: \(found.count) controller(s)")
-                self.adopt(found.first)
+                self.adopt(self.best(found))
             }
         }
         timer.resume()
         discoveryTimer = timer
     }
 
-    private func adopt(_ controller: GCController?) {
-        guard let controller else { return }
+    /// Only full gamepads count: `snapshot()` reads the extended profile.
+    private func best(_ controllers: [GCController]) -> GCController? {
+        Self.fallback(controllers.filter { $0.extendedGamepad != nil }, kind: kind)
+    }
+
+    func adopt(_ controller: GCController?) {
+        guard let controller, controller.extendedGamepad != nil else { return }
+        lock.lock()
+        let replace = Self.prefers(current: current.map(kind), new: kind(controller))
+        if replace { current = controller }
+        lock.unlock()
+        if replace { configure(controller) }
+    }
+
+    /// Falls back to another pad, physical first, when the current one goes.
+    /// The swap is one step, so a snapshot never sees no pad in between.
+    func disconnected(_ controller: GCController, remaining: [GCController]) {
+        lock.lock()
+        let wasCurrent = current === controller
+        if wasCurrent { current = best(remaining.filter { $0 !== controller }) }
+        let next = current
+        lock.unlock()
+        if wasCurrent, let next { configure(next) }
+    }
+
+    private func configure(_ controller: GCController) {
         controller.playerIndex = .index1
         controller.handlerQueue = handlerQueue
         controller.extendedGamepad?.valueChangedHandler = { [weak self] _, _ in self?.onChange?() }
-        lock.lock()
-        current = controller
-        lock.unlock()
         LabLog.write("gamepad connected: \(controller.vendorName ?? "unknown")")
     }
 
     func snapshot() -> Snapshot {
         lock.lock()
         let controller = current
+        let overlay = overlay
         lock.unlock()
-        guard let pad = controller?.extendedGamepad else { return Snapshot() }
+        var snap = Snapshot(buttons: overlay)
+        guard let pad = controller?.extendedGamepad else { return snap }
 
-        var snap = Snapshot()
         if pad.buttonA.isPressed { snap.buttons |= Button.south }
         if pad.buttonB.isPressed { snap.buttons |= Button.east }
         if pad.buttonY.isPressed { snap.buttons |= Button.north }

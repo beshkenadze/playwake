@@ -19,6 +19,7 @@ struct StreamView: View {
                     .padding(20)
                     .allowsHitTesting(false)
             }
+            VirtualPadButtons()
             // Shown while connecting too: View+Menu opens the route's menu and
             // pauses the pad, so the menu must be visible whenever it is open.
             if controller.menuOpen {
@@ -38,9 +39,15 @@ struct StreamView: View {
             controller.menuOpen ? controller.closeMenu() : controller.openMenu()
         }
         .background { shortcuts }
+        .onAppear { VirtualPad.shared.setActive(padActive) }
+        .onChange(of: padActive) { _, active in VirtualPad.shared.setActive(active) }
+        .onDisappear { VirtualPad.shared.setActive(false) }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
     }
+
+    /// The on-screen pad would cover the menu, which takes taps instead.
+    private var padActive: Bool { controller.firstFrame && !controller.menuOpen }
 
     /// Keyboard shortcuts (Mac, iPad with a keyboard).
     private var shortcuts: some View {
