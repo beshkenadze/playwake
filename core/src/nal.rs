@@ -78,7 +78,7 @@ mod tests {
         let stream = [0, 0, 0, 1, 0x40, 0x01, 0x0c, 0, 0, 0, 1, 0x42, 0x01, 0x01, 0, 0, 0, 1, 0x44, 0x01, 0xc1,
             0, 0, 0, 1, 0x26, 0x01, 0xaf];
         let unit = access_unit(&stream, Codec::Hevc);
-        assert_eq!(unit.parameter_sets.len(), 3);
+        assert_eq!(unit.parameter_sets, [vec![0x40, 0x01, 0x0c], vec![0x42, 0x01, 0x01], vec![0x44, 0x01, 0xc1]]);
         assert_eq!(unit.data, [0, 0, 0, 3, 0x26, 0x01, 0xaf]);
     }
 }

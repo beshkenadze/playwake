@@ -139,7 +139,8 @@ final class SessionController: ObservableObject {
         player.onMenu = { [weak self] events in self?.handleMenu(events) }
         pcPlayer = player
         let size = resolution(height)
-        player.start(game: game.id, width: size.0, height: size.1, fps: 60, bitrateKbps: 20_000)
+        // A refused start says why in `pcError`; leave the connecting screen.
+        if !player.start(game: game.id, width: size.0, height: size.1, fps: 60, bitrateKbps: 20_000) { stop() }
     }
 
     func refreshConsoles() {
@@ -235,7 +236,7 @@ final class SessionController: ObservableObject {
     }
 
     func closeMenu(guide: Bool = false) {
-        if let pcPlayer { pcPlayer.closeMenu() } else if let rtc { rtc.closeMenu(guide: guide) } else if fixture { handleMenu(UInt32(PW_ROUTE_MENU_CLOSED)) }
+        if let pcPlayer { pcPlayer.closeMenu(guide: guide) } else if let rtc { rtc.closeMenu(guide: guide) } else if fixture { handleMenu(UInt32(PW_ROUTE_MENU_CLOSED)) }
     }
 
     func perform(_ item: MenuItem) {
@@ -348,12 +349,14 @@ final class SessionController: ObservableObject {
             pairing = nil
             status = "Paired with \(name)"
             refreshPcs()
-        case .pcStreaming(let hevc, let hdr):
+        case .pcStreaming(let session, let hevc, let hdr):
+            guard session == pcPlayer?.session else { break }
             status = "Streaming \(hevc ? "HEVC" : "H.264")\(hdr ? " HDR" : "")"
             LabLog.write("pc: \(status)")
-        case .pcEnded(let error):
+        case .pcEnded(let session, let error):
             LabLog.write("pc: stream ended \(error ?? "")")
-            if case .pc = lastTarget, streaming {
+            // A stream that was replaced or stopped already is not this one.
+            if session == pcPlayer?.session, streaming {
                 stop()
                 status = error ?? ""
             }

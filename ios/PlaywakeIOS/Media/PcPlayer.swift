@@ -12,8 +12,10 @@ final class PcPlayer {
     /// Stream-menu events from the input route, on the main queue.
     var onMenu: ((UInt32) -> Void)?
 
+    /// The core's session of this stream; 0 until it starts.
+    private(set) var session: UInt64 = 0
     private var format: CMVideoFormatDescription?
-    private var session: VTDecompressionSession?
+    private var decoder: VTDecompressionSession?
     private var decoded = false
     private let sound = OpusPlayer()
     private let route = pw_route_new()
@@ -28,12 +30,13 @@ final class PcPlayer {
         pw_route_free(route)
     }
 
-    func start(game id: String, width: UInt32, height: UInt32, fps: UInt32, bitrateKbps: UInt32) {
+    /// False when the core refused the stream.
+    func start(game id: String, width: UInt32, height: UInt32, fps: UInt32, bitrateKbps: UInt32) -> Bool {
         Self.playing = self
         sound.start()
         Gamepad.shared.start()
         startInput()
-        PlaywakeCore.shared.streamPc(game: id, width: width, height: height, fps: fps, bitrateKbps: bitrateKbps,
+        session = PlaywakeCore.shared.streamPc(game: id, width: width, height: height, fps: fps, bitrateKbps: bitrateKbps,
                                      video: { data, length, sets, lengths, count, hevc, _ in
                                          guard let data else { return }
                                          PcPlayer.playing?.decode(data, length, sets: sets, lengths: lengths,
@@ -43,15 +46,24 @@ final class PcPlayer {
                                          guard let data else { return }
                                          PcPlayer.playing?.sound.play(data, length)
                                      })
+        if session == 0 { stop() }
+        return session != 0
     }
 
     func stop() {
+        // Returns once the stream's thread is done, so no frame or sound follows.
         pw_pc_stop()
         inputQueue.sync {
             inputTimer?.cancel()
             inputTimer = nil
         }
         sound.stop()
+        if let decoder {
+            VTDecompressionSessionWaitForAsynchronousFrames(decoder)
+            VTDecompressionSessionInvalidate(decoder)
+        }
+        decoder = nil
+        format = nil
         if Self.playing === self { Self.playing = nil }
     }
 
@@ -62,10 +74,11 @@ final class PcPlayer {
         }
     }
 
-    func closeMenu() {
+    /// `guide` presses the PC's Guide button once the pad is released.
+    func closeMenu(guide: Bool) {
         inputQueue.async { [weak self] in
             guard let self else { return }
-            self.report(pw_route_close(self.route, false))
+            self.report(pw_route_close(self.route, guide))
         }
     }
 
@@ -86,7 +99,7 @@ final class PcPlayer {
             describe((0..<count).compactMap { sets[$0] }, sizes: (0..<count).map { lengths[$0] }, hevc: hevc)
         }
         // Until the first key frame there is nothing to decode against.
-        guard let format, let session else { return }
+        guard let format, let decoder else { return }
         var block: CMBlockBuffer?
         guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: length,
                                                  blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
@@ -100,7 +113,9 @@ final class PcPlayer {
                                         sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
                                         sampleSizeEntryCount: 1, sampleSizeArray: &size,
                                         sampleBufferOut: &sample) == noErr, let sample else { return }
-        VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [], infoFlagsOut: nil) {
+        // Asynchronous, so a slow decode does not hold up the sound behind it.
+        VTDecompressionSessionDecodeFrame(decoder, sampleBuffer: sample, flags: [._EnableAsynchronousDecompression],
+                                          infoFlagsOut: nil) {
             [weak self] status, _, image, _, _ in
             guard status == noErr, let image else { return }
             self?.show(image)
@@ -128,7 +143,14 @@ final class PcPlayer {
             return
         }
         if let format, CMFormatDescriptionEqual(format, otherFormatDescription: described) { return }
-        if let session { VTDecompressionSessionInvalidate(session) }
+        if let decoder {
+            VTDecompressionSessionWaitForAsynchronousFrames(decoder)
+            VTDecompressionSessionInvalidate(decoder)
+        }
+        // Until a decoder for the new format exists, nothing decodes: the
+        // next key frame tries again, also if it brings the old format back.
+        decoder = nil
+        format = nil
         let attributes: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelBufferMetalCompatibilityKey: true,
@@ -145,7 +167,7 @@ final class PcPlayer {
         }
         VTSessionSetProperty(made, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         format = described
-        session = made
+        decoder = made
         let size = CMVideoFormatDescriptionGetDimensions(described)
         LabLog.write("pc: decoding \(hevc ? "HEVC" : "H.264") \(size.width)x\(size.height)")
         DispatchQueue.main.async { [renderer] in
@@ -207,6 +229,7 @@ private final class OpusPlayer {
     private lazy var converter = AVAudioConverter(from: opus, to: pcm)
     private let lock = NSLock()
     private var waiting = 0
+    private var stopped = false
     /// Packets that may wait to be played: 40 ms.
     private let mostWaiting = 8
 
@@ -222,18 +245,24 @@ private final class OpusPlayer {
     }
 
     func stop() {
+        lock.lock()
+        stopped = true
+        lock.unlock()
         node.stop()
         engine.stop()
+        #if os(iOS)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        #endif
     }
 
     /// Called on the stream's thread.
     func play(_ data: UnsafePointer<UInt8>, _ length: Int) {
         lock.lock()
-        let full = waiting >= mostWaiting
-        if !full { waiting += 1 }
-        lock.unlock()
         // Late sound is worse than a gap: drop what would wait too long.
-        guard !full else { return }
+        let take = !stopped && waiting < mostWaiting
+        if take { waiting += 1 }
+        lock.unlock()
+        guard take else { return }
         guard let converter, let out = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 960) else { return done() }
         let packet = AVAudioCompressedBuffer(format: opus, packetCapacity: 1, maximumPacketSize: max(length, 1))
         packet.data.copyMemory(from: data, byteCount: length)
@@ -252,7 +281,10 @@ private final class OpusPlayer {
             status.pointee = .haveData
             return packet
         }
-        guard out.frameLength > 0 else { return done() }
+        lock.lock()
+        let playing = !stopped && out.frameLength > 0
+        lock.unlock()
+        guard playing else { return done() }
         node.scheduleBuffer(out) { [weak self] in self?.done() }
     }
 

@@ -109,14 +109,16 @@ typedef void (*pw_pc_video)(const uint8_t *data, size_t length, const uint8_t *c
                             const size_t *set_lengths, size_t count, bool hevc, bool key);
 /// One Opus packet, 48 kHz stereo, 5 ms. Valid for the call only.
 typedef void (*pw_pc_audio)(const uint8_t *data, size_t length);
-/// Streams the app with this `id` (from `pcs`). Emits `status`,
-/// `pcStreaming`, `pcHdr` and `pcEnded`; `video` and `audio` are called on
-/// the stream's own thread.
-void pw_pc_stream(pw_emit callback, const char *game_id, uint32_t width, uint32_t height, uint32_t fps,
+/// Streams the app with this `id` (from `pcs`). Returns the stream's
+/// session, or 0 when it cannot start (`pcError` says why). Emits `status`,
+/// `pcStreaming`, `pcHdr` and `pcEnded`, each with its `session`; `video` and
+/// `audio` are called on the stream's own thread.
+uint64_t pw_pc_stream(pw_emit callback, const char *game_id, uint32_t width, uint32_t height, uint32_t fps,
                   uint32_t bitrate_kbps, bool hdr, pw_pc_video video, pw_pc_audio audio);
 /// Sends a routed pad state (after `pw_route_input`) to the PC stream.
 void pw_pc_gamepad(const pw_pad *pad);
-/// Ends the PC stream; `pcEnded` follows.
+/// Ends the PC stream, also one still launching, and waits up to 3 s for its
+/// thread: after it returns no frame or sound of it arrives. `pcEnded` follows.
 void pw_pc_stop(void);
 
 #ifdef __cplusplus

@@ -11,12 +11,13 @@ final class Gamepad {
         var rt: UInt16 = 0
     }
 
-    // Wire masks mirrored from media-worker/src/input.rs.
+    // Wire masks mirrored from media-worker/src/input.rs: X is 64 and Y 128,
+    // so the top face button (Y) is 128 and the left one (X) is 64.
     enum Button {
         static let south: UInt16 = 16
         static let east: UInt16 = 32
-        static let north: UInt16 = 64
-        static let west: UInt16 = 128
+        static let north: UInt16 = 128
+        static let west: UInt16 = 64
         static let view: UInt16 = 8
         static let menu: UInt16 = 4
         static let guide: UInt16 = 2

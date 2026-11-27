@@ -108,6 +108,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pairing_a_new_host_asks_its_https_port_first() {
+        use crate::{Host, Identity};
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            // serverinfo, then the PIN step (closed unanswered), then the unpair
+            // that cleans up; a client that skips one is not waited for long.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while asked.len() < 3 && std::time::Instant::now() < deadline {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                };
+                socket.set_nonblocking(false).unwrap();
+                let mut request = [0u8; 8192];
+                let read = socket.read(&mut request).unwrap_or(0);
+                let line = String::from_utf8_lossy(&request[..read]).lines().next().unwrap_or_default().to_owned();
+                if line.starts_with("GET /serverinfo") {
+                    let xml = "<root status_code=\"200\"><hostname>den</hostname><HttpsPort>47990</HttpsPort></root>";
+                    let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{xml}", xml.len());
+                }
+                asked.push(line);
+            }
+            asked
+        });
+        let mut host = Host { http_port: port, ..Host::new("127.0.0.1") };
+        assert!(pair(&mut host, &Identity::generate().unwrap(), "1234").is_err());
+        let asked = server.join().unwrap();
+        assert!(asked[0].starts_with("GET /serverinfo"), "{asked:?}");
+        assert!(asked[1].starts_with("GET /pair"), "{asked:?}");
+        // The last step, over HTTPS, would now go to the port the host named, not to 0.
+        assert_eq!(host.https_port, 47990);
+    }
+
+    #[test]
     fn ecb_round_trips_whole_blocks() {
         let key = Aes128::new_from_slice(&sha256(&[b"salt", b"1234"])[..16]).unwrap();
         let data = [7u8; 32];

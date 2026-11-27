@@ -79,8 +79,8 @@ enum CoreEvent {
     case pcs(computers: [PcComputer], games: [PcGame])
     case pcPin(pin: String, name: String)
     case pcPaired(name: String)
-    case pcStreaming(hevc: Bool, hdr: Bool)
-    case pcEnded(error: String?)
+    case pcStreaming(session: UInt64, hevc: Bool, hdr: Bool)
+    case pcEnded(session: UInt64, error: String?)
     case pcError(String)
 }
 
@@ -157,8 +157,9 @@ final class PlaywakeCore {
     func pairPc(address: String) { pw_pc_pair(trampoline, address) }
     func addPc(address: String) { pw_pc_add(trampoline, address) }
 
+    /// The stream's session, or 0 when it could not start.
     func streamPc(game id: String, width: UInt32, height: UInt32, fps: UInt32, bitrateKbps: UInt32,
-                  video: pw_pc_video, audio: pw_pc_audio) {
+                  video: pw_pc_video, audio: pw_pc_audio) -> UInt64 {
         pw_pc_stream(trampoline, id, width, height, fps, bitrateKbps, false, video, audio)
     }
 
@@ -290,9 +291,11 @@ final class PlaywakeCore {
         case "pcPaired":
             event = .pcPaired(name: object["name"] as? String ?? "")
         case "pcStreaming":
-            event = .pcStreaming(hevc: object["hevc"] as? Bool ?? false, hdr: object["hdr"] as? Bool ?? false)
+            event = .pcStreaming(session: (object["session"] as? NSNumber)?.uint64Value ?? 0,
+                                 hevc: object["hevc"] as? Bool ?? false, hdr: object["hdr"] as? Bool ?? false)
         case "pcEnded":
-            event = .pcEnded(error: object["error"] as? String)
+            event = .pcEnded(session: (object["session"] as? NSNumber)?.uint64Value ?? 0,
+                             error: object["error"] as? String)
         case "pcError":
             event = .pcError(object["message"] as? String ?? "Unknown error")
         default:
