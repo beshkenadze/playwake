@@ -143,9 +143,7 @@ fn whole(rest: &mut f32, value: f32) -> i16 {
     whole.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
 }
 
-/// Enable after T1 lands the mouse and touch packets in `gamestream`, and
-/// match the conversions to the types it defines.
-#[cfg(any())]
+/// A PC stream takes core input as GameStream packets.
 impl Sink for gamestream::Stream {
     fn key(&self, key: u8, down: bool, modifiers: u8) { gamestream::Stream::key(self, key, down, modifiers) }
     fn text(&self, text: &str) { gamestream::Stream::text(self, text) }
