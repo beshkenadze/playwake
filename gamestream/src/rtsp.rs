@@ -21,6 +21,8 @@ pub(crate) struct Ports {
     pub ping_payload: [u8; 16],
     /// Sent when the control stream connects, for the same reason.
     pub connect_data: u32,
+    /// The host takes touch and pen packets.
+    pub touch: bool,
 }
 
 struct Client {
@@ -54,6 +56,13 @@ impl Client {
 fn header<'a>(answer: &'a str, name: &str) -> Option<&'a str> {
     answer.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix(':')).map(str::trim)
 }
+
+/// The features the host announces in its description; none when it names none.
+fn feature_flags(description: &str) -> u32 {
+    header(description, "a=x-ss-general.featureFlags").and_then(|value| value.parse().ok()).unwrap_or(0)
+}
+
+const FEATURE_TOUCH: u32 = 0x01;
 
 fn server_port(answer: &str, fallback: u16) -> u16 {
     header(answer, "Transport").and_then(|value| value.split_once("server_port=")?.1.parse().ok()).unwrap_or(fallback)
@@ -101,6 +110,12 @@ pub(crate) fn handshake(address: SocketAddr, config: &Config) -> Result<Ports> {
     let mut client = Client { address, host: address.ip().to_string(), sequence: 0 };
     let transport = "Transport: unicast;X-GS-ClientPort=50000-50001\r\n";
 
+    // Only the host's features come from its description, and the stream
+    // works without them.
+    let features = client.request(&format!("DESCRIBE rtsp://{address}"),
+        "Accept: application/sdp\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n", "")
+        .map_or(0, |description| feature_flags(&description));
+
     let audio = client.request("SETUP streamid=audio/0/0", transport, "")?;
     let session = header(&audio, "Session").and_then(|value| value.split(';').next())
         .ok_or("The PC sent no stream session")?.to_owned();
@@ -115,6 +130,7 @@ pub(crate) fn handshake(address: SocketAddr, config: &Config) -> Result<Ports> {
         control: server_port(&control, 47999),
         ping_payload,
         connect_data: header(&control, "X-SS-Connect-Data").and_then(|value| value.parse().ok()).unwrap_or(0),
+        touch: features & FEATURE_TOUCH != 0,
     };
     client.request("ANNOUNCE streamid=control/13/0", &format!("{session}Content-type: application/sdp\r\n"),
         &description(&address, config, ports.video))?;
@@ -135,6 +151,21 @@ mod tests {
         assert_eq!(header(answer, "X-SS-Connect-Data"), None);
         assert_eq!(server_port(answer, 1), 48000);
         assert_eq!(server_port("RTSP/1.0 200 OK\r\n\r\n", 47998), 47998);
+    }
+
+    #[test]
+    fn reads_the_feature_flags_from_the_host_description() {
+        // Vibepollo 1f9ea16 src/rtsp.cpp:2145 writes the flags in decimal, one
+        // attribute a line; platform/common.h:466-467 gives 0x01 to touch and
+        // pen, 0x02 to gamepad touch. moonlight-common-c b618ef2 reads them at
+        // src/RtspConnection.c:1112-1114, 0 when absent.
+        let answer = "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-length: 120\r\n\r\n\
+            a=x-ss-general.featureFlags:3\na=x-ss-general.encryptionSupported:7\na=x-ss-general.encryptionRequested:1\n";
+        assert_eq!(feature_flags(answer), 3);
+        assert_ne!(feature_flags(answer) & FEATURE_TOUCH, 0);
+        assert_eq!(feature_flags("a=x-ss-general.featureFlags:2\n") & FEATURE_TOUCH, 0);
+        assert_eq!(feature_flags("RTSP/1.0 200 OK\r\n\r\na=x-nv-video[0].refPicInvalidation:1\n"), 0);
+        assert_eq!(feature_flags("a=x-ss-general.featureFlags:junk\n"), 0);
     }
 
     #[test]
