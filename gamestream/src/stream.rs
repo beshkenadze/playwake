@@ -436,11 +436,14 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         for thread in threads { thread.join().unwrap(); }
-        // Video pings first, and the streams take turns with room between.
+        // Video pings first, and the streams take turns with room between. A
+        // ping waits for the receive in progress (up to RECEIVE_WAIT), so the
+        // 250 ms between the streams can shrink by that and a busy machine's
+        // delay; half of RECEIVE_WAIT still tells them from pinging together.
         assert_eq!(pings[0].0, video_port);
         for pair in pings.windows(2) {
             assert_ne!(pair[0].0, pair[1].0, "{pings:?}");
-            assert!(pair[1].1 - pair[0].1 >= Duration::from_millis(100), "{pings:?}");
+            assert!(pair[1].1 - pair[0].1 >= RECEIVE_WAIT / 2, "{pings:?}");
         }
         assert!(pings.iter().any(|(port, _)| *port == audio_port));
     }

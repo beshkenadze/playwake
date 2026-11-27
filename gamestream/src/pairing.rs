@@ -111,6 +111,8 @@ mod tests {
     fn pairing_a_new_host_asks_its_https_port_first() {
         use crate::{Host, Identity};
         use std::io::{Read, Write};
+        // Made before the host starts waiting: an RSA key takes seconds in a debug build.
+        let identity = Identity::generate().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -137,7 +139,7 @@ mod tests {
             asked
         });
         let mut host = Host { http_port: port, ..Host::new("127.0.0.1") };
-        assert!(pair(&mut host, &Identity::generate().unwrap(), "1234").is_err());
+        assert!(pair(&mut host, &identity, "1234").is_err());
         let asked = server.join().unwrap();
         assert!(asked[0].starts_with("GET /serverinfo"), "{asked:?}");
         assert!(asked[1].starts_with("GET /pair"), "{asked:?}");
