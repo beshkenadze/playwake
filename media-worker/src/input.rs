@@ -304,9 +304,18 @@ pub struct Mouse {
 }
 
 impl Mouse {
-    /// Starts or stops taking the mouse; stopping lets go of every held button.
-    pub fn set_active(&mut self, sink: &impl Sink, active: bool) {
-        if self.active && !active { self.pc.release_all(sink); }
+    /// Sends `events` from a `window`-sized video window showing a
+    /// `picture`-sized video, and starts or stops taking the mouse. Events
+    /// read as the mouse is taken or let go stay local; letting go releases
+    /// every held button.
+    pub fn update(&mut self, sink: &impl Sink, active: bool, events: impl IntoIterator<Item = PointerEvent>,
+        window: (u32, u32), picture: (u32, u32))
+    {
+        if self.active && active {
+            for event in events { self.send(sink, event, window, picture); }
+        } else if self.active {
+            self.pc.release_all(sink);
+        }
         self.active = active;
     }
 
@@ -316,9 +325,7 @@ impl Mouse {
         self.mode = match self.mode { MouseMode::Game => MouseMode::Desktop, MouseMode::Desktop => MouseMode::Game };
     }
 
-    /// Sends `event` from a `window`-sized video window showing a `picture`-sized video.
-    pub fn send(&mut self, sink: &impl Sink, event: PointerEvent, window: (u32, u32), picture: (u32, u32)) {
-        if !self.active { return; }
+    fn send(&mut self, sink: &impl Sink, event: PointerEvent, window: (u32, u32), picture: (u32, u32)) {
         let event = match (event, self.mode) {
             (PointerEvent::Moved { dx, dy }, MouseMode::Game) => Some(InputEvent::MouseMove { dx: dx as f32, dy: dy as f32 }),
             (PointerEvent::At { x, y }, MouseMode::Desktop) => over_picture((x, y), window, picture)
@@ -467,7 +474,7 @@ mod tests {
 
     fn active_mouse(sink: &Recorder) -> Mouse {
         let mut mouse = Mouse::default();
-        mouse.set_active(sink, true);
+        mouse.update(sink, true, [], SCREEN, SCREEN);
         mouse
     }
 
@@ -475,9 +482,9 @@ mod tests {
     fn game_mode_sends_raw_motion_and_ignores_positions() {
         let sink = Recorder::default();
         let mut mouse = active_mouse(&sink);
-        mouse.send(&sink, PointerEvent::Moved { dx: 2.5, dy: -1.0 }, SCREEN, SCREEN);
-        mouse.send(&sink, PointerEvent::At { x: 10.0, y: 10.0 }, SCREEN, SCREEN);
-        mouse.send(&sink, PointerEvent::Moved { dx: 0.5, dy: 0.0 }, SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::Moved { dx: 2.5, dy: -1.0 }], SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::At { x: 10.0, y: 10.0 }], SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::Moved { dx: 0.5, dy: 0.0 }], SCREEN, SCREEN);
         assert_eq!(sink.take(), ["move 2 -1", "move 1 0"]);
     }
 
@@ -489,12 +496,12 @@ mod tests {
         assert_eq!(mouse.mode, MouseMode::Desktop);
         // 1920x1080 on a 1280x800 window: bars of 40 pixels above and below.
         let picture = (1920, 1080);
-        mouse.send(&sink, PointerEvent::Moved { dx: 5.0, dy: 5.0 }, SCREEN, picture);
-        mouse.send(&sink, PointerEvent::At { x: 640.0, y: 400.0 }, SCREEN, picture);
-        mouse.send(&sink, PointerEvent::At { x: 0.0, y: 40.0 }, SCREEN, picture);
-        mouse.send(&sink, PointerEvent::At { x: 1280.0, y: 760.0 }, SCREEN, picture);
+        mouse.update(&sink, true, [PointerEvent::Moved { dx: 5.0, dy: 5.0 }], SCREEN, picture);
+        mouse.update(&sink, true, [PointerEvent::At { x: 640.0, y: 400.0 }], SCREEN, picture);
+        mouse.update(&sink, true, [PointerEvent::At { x: 0.0, y: 40.0 }], SCREEN, picture);
+        mouse.update(&sink, true, [PointerEvent::At { x: 1280.0, y: 760.0 }], SCREEN, picture);
         // On a bar the position stays at the picture's edge.
-        mouse.send(&sink, PointerEvent::At { x: 1280.0, y: 5.0 }, SCREEN, picture);
+        mouse.update(&sink, true, [PointerEvent::At { x: 1280.0, y: 5.0 }], SCREEN, picture);
         assert_eq!(sink.take(), ["at 16384 16384", "at 0 0", "at 32767 32767", "at 32767 0"]);
     }
 
@@ -503,7 +510,7 @@ mod tests {
         let sink = Recorder::default();
         let mut mouse = active_mouse(&sink);
         mouse.toggle_mode(&sink);
-        mouse.send(&sink, PointerEvent::At { x: 320.0, y: 400.0 }, (640, 400), SCREEN);
+        mouse.update(&sink, true, [PointerEvent::At { x: 320.0, y: 400.0 }], (640, 400), SCREEN);
         assert_eq!(sink.take(), ["at 16384 32767"]);
     }
 
@@ -512,8 +519,8 @@ mod tests {
         let sink = Recorder::default();
         let mut mouse = active_mouse(&sink);
         for button in 1..=9 {
-            mouse.send(&sink, PointerEvent::Button { button, down: true }, SCREEN, SCREEN);
-            mouse.send(&sink, PointerEvent::Button { button, down: false }, SCREEN, SCREEN);
+            mouse.update(&sink, true, [PointerEvent::Button { button, down: true }], SCREEN, SCREEN);
+            mouse.update(&sink, true, [PointerEvent::Button { button, down: false }], SCREEN, SCREEN);
         }
         assert_eq!(sink.take(), [
             "Left true", "Left false", "Middle true", "Middle false", "Right true", "Right false",
@@ -526,14 +533,16 @@ mod tests {
     fn losing_the_mouse_lets_go_of_held_buttons_and_drops_later_events() {
         let sink = Recorder::default();
         let mut mouse = active_mouse(&sink);
-        mouse.send(&sink, PointerEvent::Button { button: 1, down: true }, SCREEN, SCREEN);
-        mouse.send(&sink, PointerEvent::Button { button: 3, down: true }, SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::Button { button: 1, down: true }], SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::Button { button: 3, down: true }], SCREEN, SCREEN);
         sink.take();
-        mouse.set_active(&sink, false);
+        // A click read as the menu opens stays local.
+        mouse.update(&sink, false, [PointerEvent::Button { button: 2, down: true }], SCREEN, SCREEN);
         assert_eq!(sink.take(), ["Left false", "Right false"]);
-        mouse.send(&sink, PointerEvent::Moved { dx: 4.0, dy: 4.0 }, SCREEN, SCREEN);
-        mouse.send(&sink, PointerEvent::Button { button: 1, down: true }, SCREEN, SCREEN);
-        mouse.set_active(&sink, false);
+        mouse.update(&sink, false, [PointerEvent::Moved { dx: 4.0, dy: 4.0 }], SCREEN, SCREEN);
+        // Motion made while the menu was open stays local as the mouse is taken again.
+        mouse.update(&sink, true, [PointerEvent::Moved { dx: 4.0, dy: 4.0 }], SCREEN, SCREEN);
+        mouse.update(&sink, false, [], SCREEN, SCREEN);
         assert_eq!(sink.take(), Vec::<String>::new());
     }
 
@@ -541,7 +550,7 @@ mod tests {
     fn switching_modes_lets_go_of_held_buttons() {
         let sink = Recorder::default();
         let mut mouse = active_mouse(&sink);
-        mouse.send(&sink, PointerEvent::Button { button: 1, down: true }, SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::Button { button: 1, down: true }], SCREEN, SCREEN);
         sink.take();
         mouse.toggle_mode(&sink);
         mouse.toggle_mode(&sink);

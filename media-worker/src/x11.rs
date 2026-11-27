@@ -367,8 +367,9 @@ impl Pointer {
         if (version.major_version, version.minor_version) < (2, 2) {
             return Err(format!("XInput {}.{} is older than 2.2", version.major_version, version.minor_version));
         }
-        let device = connection.xinput_xi_get_client_pointer(x11rb::NONE).map_err(|e| error(&e))?
-            .reply().map_err(|e| error(&e))?.deviceid;
+        let devices = connection.xinput_xi_query_device(Device::ALL_MASTER).map_err(|e| error(&e))?
+            .reply().map_err(|e| error(&e))?.infos;
+        let device = master_pointer(&devices).ok_or("XInput2 pointer: no master pointer")?;
         // Raw motion goes only to the root window, whatever has the grab.
         connection.xinput_xi_select_events(root, &[EventMask {
             deviceid: Device::ALL_MASTER.into(), mask: vec![XIEventMask::RAW_MOTION],
@@ -391,11 +392,12 @@ impl Pointer {
     }
 
     /// Grabs the pointer for `window`, the cursor hidden or not, or lets it
-    /// go for `None`. A grab the server refuses is tried again on the next call.
-    pub fn hold(&mut self, grab: Option<(u32, bool)>) {
+    /// go for `None`. A grab the server refuses is tried again on the next
+    /// call. Returns whether this connection has the pointer now.
+    pub fn hold(&mut self, grab: Option<(u32, bool)>) -> bool {
         use x11rb::protocol::xinput::{ConnectionExt as _, GrabOwner, XIEventMask};
         use x11rb::protocol::xproto::{GrabMode, GrabStatus};
-        if self.grabbed == grab { return; }
+        if self.grabbed == grab { return grab.is_some(); }
         if self.grabbed.take().is_some() {
             let _ = self.connection.xinput_xi_ungrab_device(x11rb::CURRENT_TIME, self.device);
         }
@@ -408,26 +410,39 @@ impl Pointer {
             if status == Some(GrabStatus::SUCCESS) { self.grabbed = grab; }
         }
         let _ = self.connection.flush();
+        self.grabbed.is_some()
     }
 
     /// The events that arrived since the last call.
     pub fn events(&mut self) -> Vec<PointerEvent> {
-        use x11rb::protocol::Event;
-        let fixed = |value: i32| f64::from(value) / 65536.0;
         let mut events = Vec::new();
-        while let Ok(Some(event)) = self.connection.poll_for_event() {
-            events.extend(match event {
-                Event::XinputRawMotion(raw) => {
-                    let (dx, dy) = raw_motion(&raw.valuator_mask, &raw.axisvalues_raw);
-                    Some(PointerEvent::Moved { dx, dy })
-                }
-                Event::XinputMotion(motion) => Some(PointerEvent::At { x: fixed(motion.event_x), y: fixed(motion.event_y) }),
-                Event::XinputButtonPress(press) => Some(PointerEvent::Button { button: press.detail, down: true }),
-                Event::XinputButtonRelease(release) => Some(PointerEvent::Button { button: release.detail, down: false }),
-                _ => None,
-            });
-        }
+        while let Ok(Some(event)) = self.connection.poll_for_event() { events.extend(pointer_events(event)); }
         events
+    }
+}
+
+/// The master pointer among the master devices.
+fn master_pointer(devices: &[x11rb::protocol::xinput::XIDeviceInfo]) -> Option<u16> {
+    use x11rb::protocol::xinput::DeviceType;
+    devices.iter().find(|device| device.type_ == DeviceType::MASTER_POINTER).map(|device| device.deviceid)
+}
+
+/// What an X event says about the pointer. A button comes with where it
+/// was pressed, which a click without motion before it needs.
+fn pointer_events(event: x11rb::protocol::Event) -> Vec<PointerEvent> {
+    use x11rb::protocol::Event;
+    let at = |x: i32, y: i32| PointerEvent::At { x: f64::from(x) / 65536.0, y: f64::from(y) / 65536.0 };
+    match event {
+        Event::XinputRawMotion(raw) => {
+            let (dx, dy) = raw_motion(&raw.valuator_mask, &raw.axisvalues_raw);
+            vec![PointerEvent::Moved { dx, dy }]
+        }
+        Event::XinputMotion(motion) => vec![at(motion.event_x, motion.event_y)],
+        Event::XinputButtonPress(press) => vec![at(press.event_x, press.event_y),
+            PointerEvent::Button { button: press.detail, down: true }],
+        Event::XinputButtonRelease(release) => vec![at(release.event_x, release.event_y),
+            PointerEvent::Button { button: release.detail, down: false }],
+        _ => Vec::new(),
     }
 }
 
@@ -551,6 +566,23 @@ mod tests {
         // A wheel valuator after x does not count as y.
         assert_eq!(raw_motion(&[0b1001], &[three, half]), (3.0, 0.0));
         assert_eq!(raw_motion(&[], &[]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn the_grab_takes_the_master_pointer_not_the_keyboard() {
+        use x11rb::protocol::xinput::{DeviceType, XIDeviceInfo};
+        let device = |deviceid, type_| XIDeviceInfo { deviceid, type_, attachment: 0, enabled: true, name: Vec::new(), classes: Vec::new() };
+        assert_eq!(master_pointer(&[device(3, DeviceType::MASTER_KEYBOARD), device(2, DeviceType::MASTER_POINTER)]), Some(2));
+        assert_eq!(master_pointer(&[device(3, DeviceType::MASTER_KEYBOARD)]), None);
+    }
+
+    #[test]
+    fn a_button_comes_with_where_it_was_pressed() {
+        use x11rb::protocol::{Event, xinput::ButtonPressEvent};
+        let press = ButtonPressEvent { detail: 1, event_x: 100 << 16, event_y: (50 << 16) + (1 << 15), ..Default::default() };
+        assert_eq!(pointer_events(Event::XinputButtonPress(press.clone())), [
+            PointerEvent::At { x: 100.0, y: 50.5 }, PointerEvent::Button { button: 1, down: true }]);
+        assert_eq!(pointer_events(Event::XinputButtonRelease(press))[1], PointerEvent::Button { button: 1, down: false });
     }
 }
 

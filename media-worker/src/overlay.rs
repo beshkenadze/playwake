@@ -162,7 +162,7 @@ impl Overlay {
             return events;
         }
         let (width, height) = (video_size.0 as f64, video_size.1 as f64);
-        self.scale = 2.0_f64.min(width / 1280.0).min(height / 545.0);
+        self.scale = scale(width, height, self.items().len());
         let (logical_width, logical_height) = if self.menu {
             (440.0, height / self.scale)
         } else if hint {
@@ -326,6 +326,13 @@ impl Overlay {
 const ITEMS_TOP: f64 = 152.0;
 const ITEM_STEP: f64 = 58.0;
 
+/// How much the overlay is enlarged in a window: up to twice, as long as
+/// it fits, the menu of `items` items with its footer below them.
+fn scale(width: f64, height: f64, items: usize) -> f64 {
+    let tall = 545.0 + ITEM_STEP * items.saturating_sub(5) as f64;
+    2.0_f64.min(width / 1280.0).min(height / tall)
+}
+
 /// The menu item at a point of the menu, of `count` items.
 fn item_at(x: f64, y: f64, count: usize) -> Option<usize> {
     let offset = y - ITEMS_TOP;
@@ -338,7 +345,19 @@ fn item_at(x: f64, y: f64, count: usize) -> Option<usize> {
 unsafe impl Send for Overlay {}
 #[cfg(test)]
 mod tests {
-    use super::item_at;
+    use super::*;
+
+    #[test]
+    fn the_footer_stays_below_the_last_item_in_a_wide_window() {
+        for (width, height) in [(2560.0, 1080.0), (1280.0, 800.0), (3440.0, 1440.0), (640.0, 400.0)] {
+            for items in [5, 6] {
+                let logical_height = height / scale(width, height, items);
+                // The paused line's baseline sits 73 above the bottom, its text about 15 high.
+                let last_item_bottom = ITEMS_TOP + ITEM_STEP * (items - 1) as f64 + 52.0;
+                assert!(logical_height - 73.0 - 15.0 >= last_item_bottom, "{width}x{height} with {items} items");
+            }
+        }
+    }
 
     #[test]
     fn clicks_pick_the_item_under_them_including_the_pc_mouse_item() {

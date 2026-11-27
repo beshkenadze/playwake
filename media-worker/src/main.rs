@@ -354,7 +354,7 @@ fn run() -> Result<(), String> {
     quit.run();
 
     if let Some(mut w) = slot.lock().unwrap().take() {
-        if let Some(pc) = &w.pc { w.mouse.set_active(pc.as_ref(), false); }
+        if let Some(pc) = &w.pc { w.mouse.update(pc.as_ref(), false, [], (0, 0), (0, 0)); }
         if let Some(overlay) = w.overlay.as_mut() { overlay.close(); }
         if let Some(x11) = w.x11.as_mut() { x11.close(); }
         if let Some(pc) = &w.pc { pc.stop(); }
@@ -784,13 +784,12 @@ impl Worker {
         // Steam's on-screen keyboard takes the pointer while it is up.
         let window = self.x11.as_ref().filter(|x11| x11.xid != 0 && !x11.keyboard).map(|x11| (x11.xid as u32, x11.size));
         let picture = { let st = self.state.lock().unwrap(); (st.width, st.height) };
-        for event in events {
-            if let Some((_, size)) = window { self.mouse.send(pc.as_ref(), event, size, picture); }
-        }
-        let active = self.focused && !self.input.route.overlay && window.is_some() && !pc.ended();
-        self.mouse.set_active(pc.as_ref(), active);
+        let wanted = self.focused && !self.input.route.overlay && !pc.ended();
         let hidden = self.mouse.mode == input::MouseMode::Game;
-        pointer.hold(window.filter(|_| active).map(|(xid, _)| (xid, hidden)));
+        // Raw motion arrives without the grab too: only a held grab makes it the stream's.
+        let grabbed = pointer.hold(window.filter(|_| wanted).map(|(xid, _)| (xid, hidden)));
+        let size = window.map_or((0, 0), |(_, size)| size);
+        self.mouse.update(pc.as_ref(), grabbed, events, size, picture);
     }
 
     /// Sends the current pad state. Returns false when input is not armed or
