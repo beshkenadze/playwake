@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 pub enum InputEvent {
     Key { usage: Usage, down: bool },
     Text(String),
-    /// Relative motion in host pixels.
+    /// Relative motion in host pixels; positive `dx` is right, positive `dy` down.
     MouseMove { dx: f32, dy: f32 },
     /// Absolute position over the video, 0…1 from its top left corner.
     MousePosition { x: f32, y: f32 },

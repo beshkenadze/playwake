@@ -52,6 +52,7 @@ impl Trackpad {
     }
 
     /// One touch, `x` and `y` 0…1 over the surface, `now` in milliseconds.
+    /// `Ended` must carry the finger's last point: it counts as a move.
     pub fn touch(&mut self, id: u32, phase: Phase, x: f32, y: f32, now: f64) -> Vec<Gesture> {
         let at = (x * self.size.0, y * self.size.1);
         let mut out = Vec::new();
