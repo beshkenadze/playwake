@@ -147,21 +147,25 @@ final class Gamepad {
         let replace = Self.prefers(current: current.map(kind), new: kind(controller))
         if replace { current = controller }
         lock.unlock()
-        guard replace else { return }
+        if replace { configure(controller) }
+    }
+
+    /// Falls back to another pad, physical first, when the current one goes.
+    /// The swap is one step, so a snapshot never sees no pad in between.
+    func disconnected(_ controller: GCController, remaining: [GCController]) {
+        lock.lock()
+        let wasCurrent = current === controller
+        if wasCurrent { current = best(remaining.filter { $0 !== controller }) }
+        let next = current
+        lock.unlock()
+        if wasCurrent, let next { configure(next) }
+    }
+
+    private func configure(_ controller: GCController) {
         controller.playerIndex = .index1
         controller.handlerQueue = handlerQueue
         controller.extendedGamepad?.valueChangedHandler = { [weak self] _, _ in self?.onChange?() }
         LabLog.write("gamepad connected: \(controller.vendorName ?? "unknown")")
-    }
-
-    /// Falls back to another pad, physical first, when the current one goes.
-    func disconnected(_ controller: GCController, remaining: [GCController]) {
-        lock.lock()
-        let wasCurrent = current === controller
-        if wasCurrent { current = nil }
-        lock.unlock()
-        guard wasCurrent else { return }
-        adopt(best(remaining.filter { $0 !== controller }))
     }
 
     func snapshot() -> Snapshot {

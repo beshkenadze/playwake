@@ -21,6 +21,8 @@ final class VirtualPadUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "never"]
         app.launch()
+        let stats = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'fps'")).firstMatch
+        XCTAssertTrue(stats.waitForExistence(timeout: 20), "the stream did not open")
         XCTAssertFalse(app.buttons["View"].waitForExistence(timeout: 8), "the on-screen pad appeared in Never")
     }
 
