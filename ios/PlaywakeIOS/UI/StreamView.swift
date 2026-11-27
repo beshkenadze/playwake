@@ -5,12 +5,16 @@ import SwiftUI
 /// optional statistics HUD and the stream menu.
 struct StreamView: View {
     @ObservedObject var controller: SessionController
+    @ObservedObject private var keyboardMouse = KeyboardMouse.shared
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             LowLatencyVideoView(renderer: controller.renderer)
                 .ignoresSafeArea()
+            if padActive && keyboardMouse.mouseConnected && keyboardMouse.mode == .desktop {
+                PointerArea().ignoresSafeArea()
+            }
             if !controller.firstFrame {
                 ConnectingView(title: controller.streamTitle, status: controller.status) { controller.stop() }
             } else if controller.showStats {
@@ -35,13 +39,23 @@ struct StreamView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            guard controller.firstFrame else { return }
+            // A mouse click belongs to the stream; Cmd+K opens the menu.
+            guard controller.firstFrame, !keyboardMouse.mouseConnected else { return }
             controller.menuOpen ? controller.closeMenu() : controller.openMenu()
         }
         .background { shortcuts }
-        .onAppear { VirtualPad.shared.setActive(padActive) }
-        .onChange(of: padActive) { _, active in VirtualPad.shared.setActive(active) }
-        .onDisappear { VirtualPad.shared.setActive(false) }
+        .onAppear {
+            VirtualPad.shared.setActive(padActive)
+            keyboardMouse.setStreamActive(padActive)
+        }
+        .onChange(of: padActive) { _, active in
+            VirtualPad.shared.setActive(active)
+            keyboardMouse.setStreamActive(active)
+        }
+        .onDisappear {
+            VirtualPad.shared.setActive(false)
+            keyboardMouse.setStreamActive(false)
+        }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
     }
@@ -141,6 +155,7 @@ private struct StatsHUD: View {
 
 private struct StreamMenu: View {
     @ObservedObject var controller: SessionController
+    @ObservedObject private var keyboardMouse = KeyboardMouse.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -156,6 +171,9 @@ private struct StreamMenu: View {
             row(.statistics, "Statistics") {
                 Image(systemName: controller.showStats ? "checkmark.circle.fill" : "circle")
                     .foregroundStyle(controller.showStats ? Theme.mint : Theme.muted)
+            }
+            row(.mouse, "Mouse") {
+                Text(keyboardMouse.mode == .game ? "Game" : "Desktop").foregroundStyle(Theme.muted)
             }
             row(.reconnect, "Reconnect")
             Spacer(minLength: 12)

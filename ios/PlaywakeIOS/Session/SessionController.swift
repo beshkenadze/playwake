@@ -41,7 +41,7 @@ final class SessionController: ObservableObject {
     }
 
     enum MenuItem: CaseIterable {
-        case resume, guide, statistics, reconnect, end
+        case resume, guide, statistics, mouse, reconnect, end
     }
 
     @Published private(set) var phase: Phase = .restoring
@@ -244,6 +244,7 @@ final class SessionController: ObservableObject {
         case .resume: closeMenu()
         case .guide: closeMenu(guide: true)
         case .statistics: showStats.toggle()
+        case .mouse: KeyboardMouse.shared.toggleMode()
         case .reconnect: reconnect()
         case .end: stop()
         }
@@ -352,7 +353,7 @@ final class SessionController: ObservableObject {
         case .pcStreaming(let session, let hevc, let hdr):
             guard session == pcPlayer?.session else { break }
             status = "Streaming \(hevc ? "HEVC" : "H.264")\(hdr ? " HDR" : "")"
-            LabLog.write("pc: \(status)")
+            LabLog.write("pc: \(status), host touch \(pw_input_host_supports_touch())")
         case .pcEnded(let session, let error):
             LabLog.write("pc: stream ended \(error ?? "")")
             // A stream that was replaced or stopped already is not this one.
