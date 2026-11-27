@@ -36,7 +36,6 @@ final class KeyboardMouse: ObservableObject {
     @Published var mode: Mode {
         didSet {
             UserDefaults.standard.set(mode.rawValue, forKey: Mode.key)
-            pw_input_mode(mode.core)
             update()
         }
     }
@@ -48,7 +47,8 @@ final class KeyboardMouse: ObservableObject {
     /// Desktop mode: the left button as the view over the video saw it.
     private var leftHeld = false
     private let gate = InputGate()
-    private let queue = DispatchQueue(label: "io.playwake.keyboard-mouse", qos: .userInteractive)
+    /// Where keyboard and mouse events arrive.
+    let queue = DispatchQueue(label: "io.playwake.keyboard-mouse", qos: .userInteractive)
 
     private init() {
         mode = Mode.stored()
@@ -64,7 +64,9 @@ final class KeyboardMouse: ObservableObject {
         for name in [Notification.Name.GCKeyboardDidDisconnect, .GCMouseDidDisconnect] {
             center.addObserver(forName: name, object: nil, queue: .main) { _ in
                 MainActor.assumeIsolated {
-                    KeyboardMouse.shared.gate.locked { pw_input_release_all() }
+                    // After the device's events already queued, so none of them presses again.
+                    let gate = KeyboardMouse.shared.gate
+                    KeyboardMouse.shared.queue.async { gate.locked { pw_input_release_all() } }
                     KeyboardMouse.shared.connect()
                 }
             }
@@ -98,8 +100,8 @@ final class KeyboardMouse: ObservableObject {
 
     /// Desktop mode: the pointer at `point` in a view of `size` that shows
     /// the video aspect-fit, and the left button when `pressed` changes.
-    func pointer(at point: CGPoint, in size: CGSize, pressed: Bool? = nil) {
-        guard let place = Self.videoPosition(of: point, in: size, aspect: Self.videoAspect) else { return }
+    func pointer(at point: CGPoint?, in size: CGSize, pressed: Bool? = nil) {
+        let place = point.flatMap { Self.videoPosition(of: $0, in: size, aspect: Self.videoAspect) }
         let events = Self.pointerEvents(at: place, pressed: pressed, held: leftHeld)
         leftHeld = pressed ?? leftHeld
         gate.send {
@@ -112,6 +114,11 @@ final class KeyboardMouse: ObservableObject {
         }
     }
 
+    /// Lets go of the left button if the view still holds it.
+    func pointerLifted() {
+        pointer(at: nil, in: .zero, pressed: false)
+    }
+
     enum PointerEvent: Equatable {
         case position(CGPoint)
         case left(Bool)
@@ -119,9 +126,10 @@ final class KeyboardMouse: ObservableObject {
 
     /// The position goes first, so a click lands where the pointer is: a
     /// separate button event could overtake the position.
-    nonisolated static func pointerEvents(at place: CGPoint, pressed: Bool?, held: Bool) -> [PointerEvent] {
-        guard let pressed, pressed != held else { return [.position(place)] }
-        return [.position(place), .left(pressed)]
+    nonisolated static func pointerEvents(at place: CGPoint?, pressed: Bool?, held: Bool) -> [PointerEvent] {
+        var events = place.map { [PointerEvent.position($0)] } ?? []
+        if let pressed, pressed != held { events.append(.left(pressed)) }
+        return events
     }
 
     /// `point` over an aspect-fit video of `aspect` (width / height) in a view
@@ -150,7 +158,12 @@ final class KeyboardMouse: ObservableObject {
 
     private func update() {
         let open = streamActive && appActive
-        gate.set(open: open, desktop: mode == .desktop) { pw_input_release_all() }
+        let core = mode.core
+        // Under the gate, so no event of the old mode slips in between.
+        gate.set(open: open, desktop: mode == .desktop) { closing, modeChanged in
+            if modeChanged { pw_input_mode(core) }
+            if closing { pw_input_release_all() }
+        }
         if !open || mode != .desktop { leftHeld = false }
         PointerLock.wanted = open && mode == .game && mouseConnected
     }
@@ -283,10 +296,11 @@ final class InputGate: @unchecked Sendable {
         lock.withLock(body)
     }
 
-    /// `closing` runs under the lock when an open gate closes.
-    func set(open: Bool, desktop: Bool, closing: () -> Void) {
+    /// `apply` runs under the lock, told whether an open gate closes and
+    /// whether the mode changes.
+    func set(open: Bool, desktop: Bool, apply: (_ closing: Bool, _ modeChanged: Bool) -> Void) {
         lock.withLock {
-            if self.open && !open { closing() }
+            apply(self.open && !open, self.desktop != desktop)
             self.open = open
             self.desktop = desktop
         }
@@ -328,6 +342,8 @@ private enum PointerLock {
 /// Desktop mode: follows the pointer over the stream, also while a button
 /// is held, and sends the left button with the pointer's place.
 struct PointerArea: View {
+    @GestureState private var pressing = false
+
     var body: some View {
         GeometryReader { geometry in
             Color.clear
@@ -338,8 +354,14 @@ struct PointerArea: View {
                     }
                 }
                 .gesture(DragGesture(minimumDistance: 0)
+                    .updating($pressing) { _, pressing, _ in pressing = true }
                     .onChanged { drag in KeyboardMouse.shared.pointer(at: drag.location, in: geometry.size, pressed: true) }
                     .onEnded { drag in KeyboardMouse.shared.pointer(at: drag.location, in: geometry.size, pressed: false) })
+                // A cancelled drag never ends, but its gesture state resets.
+                .onChange(of: pressing) { _, pressing in
+                    if !pressing { KeyboardMouse.shared.pointerLifted() }
+                }
+                .onDisappear { KeyboardMouse.shared.pointerLifted() }
         }
     }
 }

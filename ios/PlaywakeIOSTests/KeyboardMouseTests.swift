@@ -52,49 +52,49 @@ struct KeyboardMouseTests {
         #expect(KeyboardMouse.pointerEvents(at: place, pressed: true, held: true) == [.position(place)])
         #expect(KeyboardMouse.pointerEvents(at: place, pressed: nil, held: true) == [.position(place)])
         #expect(KeyboardMouse.pointerEvents(at: place, pressed: false, held: true) == [.position(place), .left(false)])
+        // Off the video or with no view left, the release still goes.
+        #expect(KeyboardMouse.pointerEvents(at: nil, pressed: false, held: true) == [.left(false)])
     }
 
     @Test func aClosingGateWaitsForTheSendInProgress() {
+        #expect(sendThenSet(open: false, desktop: false) == ["send", "release"])
+    }
+
+    @Test func aModeChangeWaitsForTheSendInProgress() {
+        #expect(sendThenSet(open: true, desktop: true) == ["send", "mode"])
+    }
+
+    /// A send that is in progress when the gate changes: the change waits for it.
+    private func sendThenSet(open: Bool, desktop: Bool) -> [String] {
         let gate = InputGate()
-        gate.set(open: true, desktop: false) {}
+        gate.set(open: true, desktop: false) { _, _ in }
         let order = OrderLog()
-        let sending = DispatchSemaphore(value: 0)
+        let sending = DispatchSemaphore(value: 0), closing = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
             gate.send {
                 sending.signal()
-                usleep(100_000)
+                _ = closing.wait(timeout: .now() + 1)
+                usleep(50_000)
                 order.append("send")
             }
         }
         sending.wait()
-        gate.set(open: false, desktop: false) { order.append("release") }
-        #expect(order.entries == ["send", "release"])
-        gate.send { order.append("late") }
-        #expect(order.entries == ["send", "release"])
+        closing.signal()
+        gate.set(open: open, desktop: desktop) { closed, modeChanged in
+            if closed { order.append("release") }
+            if modeChanged { order.append("mode") }
+        }
+        gate.send(inDesktop: false) { order.append("late") }
+        return order.entries
     }
 
     @Test func desktopModeLeavesTheLeftButtonToTheView() {
         let gate = InputGate()
-        gate.set(open: true, desktop: true) {}
+        gate.set(open: true, desktop: true) { _, _ in }
         var sent = 0
         gate.send(inDesktop: false) { sent += 1 }
         gate.send { sent += 10 }
         #expect(sent == 10)
-    }
-
-    @MainActor
-    @Test func aKeyboardThatGoesAwayLetsGoOfItsKeys() async throws {
-        _ = KeyboardMouse.shared
-        // Without a PC stream the key drives the Xbox pad, which shows it.
-        pw_input_key(KeyboardMouse.keyboardPage, 0x1A, true)
-        var held = pw_pad()
-        pw_input_pad(&held, 0)
-        #expect(held.axes.1 != 0)
-        NotificationCenter.default.post(name: .GCKeyboardDidDisconnect, object: nil)
-        try await Task.sleep(for: .milliseconds(50))
-        var after = pw_pad()
-        pw_input_pad(&after, 1)
-        #expect(after.axes.1 == 0)
     }
 
     @Test func storedModeDefaultsToGame() throws {
@@ -103,6 +103,43 @@ struct KeyboardMouseTests {
         #expect(KeyboardMouse.Mode.stored(defaults) == .game)
         defaults.set("desktop", forKey: KeyboardMouse.Mode.key)
         #expect(KeyboardMouse.Mode.stored(defaults) == .desktop)
+    }
+}
+
+/// These read the core's one input state through the Xbox pad, which a key
+/// drives while no PC streams, so they run one at a time.
+@MainActor
+@Suite(.serialized)
+struct KeyboardMouseDisconnectTests {
+    private let w: UInt16 = 0x1A
+
+    private func stickY(at now: Double) -> Int16 {
+        var pad = pw_pad()
+        pw_input_pad(&pad, now)
+        return pad.axes.1
+    }
+
+    @Test func aKeyboardThatGoesAwayLetsGoOfItsKeys() async throws {
+        _ = KeyboardMouse.shared
+        pw_input_key(KeyboardMouse.keyboardPage, w, true)
+        #expect(stickY(at: 0) != 0)
+        NotificationCenter.default.post(name: .GCKeyboardDidDisconnect, object: nil)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(stickY(at: 1) == 0)
+    }
+
+    @Test func theReleaseComesAfterTheDevicesQueuedEvents() async throws {
+        let keyboardMouse = KeyboardMouse.shared
+        let queued = DispatchSemaphore(value: 0)
+        let w = w
+        keyboardMouse.queue.async {
+            queued.wait()
+            pw_input_key(KeyboardMouse.keyboardPage, w, true)
+        }
+        NotificationCenter.default.post(name: .GCKeyboardDidDisconnect, object: nil)
+        queued.signal()
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(stickY(at: 2) == 0)
     }
 }
 

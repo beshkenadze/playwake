@@ -146,11 +146,13 @@ impl Input {
         }
         match sink {
             Some(sink) if sink.host_supports_touch() => {
-                match phase {
-                    Phase::Began | Phase::Moved => { self.touches.insert(id, (x, y)); }
-                    Phase::Ended | Phase::Cancelled => { self.touches.remove(&id); }
-                }
-                self.pc.send(sink, InputEvent::Touch { id, phase, x, y, pressure });
+                // A finger cancelled by a release stays off the host until it lifts.
+                let known = match phase {
+                    Phase::Began => self.touches.insert(id, (x, y)).is_none(),
+                    Phase::Moved => self.touches.get_mut(&id).map(|point| *point = (x, y)).is_some(),
+                    Phase::Ended | Phase::Cancelled => self.touches.remove(&id).is_some(),
+                };
+                if known { self.pc.send(sink, InputEvent::Touch { id, phase, x, y, pressure }); }
             }
             Some(sink) => self.touch_mouse(sink, id, phase, x, y),
             // An Xbox has no pointer to touch with.
@@ -569,6 +571,31 @@ mod tests {
         host.take();
         input.mode(pc, PW_INPUT_TRACKPAD);
         assert_eq!(host.take(), [Call::Touch(7, Phase::Cancelled)]);
+    }
+
+    #[test]
+    fn a_finger_cancelled_by_a_release_stays_off_the_host() {
+        let (host, mut input) = (Host::default(), Input::default());
+        host.touch.set(true);
+        let pc = Some((1, &host));
+        input.mode(pc, PW_INPUT_DIRECT);
+        input.touch(pc, touch(7, Phase::Began, 0.2, 0.3), 0.0);
+        input.release_all(pc);
+        assert_eq!(host.take(), [Call::Touch(7, Phase::Began), Call::Touch(7, Phase::Cancelled)]);
+        input.touch(pc, touch(7, Phase::Moved, 0.3, 0.3), 0.0);
+        input.touch(pc, touch(7, Phase::Ended, 0.3, 0.3), 0.0);
+        input.release_all(pc);
+        assert_eq!(host.take(), []);
+    }
+
+    #[test]
+    fn only_the_five_buttons_decode() {
+        let decoded: Vec<_> = (0..=6).map(button).collect();
+        assert_eq!(decoded, [
+            Some(MouseButton::Left), Some(MouseButton::Right), Some(MouseButton::Middle),
+            Some(MouseButton::X1), Some(MouseButton::X2), None, None,
+        ]);
+        assert_eq!(button(u32::MAX), None);
     }
 
     #[test]
