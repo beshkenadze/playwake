@@ -6,6 +6,7 @@ pub mod cloud;
 pub mod covers;
 pub mod device;
 pub mod handshake;
+pub mod input;
 pub mod journal;
 pub mod library;
 pub mod nal;
