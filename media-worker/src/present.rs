@@ -103,7 +103,7 @@ pub fn hdr_peak(frame: &gst_video::VideoFrameRef<&gstreamer::BufferRef>) -> Opti
 }
 
 /// Where a picture goes in a window: as large as fits, centred, in its shape.
-fn fit(picture: (u32, u32), window: (u32, u32)) -> (f32, f32, f32, f32) {
+pub fn fit(picture: (u32, u32), window: (u32, u32)) -> (f32, f32, f32, f32) {
     let (pw, ph, ww, wh) = (picture.0 as f32, picture.1 as f32, window.0 as f32, window.1 as f32);
     let scale = (ww / pw).min(wh / ph);
     let (width, height) = (pw * scale, ph * scale);

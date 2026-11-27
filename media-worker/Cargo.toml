@@ -15,7 +15,7 @@ gstreamer-base = { version = "0.23", features = ["v1_20"] }
 gstreamer-video = { version = "0.23", features = ["v1_20"] }
 gstreamer-webrtc = { version = "0.23", features = ["v1_20"] }
 gstreamer-sdp = { version = "0.23", features = ["v1_20"] }
-x11rb = { version = "0.13", features = ["res", "shape"] }
+x11rb = { version = "0.13", features = ["res", "shape", "xinput"] }
 evdev = "0.13"
 cairo-rs = { version = "0.20", features = ["xlib"] }
 x11-dl = "2"

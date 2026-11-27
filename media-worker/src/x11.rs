@@ -332,6 +332,115 @@ impl X11Window {
 // The Xlib display is only touched from the glib main-loop thread.
 unsafe impl Send for X11Window {}
 
+/// What the pointer did, as XInput2 reports it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PointerEvent {
+    /// How far the device moved, before the cursor stops at a screen edge.
+    Moved { dx: f64, dy: f64 },
+    /// Where the pointer is in the grab window, in pixels.
+    At { x: f64, y: f64 },
+    /// An X button: 1–3 left, middle, right; 4–7 the wheel; 8 and 9 back and forward.
+    Button { button: u32, down: bool },
+}
+
+/// The pointer read through XInput2, on a connection of its own so its grab
+/// and events stay apart from the Xlib window's.
+pub struct Pointer {
+    connection: RustConnection,
+    device: u16,
+    /// A cursor with no pixels, shown while the pointer is hidden.
+    blank: u32,
+    /// The window holding the grab, and whether the cursor is hidden.
+    grabbed: Option<(u32, bool)>,
+    /// Dies with this pointer, whose fd closes then.
+    alive: std::sync::Arc<()>,
+}
+
+impl Pointer {
+    pub fn new() -> Result<Self, String> {
+        use x11rb::protocol::xinput::{ConnectionExt as _, Device, EventMask, XIEventMask};
+        use x11rb::protocol::xproto::{CreateGCAux, Rectangle};
+        let error = |e: &dyn std::fmt::Display| format!("XInput2 pointer: {e}");
+        let (connection, screen) = x11rb::connect(None).map_err(|e| error(&e))?;
+        let root = connection.setup().roots[screen].root;
+        let version = connection.xinput_xi_query_version(2, 2).map_err(|e| error(&e))?.reply().map_err(|e| error(&e))?;
+        if (version.major_version, version.minor_version) < (2, 2) {
+            return Err(format!("XInput {}.{} is older than 2.2", version.major_version, version.minor_version));
+        }
+        let device = connection.xinput_xi_get_client_pointer(x11rb::NONE).map_err(|e| error(&e))?
+            .reply().map_err(|e| error(&e))?.deviceid;
+        // Raw motion goes only to the root window, whatever has the grab.
+        connection.xinput_xi_select_events(root, &[EventMask {
+            deviceid: Device::ALL_MASTER.into(), mask: vec![XIEventMask::RAW_MOTION],
+        }]).map_err(|e| error(&e))?.check().map_err(|e| error(&e))?;
+        let (pixmap, gc, blank) = (connection.generate_id().map_err(|e| error(&e))?,
+            connection.generate_id().map_err(|e| error(&e))?, connection.generate_id().map_err(|e| error(&e))?);
+        connection.create_pixmap(1, pixmap, root, 1, 1).map_err(|e| error(&e))?;
+        connection.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0)).map_err(|e| error(&e))?;
+        connection.poly_fill_rectangle(pixmap, gc, &[Rectangle { x: 0, y: 0, width: 1, height: 1 }]).map_err(|e| error(&e))?;
+        connection.create_cursor(blank, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 0, 0).map_err(|e| error(&e))?;
+        connection.free_gc(gc).map_err(|e| error(&e))?;
+        connection.free_pixmap(pixmap).map_err(|e| error(&e))?.check().map_err(|e| error(&e))?;
+        Ok(Self { connection, device, blank, grabbed: None, alive: std::sync::Arc::new(()) })
+    }
+
+    /// The fd to watch for events, and a token that dies with this pointer.
+    pub fn watch(&self) -> (std::os::fd::RawFd, std::sync::Weak<()>) {
+        use std::os::fd::AsRawFd;
+        (self.connection.stream().as_raw_fd(), std::sync::Arc::downgrade(&self.alive))
+    }
+
+    /// Grabs the pointer for `window`, the cursor hidden or not, or lets it
+    /// go for `None`. A grab the server refuses is tried again on the next call.
+    pub fn hold(&mut self, grab: Option<(u32, bool)>) {
+        use x11rb::protocol::xinput::{ConnectionExt as _, GrabOwner, XIEventMask};
+        use x11rb::protocol::xproto::{GrabMode, GrabStatus};
+        if self.grabbed == grab { return; }
+        if self.grabbed.take().is_some() {
+            let _ = self.connection.xinput_xi_ungrab_device(x11rb::CURRENT_TIME, self.device);
+        }
+        if let Some((window, hidden)) = grab {
+            let cursor = if hidden { self.blank } else { x11rb::NONE };
+            let mask = XIEventMask::MOTION | XIEventMask::BUTTON_PRESS | XIEventMask::BUTTON_RELEASE;
+            let status = self.connection.xinput_xi_grab_device(window, x11rb::CURRENT_TIME, cursor, self.device,
+                GrabMode::ASYNC, GrabMode::ASYNC, GrabOwner::NO_OWNER, &[mask.into()])
+                .ok().and_then(|cookie| cookie.reply().ok()).map(|reply| reply.status);
+            if status == Some(GrabStatus::SUCCESS) { self.grabbed = grab; }
+        }
+        let _ = self.connection.flush();
+    }
+
+    /// The events that arrived since the last call.
+    pub fn events(&mut self) -> Vec<PointerEvent> {
+        use x11rb::protocol::Event;
+        let fixed = |value: i32| f64::from(value) / 65536.0;
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = self.connection.poll_for_event() {
+            events.extend(match event {
+                Event::XinputRawMotion(raw) => {
+                    let (dx, dy) = raw_motion(&raw.valuator_mask, &raw.axisvalues_raw);
+                    Some(PointerEvent::Moved { dx, dy })
+                }
+                Event::XinputMotion(motion) => Some(PointerEvent::At { x: fixed(motion.event_x), y: fixed(motion.event_y) }),
+                Event::XinputButtonPress(press) => Some(PointerEvent::Button { button: press.detail, down: true }),
+                Event::XinputButtonRelease(release) => Some(PointerEvent::Button { button: release.detail, down: false }),
+                _ => None,
+            });
+        }
+        events
+    }
+}
+
+/// The motion along valuators 0 and 1 of a raw event. Its values come one
+/// for each bit set in the mask, in bit order.
+fn raw_motion(mask: &[u32], values: &[x11rb::protocol::xinput::Fp3232]) -> (f64, f64) {
+    let set = |bit: u32| mask.first().is_some_and(|word| word & (1 << bit) != 0);
+    let value = |index: usize| values.get(index).map_or(0.0, |v| f64::from(v.integral) + f64::from(v.frac) / 4_294_967_296.0);
+    let dx = if set(0) { value(0) } else { 0.0 };
+    let dy = if set(1) { value(usize::from(set(0))) } else { 0.0 };
+    (dx, dy)
+}
+
 /// Whether Gamescope shows HDR now. Its Vulkan layer goes by the same fact
 /// when it offers a window the HDR10 colour space.
 pub fn hdr_output() -> bool {
@@ -429,6 +538,19 @@ mod tests {
         assert_eq!(above_keyboard((10, 20, 1280, 800)), (330, 20, 640, 400));
         // A window too small to halve still has a size.
         assert_eq!(above_keyboard((0, 0, 1, 1)), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn raw_motion_reads_the_values_of_the_set_valuators() {
+        use x11rb::protocol::xinput::Fp3232;
+        let half = Fp3232 { integral: -1, frac: 1 << 31 };
+        let three = Fp3232 { integral: 3, frac: 0 };
+        assert_eq!(raw_motion(&[0b11], &[three, half]), (3.0, -0.5));
+        // Only y moved: its value is the first one.
+        assert_eq!(raw_motion(&[0b10], &[half]), (0.0, -0.5));
+        // A wheel valuator after x does not count as y.
+        assert_eq!(raw_motion(&[0b1001], &[three, half]), (3.0, 0.0));
+        assert_eq!(raw_motion(&[], &[]), (0.0, 0.0));
     }
 }
 

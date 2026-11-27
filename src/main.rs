@@ -284,6 +284,7 @@ impl RemotePlay {
             2 => self.control_stream(media::StreamCommand::ToggleDiagnostics),
             3 => { self.reconnect = true; self.stop_stream(); }
             4 => self.stop_stream(),
+            5 => self.control_stream(media::StreamCommand::ToggleMouseMode),
             _ => {}
         }
     }
@@ -879,7 +880,7 @@ impl RemotePlay {
             }
             Event::Stream(media::StreamEvent::OverlayKey(key)) if self.overlay_open => {
                 let native = x11_window(window).is_some();
-                let count = if native { 5 } else { 4 };
+                let count = overlay_count(native, matches!(self.active_target, Some(media::Target::Pc(_))));
                 match key {
                     media::OverlayKey::Left => self.overlay_index = (self.overlay_index + count - 1) % count,
                     media::OverlayKey::Right => self.overlay_index = (self.overlay_index + 1) % count,
@@ -1045,6 +1046,26 @@ fn probe(run: media::Run) -> xbox::Result<()> {
         }));
     }
     Ok(())
+}
+
+/// How many items the stream menu shows: the worker's own menu has
+/// statistics, and a PC stream's a mouse mode switch after the others.
+fn overlay_count(native: bool, pc: bool) -> usize {
+    match (native, pc) {
+        (false, _) => 4,
+        (true, false) => 5,
+        (true, true) => 6,
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    #[test]
+    fn only_the_worker_menu_of_a_pc_stream_has_the_mouse_item() {
+        assert_eq!(super::overlay_count(true, true), 6);
+        assert_eq!(super::overlay_count(true, false), 5);
+        assert_eq!(super::overlay_count(false, true), 4);
+    }
 }
 
 #[cfg(test)]

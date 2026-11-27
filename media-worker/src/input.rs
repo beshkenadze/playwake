@@ -3,7 +3,8 @@
 //! machine, pulse overrides and external gamepad state.
 //! Port of media/gstreamer_player.py:859-921 + StreamInput wiring.
 
-use crate::{clock, protocol, route::{Route, Routed, RouteEvent, GUIDE}};
+use crate::{clock, protocol, route::{Route, Routed, RouteEvent, GUIDE}, x11::PointerEvent};
+use playwake_core::input::{InputEvent, MouseButton, PcInput, Sink};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
@@ -283,6 +284,78 @@ impl Input {
     }
 }
 
+/// How a PC stream takes the mouse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MouseMode {
+    /// How far the mouse moved, with the cursor hidden and held in the stream.
+    #[default]
+    Game,
+    /// Where the cursor is over the picture.
+    Desktop,
+}
+
+/// The mouse of a PC stream: pointer events of the video window as core
+/// input, sent only while the stream has the mouse.
+#[derive(Default)]
+pub struct Mouse {
+    pub mode: MouseMode,
+    active: bool,
+    pc: PcInput,
+}
+
+impl Mouse {
+    /// Starts or stops taking the mouse; stopping lets go of every held button.
+    pub fn set_active(&mut self, sink: &impl Sink, active: bool) {
+        if self.active && !active { self.pc.release_all(sink); }
+        self.active = active;
+    }
+
+    /// Switches between the game and desktop modes, letting go of held buttons.
+    pub fn toggle_mode(&mut self, sink: &impl Sink) {
+        self.pc.release_all(sink);
+        self.mode = match self.mode { MouseMode::Game => MouseMode::Desktop, MouseMode::Desktop => MouseMode::Game };
+    }
+
+    /// Sends `event` from a `window`-sized video window showing a `picture`-sized video.
+    pub fn send(&mut self, sink: &impl Sink, event: PointerEvent, window: (u32, u32), picture: (u32, u32)) {
+        if !self.active { return; }
+        let event = match (event, self.mode) {
+            (PointerEvent::Moved { dx, dy }, MouseMode::Game) => Some(InputEvent::MouseMove { dx: dx as f32, dy: dy as f32 }),
+            (PointerEvent::At { x, y }, MouseMode::Desktop) => over_picture((x, y), window, picture)
+                .map(|(x, y)| InputEvent::MousePosition { x, y }),
+            (PointerEvent::Button { button, down }, _) => button_event(button, down),
+            _ => None,
+        };
+        if let Some(event) = event { self.pc.send(sink, event); }
+    }
+}
+
+/// The core event of an X button; the wheel scrolls one notch on a press.
+fn button_event(button: u32, down: bool) -> Option<InputEvent> {
+    let press = |button| Some(InputEvent::MouseButton { button, down });
+    let scroll = |dx, dy| down.then_some(InputEvent::Scroll { dx, dy });
+    match button {
+        1 => press(MouseButton::Left),
+        2 => press(MouseButton::Middle),
+        3 => press(MouseButton::Right),
+        8 => press(MouseButton::X1),
+        9 => press(MouseButton::X2),
+        4 => scroll(0.0, 1.0),
+        5 => scroll(0.0, -1.0),
+        6 => scroll(-1.0, 0.0),
+        7 => scroll(1.0, 0.0),
+        _ => None,
+    }
+}
+
+/// Where a point of the window is on the picture, 0…1 from its top left
+/// corner: the picture is as large as fits and centred, as it is shown.
+fn over_picture((x, y): (f64, f64), window: (u32, u32), picture: (u32, u32)) -> Option<(f32, f32)> {
+    if picture.0 == 0 || picture.1 == 0 || window.0 == 0 || window.1 == 0 { return None; }
+    let (left, top, width, height) = crate::present::fit(picture, window);
+    Some(((x as f32 - left) / width, (y as f32 - top) / height))
+}
+
 pub fn emit_route_events(events: Vec<RouteEvent>) {
     for event in events {
         match event {
@@ -368,6 +441,111 @@ mod tests {
         let dropped = Arc::downgrade(&input.device_alive);
         drop(input);
         assert_eq!(dropped.strong_count(), 0);
+    }
+
+    #[derive(Default)]
+    struct Recorder(std::cell::RefCell<Vec<String>>);
+
+    impl Recorder {
+        fn take(&self) -> Vec<String> { std::mem::take(&mut self.0.borrow_mut()) }
+        fn push(&self, call: String) { self.0.borrow_mut().push(call) }
+    }
+
+    impl Sink for Recorder {
+        fn key(&self, key: u8, down: bool, _: u8) { self.push(format!("key {key} {down}")) }
+        fn text(&self, text: &str) { self.push(format!("text {text}")) }
+        fn mouse_move(&self, dx: i16, dy: i16) { self.push(format!("move {dx} {dy}")) }
+        fn mouse_position(&self, x: i16, y: i16, _: i16, _: i16) { self.push(format!("at {x} {y}")) }
+        fn mouse_button(&self, button: MouseButton, down: bool) { self.push(format!("{button:?} {down}")) }
+        fn scroll(&self, amount: i16) { self.push(format!("scroll {amount}")) }
+        fn hscroll(&self, amount: i16) { self.push(format!("hscroll {amount}")) }
+        fn touch(&self, _: playwake_core::input::Touch) -> bool { false }
+        fn host_supports_touch(&self) -> bool { false }
+    }
+
+    const SCREEN: (u32, u32) = (1280, 800);
+
+    fn active_mouse(sink: &Recorder) -> Mouse {
+        let mut mouse = Mouse::default();
+        mouse.set_active(sink, true);
+        mouse
+    }
+
+    #[test]
+    fn game_mode_sends_raw_motion_and_ignores_positions() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        mouse.send(&sink, PointerEvent::Moved { dx: 2.5, dy: -1.0 }, SCREEN, SCREEN);
+        mouse.send(&sink, PointerEvent::At { x: 10.0, y: 10.0 }, SCREEN, SCREEN);
+        mouse.send(&sink, PointerEvent::Moved { dx: 0.5, dy: 0.0 }, SCREEN, SCREEN);
+        assert_eq!(sink.take(), ["move 2 -1", "move 1 0"]);
+    }
+
+    #[test]
+    fn desktop_mode_sends_positions_over_the_letterboxed_picture() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        mouse.toggle_mode(&sink);
+        assert_eq!(mouse.mode, MouseMode::Desktop);
+        // 1920x1080 on a 1280x800 window: bars of 40 pixels above and below.
+        let picture = (1920, 1080);
+        mouse.send(&sink, PointerEvent::Moved { dx: 5.0, dy: 5.0 }, SCREEN, picture);
+        mouse.send(&sink, PointerEvent::At { x: 640.0, y: 400.0 }, SCREEN, picture);
+        mouse.send(&sink, PointerEvent::At { x: 0.0, y: 40.0 }, SCREEN, picture);
+        mouse.send(&sink, PointerEvent::At { x: 1280.0, y: 760.0 }, SCREEN, picture);
+        // On a bar the position stays at the picture's edge.
+        mouse.send(&sink, PointerEvent::At { x: 1280.0, y: 5.0 }, SCREEN, picture);
+        assert_eq!(sink.take(), ["at 16384 16384", "at 0 0", "at 32767 32767", "at 32767 0"]);
+    }
+
+    #[test]
+    fn a_window_shrunk_above_the_keyboard_maps_to_the_whole_picture() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        mouse.toggle_mode(&sink);
+        mouse.send(&sink, PointerEvent::At { x: 320.0, y: 400.0 }, (640, 400), SCREEN);
+        assert_eq!(sink.take(), ["at 16384 32767"]);
+    }
+
+    #[test]
+    fn buttons_and_wheel_map_to_the_pc_mouse() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        for button in 1..=9 {
+            mouse.send(&sink, PointerEvent::Button { button, down: true }, SCREEN, SCREEN);
+            mouse.send(&sink, PointerEvent::Button { button, down: false }, SCREEN, SCREEN);
+        }
+        assert_eq!(sink.take(), [
+            "Left true", "Left false", "Middle true", "Middle false", "Right true", "Right false",
+            "scroll 120", "scroll -120", "hscroll -120", "hscroll 120",
+            "X1 true", "X1 false", "X2 true", "X2 false",
+        ]);
+    }
+
+    #[test]
+    fn losing_the_mouse_lets_go_of_held_buttons_and_drops_later_events() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        mouse.send(&sink, PointerEvent::Button { button: 1, down: true }, SCREEN, SCREEN);
+        mouse.send(&sink, PointerEvent::Button { button: 3, down: true }, SCREEN, SCREEN);
+        sink.take();
+        mouse.set_active(&sink, false);
+        assert_eq!(sink.take(), ["Left false", "Right false"]);
+        mouse.send(&sink, PointerEvent::Moved { dx: 4.0, dy: 4.0 }, SCREEN, SCREEN);
+        mouse.send(&sink, PointerEvent::Button { button: 1, down: true }, SCREEN, SCREEN);
+        mouse.set_active(&sink, false);
+        assert_eq!(sink.take(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn switching_modes_lets_go_of_held_buttons() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        mouse.send(&sink, PointerEvent::Button { button: 1, down: true }, SCREEN, SCREEN);
+        sink.take();
+        mouse.toggle_mode(&sink);
+        mouse.toggle_mode(&sink);
+        assert_eq!((sink.take(), mouse.mode), (vec!["Left false".to_string()], MouseMode::Game));
     }
 
     #[test]

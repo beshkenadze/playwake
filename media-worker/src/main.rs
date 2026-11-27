@@ -91,6 +91,11 @@ struct Worker {
     preview: bool,
     /// Removes the pipeline's error watch when dropped, so it lives here.
     bus_watch: Option<gst::bus::BusWatchGuard>,
+    /// The pointer of a PC stream's video window.
+    pointer: Option<x11::Pointer>,
+    mouse: input::Mouse,
+    /// Gamescope shows this app, not Steam or another one.
+    focused: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -336,10 +341,11 @@ fn run() -> Result<(), String> {
                     let app = focus.focused_app();
                     // The gamepad moves over the on-screen keyboard, not the game.
                     let typing = w.x11.as_ref().is_some_and(|x11| x11.keyboard);
-                    let active = (app.is_none() || app == Some(target)) && !typing;
-                    let events = w.input.route.focus(active);
+                    w.focused = app.is_none() || app == Some(target);
+                    let events = w.input.route.focus(w.focused && !typing);
                     input::emit_route_events(events);
                 }
+                w.sync_mouse();
             }
             glib::ControlFlow::Continue
         });
@@ -348,6 +354,7 @@ fn run() -> Result<(), String> {
     quit.run();
 
     if let Some(mut w) = slot.lock().unwrap().take() {
+        if let Some(pc) = &w.pc { w.mouse.set_active(pc.as_ref(), false); }
         if let Some(overlay) = w.overlay.as_mut() { overlay.close(); }
         if let Some(x11) = w.x11.as_mut() { x11.close(); }
         if let Some(pc) = &w.pc { pc.stop(); }
@@ -418,18 +425,30 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 let events = w.input.route.open_overlay();
                 input::emit_route_events(events);
+                w.sync_mouse();
             }
         }
         Command::OverlayClose => {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 let events = w.input.route.close_overlay(false);
                 input::emit_route_events(events);
+                w.sync_mouse();
             }
         }
         Command::XboxGuide => {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 let events = w.input.route.close_overlay(true);
                 input::emit_route_events(events);
+                w.sync_mouse();
+            }
+        }
+        Command::MouseModeToggle => {
+            if let Some(w) = slot.lock().unwrap().as_mut() {
+                if let Some(pc) = &w.pc { w.mouse.toggle_mode(pc.as_ref()); }
+                let desktop = w.mouse.mode == input::MouseMode::Desktop;
+                if let Some(overlay) = w.overlay.as_mut() { overlay.desktop_mouse = desktop; }
+                protocol::event("stream-mouse-mode", serde_json::json!({ "mode": if desktop { "desktop" } else { "game" } }));
+                w.sync_mouse();
             }
         }
         Command::Type { text } => {
@@ -443,8 +462,10 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
         }
         Command::InputFocus { active } => {
             if let Some(w) = slot.lock().unwrap().as_mut() {
+                w.focused = active;
                 let events = w.input.route.focus(active);
                 input::emit_route_events(events);
+                w.sync_mouse();
             }
         }
         Command::Trial { restore_view } => {
@@ -578,12 +599,11 @@ fn start(
     if let Some(x) = x11_window.as_ref() { x.sync(); }
     let overlay = if interactive {
         x11_window.as_ref()
-            .and_then(|x| overlay::Overlay::new(x.display, x.xid as u32).ok())
+            .and_then(|x| overlay::Overlay::new(x.display, x.xid as u32, matches!(source, Source::Pc(_))).ok())
             .map(|mut overlay| {
                 overlay.russian = russian;
                 overlay.xbox_palette = xbox_palette;
                 overlay.console_name = console_name.clone();
-                overlay.pc = matches!(source, Source::Pc(_));
                 overlay
             })
     } else {
@@ -596,12 +616,30 @@ fn start(
         if let Source::Scene { title, .. } = &source { st.preview = Some(title.clone()); }
     }
 
+    // A PC stream takes the mouse of its video window.
+    let pointer = if matches!(source, Source::Pc(_)) && x11_window.is_some() {
+        x11::Pointer::new().inspect_err(|error| eprintln!("pw-mouse {error}")).ok()
+    } else {
+        None
+    };
+    if let Some((fd, alive)) = pointer.as_ref().map(x11::Pointer::watch) {
+        let slot = slot.clone();
+        glib::unix_fd_add_local(fd, glib::IOCondition::IN, move |_, _| {
+            let mut guard = slot.lock().unwrap();
+            // The fd is closed once its worker is replaced or gone.
+            if alive.strong_count() == 0 { return glib::ControlFlow::Break; }
+            let Some(w) = guard.as_mut() else { return glib::ControlFlow::Break };
+            w.sync_mouse();
+            glib::ControlFlow::Continue
+        });
+    }
+
     *slot.lock().unwrap() = Some(Worker {
         pipeline: pipeline.clone(), rtc: rtc.clone(), pc: None, state: state.clone(), video: None,
         x11: x11_window, overlay, focus, target_app,
         input, renderer: renderer.clone(), window, lsfg, volume,
         tracked: std::collections::HashSet::new(), quit: quit.clone(), start_time, input_retry: false,
-        hud_active: false, preview, bus_watch: None,
+        hud_active: false, preview, bus_watch: None, pointer, mouse: input::Mouse::default(), focused: true,
     });
 
     // pad-added → branch attachment.
@@ -737,6 +775,24 @@ fn arm_input(slot: &Slot, w: &mut Worker) {
 
 #[cfg(target_os = "linux")]
 impl Worker {
+    /// Sends the pointer events that arrived to the PC, then grabs the
+    /// pointer while the stream has the mouse and lets it go otherwise.
+    fn sync_mouse(&mut self) {
+        let Some(pointer) = self.pointer.as_mut() else { return };
+        let events = pointer.events();
+        let Some(pc) = self.pc.as_ref() else { return };
+        // Steam's on-screen keyboard takes the pointer while it is up.
+        let window = self.x11.as_ref().filter(|x11| x11.xid != 0 && !x11.keyboard).map(|x11| (x11.xid as u32, x11.size));
+        let picture = { let st = self.state.lock().unwrap(); (st.width, st.height) };
+        for event in events {
+            if let Some((_, size)) = window { self.mouse.send(pc.as_ref(), event, size, picture); }
+        }
+        let active = self.focused && !self.input.route.overlay && window.is_some() && !pc.ended();
+        self.mouse.set_active(pc.as_ref(), active);
+        let hidden = self.mouse.mode == input::MouseMode::Game;
+        pointer.hold(window.filter(|_| active).map(|(xid, _)| (xid, hidden)));
+    }
+
     /// Sends the current pad state. Returns false when input is not armed or
     /// its channel is gone.
     fn send_input(&mut self, slot: &Slot) -> bool {

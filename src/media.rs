@@ -172,6 +172,8 @@ pub enum StreamCommand {
     Type(char),
     /// A key pressed and released, as a Windows virtual-key code.
     Key(u8),
+    /// Switches the PC mouse between game and desktop mode.
+    ToggleMouseMode,
 }
 
 /// The Windows virtual-key code of a keyboard key that types no character.
@@ -219,6 +221,7 @@ impl StreamCommand {
             Self::InputFocus(active) => json!({"action":"input-focus","active":active}),
             Self::Type(character) => json!({"action":"type","text":character.to_string()}),
             Self::Key(code) => json!({"action":"key","code":code}),
+            Self::ToggleMouseMode => json!({"action":"mouse-mode-toggle"}),
         }
     }
 }
@@ -232,7 +235,7 @@ impl OverlayKey {
             Some("activate") => Some(Self::Activate),
             Some("back") => Some(Self::Back),
             Some("select") => event.get("index").and_then(Value::as_u64)
-                .filter(|index| *index < 5).map(|index| Self::Select(index as usize)),
+                .filter(|index| *index < 6).map(|index| Self::Select(index as usize)),
             _ => None,
         }
     }
@@ -790,6 +793,13 @@ mod tests {
         // A key that types a character has no code of its own here.
         assert_eq!(named_key("a"), None);
         assert_eq!(named_key("space"), None);
+    }
+
+    #[test]
+    fn the_pc_mouse_item_of_the_stream_menu_reaches_the_worker() {
+        assert!(matches!(OverlayKey::read(&json!({"key":"select","index":5})), Some(OverlayKey::Select(5))));
+        assert!(OverlayKey::read(&json!({"key":"select","index":6})).is_none());
+        assert_eq!(StreamCommand::ToggleMouseMode.message(), json!({"action":"mouse-mode-toggle"}));
     }
 
     #[test]

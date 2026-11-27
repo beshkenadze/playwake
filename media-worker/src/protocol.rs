@@ -91,6 +91,8 @@ pub enum Command {
     InputFocus {
         active: bool,
     },
+    /// Switches the PC mouse between game and desktop mode.
+    MouseModeToggle,
     Stats,
     Stop,
     /// The LSFG preview: a made-up scene in the video window, no stream.
@@ -186,6 +188,7 @@ mod tests {
         assert!(matches!(parse(r#"{"action":"start","bitrate":1,"jitter_ms":5}"#), Some(Command::Start { jitter_ms: Some(5), .. })));
         assert!(matches!(parse(r#"{"action":"start","bitrate":1,"jitter_ms":null}"#), Some(Command::Start { jitter_ms: None, .. })));
         assert!(matches!(parse(r#"{"action":"stop"}"#), Some(Command::Stop)));
+        assert!(matches!(parse(r#"{"action":"mouse-mode-toggle"}"#), Some(Command::MouseModeToggle)));
     }
 
     #[test]

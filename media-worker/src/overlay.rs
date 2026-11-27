@@ -44,19 +44,22 @@ pub struct Overlay {
     pub russian: bool,
     pub xbox_palette: bool,
     pub console_name: String,
-    /// The stream comes from a PC, not an Xbox.
+    /// The stream comes from a PC, not an Xbox: its menu has a mouse mode
+    /// item, and a right click goes to the PC.
     pub pc: bool,
+    /// The PC mouse is in desktop mode, not game mode.
+    pub desktop_mouse: bool,
     /// Paint into `layer`, not the window: a child window above the video
     /// stops Gamescope from showing the video's own HDR frames.
     pub offscreen: bool,
     pub layer: Option<std::sync::Arc<Layer>>,
-    rendered: Option<(String, usize, bool, String, String, Vec<String>)>,
+    rendered: Option<(String, usize, bool, bool, String, String, Vec<String>)>,
     geometry: Option<(String, i32, i32, i32, i32)>,
     scale: f64,
 }
 
 impl Overlay {
-    pub fn new(display: *mut xlib::Display, parent: u32) -> Result<Self, String> {
+    pub fn new(display: *mut xlib::Display, parent: u32, pc: bool) -> Result<Self, String> {
         let xlib = xlib::Xlib::open().map_err(|e| format!("libX11: {e}"))?;
         let (shape_conn, _) = x11rb::connect(None).map_err(|e| format!("X11 shape connect: {e}"))?;
         unsafe {
@@ -67,10 +70,13 @@ impl Overlay {
             if xid == 0 { return Err("overlay XCreateSimpleWindow failed".into()); }
             (xlib.XStoreName)(display, xid, b"Playwake stream overlay\0".as_ptr() as *const i8);
             (xlib.XSelectInput)(display, xid, xlib::ExposureMask | xlib::ButtonPressMask);
-            // Right click opens the menu from the video or its parent.
-            (xlib.XGrabButton)(display, 3, xlib::AnyModifier, parent as xlib::Window, 0,
-                (xlib::ButtonPressMask | xlib::ButtonReleaseMask) as u32,
-                xlib::GrabModeAsync, xlib::GrabModeAsync, 0, 0);
+            // Right click opens the menu from the video or its parent, except
+            // in a PC stream, where it is the PC's.
+            if !pc {
+                (xlib.XGrabButton)(display, 3, xlib::AnyModifier, parent as xlib::Window, 0,
+                    (xlib::ButtonPressMask | xlib::ButtonReleaseMask) as u32,
+                    xlib::GrabModeAsync, xlib::GrabModeAsync, 0, 0);
+            }
             (xlib.XFlush)(display);
             (xlib.XSync)(display, 0);
             Ok(Self {
@@ -78,7 +84,7 @@ impl Overlay {
                 hint_pending: false, hint_until: 0.0,
                 menu: false, diagnostics: false, selection: 0,
                 metrics: Vec::new(), compact: "—".into(), compact_rate: "—".into(),
-                russian: false, xbox_palette: false, console_name: "Xbox".into(), pc: false,
+                russian: false, xbox_palette: false, console_name: "Xbox".into(), pc, desktop_mouse: false,
                 offscreen: false, layer: None, rendered: None, geometry: None, scale: 1.0,
             })
         }
@@ -95,19 +101,29 @@ impl Overlay {
     /// Button events arrive via the shared Xlib pump (video tick).
     pub fn handle_button(&mut self, window: u32, button: u32, x: i32, y: i32) -> Vec<OverlayEvent> {
         let mut events = Vec::new();
-        if button == 3 && (window == self.parent || window == self.xid) {
+        if button == 3 && !self.pc && (window == self.parent || window == self.xid) {
             events.push(OverlayEvent::Toggle);
         } else if let Some((left, top)) = self.pressed_in(window).filter(|_| button == 1 && self.menu) {
             let x = (x - left) as f64 / self.scale;
             let y = (y - top) as f64 / self.scale;
-            let index = ((y - 152.0) / 58.0).floor() as isize;
-            if (22.0..=418.0).contains(&x) && (152.0..442.0).contains(&y)
-                && (y - 152.0) % 58.0 < 52.0 && index >= 0
-            {
-                events.push(OverlayEvent::Select(index as usize));
-            }
+            events.extend(item_at(x, y, self.items().len()).map(OverlayEvent::Select));
         }
         events
+    }
+
+    /// The menu's items; the app acts on them by their index.
+    fn items(&self) -> Vec<String> {
+        let label = |ru: &str, en: &str| if self.russian { ru.to_string() } else { en.to_string() };
+        let diagnostics = if self.diagnostics { label("Скрыть статистику", "Hide statistics") }
+            else { label("Статистика", "Statistics") };
+        let guide = if self.pc { "Guide" } else { "Xbox Guide" };
+        let mut items = vec![label("Продолжить", "Resume"), guide.to_string(), diagnostics,
+            label("Переподключить", "Reconnect"), label("Завершить стрим", "End stream")];
+        if self.pc {
+            items.push(if self.desktop_mouse { label("Мышь: рабочий стол", "Mouse: desktop") }
+                else { label("Мышь: игра", "Mouse: game") });
+        }
+        items
     }
 
     /// Where the overlay starts in the window a press came from, if the
@@ -187,7 +203,7 @@ impl Overlay {
             // repaint even when the text itself did not change.
             self.rendered = None;
         }
-        let frame = (mode.to_string(), self.selection, self.diagnostics,
+        let frame = (mode.to_string(), self.selection, self.diagnostics, self.desktop_mouse,
             self.compact.clone(), self.compact_rate.clone(),
             if self.menu && self.diagnostics { self.metrics.clone() } else { Vec::new() });
         if self.rendered.as_ref() != Some(&frame) {
@@ -262,13 +278,9 @@ impl Overlay {
             text(ctx, 48.0, 85.0, &label("Стрим идёт", "Streaming"), 16.0, false, accent);
             text(ctx, 32.0, 111.0, &self.compact_rate, 13.0, false, muted);
             text(ctx, 32.0, 131.0, &self.compact, 13.0, false, muted);
-            let diagnostics = if self.diagnostics { label("Скрыть статистику", "Hide statistics") }
-                else { label("Статистика", "Statistics") };
-            let guide = if self.pc { "Guide" } else { "Xbox Guide" };
-            let names = [label("Продолжить", "Resume"), guide.to_string(), diagnostics,
-                label("Переподключить", "Reconnect"), label("Завершить стрим", "End stream")];
+            let names = self.items();
             for (index, name) in names.iter().enumerate() {
-                let y = 152.0 + 58.0 * index as f64;
+                let y = ITEMS_TOP + ITEM_STEP * index as f64;
                 let selected = index == self.selection;
                 if selected {
                     rect(ctx, 20.0, y - 2.0, width - 40.0, 56.0, accent);
@@ -277,9 +289,10 @@ impl Overlay {
                 let color = if index == 4 { (0.99, 0.53, 0.51) } else { (0.93, 0.93, 0.93) };
                 text(ctx, 40.0, y + 33.0, name, 18.0, selected, color);
             }
-            if self.diagnostics && height > 645.0 {
+            let metrics = ITEMS_TOP + ITEM_STEP * names.len() as f64 + 25.0;
+            if self.diagnostics && height > metrics + 178.0 {
                 for (index, line) in self.metrics.iter().skip(1).enumerate() {
-                    text(ctx, 32.0, 467.0 + 19.0 * index as f64, line, 13.0, false, muted);
+                    text(ctx, 32.0, metrics + 19.0 * index as f64, line, 13.0, false, muted);
                 }
             }
             let paused = if self.pc { label("Ввод на ПК приостановлен", "PC input paused") }
@@ -308,5 +321,34 @@ impl Overlay {
     }
 }
 
+/// Where the menu's first item starts and how far apart items are, in
+/// unscaled pixels; an item is 52 pixels high.
+const ITEMS_TOP: f64 = 152.0;
+const ITEM_STEP: f64 = 58.0;
+
+/// The menu item at a point of the menu, of `count` items.
+fn item_at(x: f64, y: f64, count: usize) -> Option<usize> {
+    let offset = y - ITEMS_TOP;
+    let index = (offset / ITEM_STEP).floor();
+    ((22.0..=418.0).contains(&x) && index >= 0.0 && index < count as f64 && offset % ITEM_STEP < 52.0)
+        .then_some(index as usize)
+}
+
 // The shared Xlib display is only touched from the glib main-loop thread.
 unsafe impl Send for Overlay {}
+#[cfg(test)]
+mod tests {
+    use super::item_at;
+
+    #[test]
+    fn clicks_pick_the_item_under_them_including_the_pc_mouse_item() {
+        assert_eq!(item_at(100.0, 152.0, 5), Some(0));
+        assert_eq!(item_at(100.0, 152.0 + 58.0 * 4.0 + 51.0, 5), Some(4));
+        // The gap between two items and the space past the last one pick nothing.
+        assert_eq!(item_at(100.0, 152.0 + 53.0, 5), None);
+        assert_eq!(item_at(100.0, 152.0 + 58.0 * 5.0 + 10.0, 5), None);
+        assert_eq!(item_at(100.0, 152.0 + 58.0 * 5.0 + 10.0, 6), Some(5));
+        assert_eq!(item_at(10.0, 152.0, 5), None);
+        assert_eq!(item_at(100.0, 100.0, 5), None);
+    }
+}
