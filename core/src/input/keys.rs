@@ -65,6 +65,7 @@ fn hid_vk(usage: u16) -> Option<u8> {
         0x63 => 0x6E,                       // keypad .
         0x64 => 0xE2,                       // ISO \ next to the left Shift
         0x65 => 0x5D,                       // Menu
+        0x67 => 0x92,                       // keypad =
         0x68..=0x73 => 0x7C + offset(0x68), // F13…F24
         0xE0 => 0xA2,                       // left Ctrl
         0xE1 => 0xA0,                       // left Shift
@@ -133,6 +134,7 @@ fn evdev_hid(code: u16) -> Option<u16> {
         109 => 0x4E,                         // KEY_PAGEDOWN
         110 => 0x49,                         // KEY_INSERT
         111 => 0x4C,                         // KEY_DELETE
+        117 => 0x67,                         // KEY_KPEQUAL
         119 => 0x48,                         // KEY_PAUSE
         125 => 0xE3,                         // KEY_LEFTMETA
         126 => 0xE7,                         // KEY_RIGHTMETA
@@ -206,6 +208,9 @@ mod tests {
         assert_eq!(both(0x2D, 12), (Some(0xBD), Some(0xBD)));   // -
         assert_eq!(both(0x5F, 71), (Some(0x67), Some(0x67)));   // keypad 7
         assert_eq!(both(0x63, 83), (Some(0x6E), Some(0x6E)));   // keypad .
+        assert_eq!(both(0x54, 98), (Some(0x6F), Some(0x6F)));   // keypad /
+        assert_eq!(both(0x58, 96), (Some(0x0D), Some(0x0D)));   // keypad Enter
+        assert_eq!(both(0x67, 117), (Some(0x92), Some(0x92)));  // keypad =
     }
 
     #[test]
@@ -239,13 +244,28 @@ mod tests {
         assert_eq!(Usage::Evdev(0xFFFF).vk(), None);
     }
 
-    #[test]
-    fn every_evdev_key_lands_on_a_virtual_key() {
+    /// Every key lands on a virtual key of its own, but for the keys that
+    /// share one on purpose, so a lost or misdirected row shows.
+    fn distinct_keys(usage: fn(u16) -> Usage, shared: &[u8]) -> usize {
+        let mut seen = std::collections::BTreeMap::new();
         for code in 0..=u16::MAX {
-            if let Some(hid) = evdev_hid(code) {
-                assert!(hid_vk(hid).is_some(), "evdev {code} gives HID {hid:#x} with no key");
+            if let Some(vk) = usage(code).vk()
+                && let Some(before) = seen.insert(vk, code)
+            {
+                assert!(shared.contains(&vk), "{before} and {code} both give {vk:#x}");
             }
         }
+        seen.len()
+    }
+
+    #[test]
+    fn each_hid_key_has_its_own_virtual_key() {
+        assert_eq!(distinct_keys(Usage::Hid, &[0x0D, 0xDC]), 117);
+    }
+
+    #[test]
+    fn each_evdev_key_has_its_own_virtual_key() {
+        assert_eq!(distinct_keys(Usage::Evdev, &[0x0D]), 117);
     }
 
     #[test]
