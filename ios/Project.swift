@@ -64,12 +64,36 @@ let project = Project(
                     ],
                 ]
             )
-        )
+        ),
+        .target(
+            name: "PlaywakeIOSTests",
+            destinations: [.iPhone, .iPad],
+            product: .unitTests,
+            bundleId: "io.github.beshkenadze.playwake.ios.tests",
+            deploymentTargets: .iOS("17.0"),
+            sources: ["PlaywakeIOSTests/**"],
+            dependencies: [.target(name: "PlaywakeIOS")],
+            settings: .settings(base: [
+                // The app's product name is Playwake, not the target name.
+                "TEST_HOST": "$(BUILT_PRODUCTS_DIR)/Playwake.app/Playwake",
+                "BUNDLE_LOADER": "$(TEST_HOST)",
+            ])
+        ),
+        .target(
+            name: "PlaywakeIOSUITests",
+            destinations: [.iPhone, .iPad],
+            product: .uiTests,
+            bundleId: "io.github.beshkenadze.playwake.ios.uitests",
+            deploymentTargets: .iOS("17.0"),
+            sources: ["PlaywakeIOSUITests/**"],
+            dependencies: [.target(name: "PlaywakeIOS")]
+        ),
     ],
     schemes: [
         .scheme(
             name: "PlaywakeIOS",
             buildAction: .buildAction(targets: ["PlaywakeIOS"]),
+            testAction: .targets(["PlaywakeIOSTests", "PlaywakeIOSUITests"]),
             runAction: .runAction(
                 configuration: .debug,
                 arguments: .arguments(

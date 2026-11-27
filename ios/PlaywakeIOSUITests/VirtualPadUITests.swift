@@ -1,0 +1,27 @@
+import XCTest
+
+final class VirtualPadUITests: XCTestCase {
+    /// Touches on the on-screen pad play the game; only touches elsewhere
+    /// open the stream menu.
+    @MainActor
+    func testPadTouchesDoNotOpenTheStreamMenu() {
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "always"]
+        app.launch()
+
+        let view = app.buttons["View"]
+        XCTAssertTrue(view.waitForExistence(timeout: 20), "the on-screen pad did not appear")
+        let menu = app.staticTexts["Input paused"]
+
+        // The A button of the system pad, bottom right in portrait.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.59, dy: 0.92)).tap()
+        XCTAssertFalse(menu.waitForExistence(timeout: 2), "a touch on A opened the stream menu")
+
+        view.tap()
+        XCTAssertFalse(menu.waitForExistence(timeout: 2), "a touch on View opened the stream menu")
+
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
+        XCTAssertTrue(menu.waitForExistence(timeout: 5), "a touch on the video did not open the stream menu")
+    }
+}

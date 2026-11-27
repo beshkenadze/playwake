@@ -1,11 +1,11 @@
-import Foundation
 import GameController
+import SwiftUI
 
 /// The system on-screen gamepad (`GCVirtualController`) shown over a stream.
 /// It appears to the app as an ordinary `GCController`, so `Gamepad` reads it
 /// like a physical pad.
 @MainActor
-final class VirtualPad {
+final class VirtualPad: ObservableObject {
     enum Mode: String {
         case auto, always, never
 
@@ -35,7 +35,8 @@ final class VirtualPad {
     static let shared = VirtualPad()
 
     /// The system pad throws on a d-pad together with the left stick, and on
-    /// Menu, Options and the stick buttons, so those are not here.
+    /// Menu, Options and the stick buttons, so those are not here; View and
+    /// Menu are `VirtualPadButtons`.
     private lazy var pad: GCVirtualController = {
         let configuration = GCVirtualController.Configuration()
         configuration.elements = [
@@ -46,7 +47,7 @@ final class VirtualPad {
         return GCVirtualController(configuration: configuration)
     }()
     private var active = false
-    private var connected = false
+    @Published private(set) var connected = false
     private var connecting = false
 
     private init() {
@@ -92,6 +93,52 @@ final class VirtualPad {
         } else if !show && connected {
             pad.disconnect()
             connected = false
+            Gamepad.shared.overlayButtons = 0
         }
+    }
+}
+
+/// View and Menu, which the system pad cannot show, held down while touched.
+struct VirtualPadButtons: View {
+    @ObservedObject private var pad = VirtualPad.shared
+
+    var body: some View {
+        if pad.connected {
+            HStack(spacing: 28) {
+                PadButton(symbol: "rectangle.on.rectangle", label: "View", bit: Gamepad.Button.view)
+                PadButton(symbol: "line.3.horizontal", label: "Menu", bit: Gamepad.Button.menu)
+            }
+            .padding(.bottom, 24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        }
+    }
+}
+
+private struct PadButton: View {
+    let symbol: String
+    let label: String
+    let bit: UInt16
+    @State private var pressed = false
+
+    var body: some View {
+        Image(systemName: symbol)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(.black)
+            .frame(width: 44, height: 44)
+            .background(Circle().fill(Color.white.opacity(pressed ? 1 : 0.75)))
+            .contentShape(Circle())
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { _ in set(true) }
+                .onEnded { _ in set(false) })
+            .onDisappear { set(false) }
+            .accessibilityLabel(label)
+            .accessibilityAddTraits(.isButton)
+    }
+
+    private func set(_ down: Bool) {
+        guard pressed != down else { return }
+        pressed = down
+        let gamepad = Gamepad.shared
+        gamepad.overlayButtons = down ? gamepad.overlayButtons | bit : gamepad.overlayButtons & ~bit
     }
 }

@@ -19,6 +19,7 @@ struct StreamView: View {
                     .padding(20)
                     .allowsHitTesting(false)
             }
+            VirtualPadButtons()
             // Shown while connecting too: View+Menu opens the route's menu and
             // pauses the pad, so the menu must be visible whenever it is open.
             if controller.menuOpen {
