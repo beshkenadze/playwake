@@ -358,6 +358,8 @@ final class XboxRTC: NSObject {
     private func routePad(_ pad: inout Gamepad.Snapshot, at now: Double) -> UInt32 {
         var wire = pw_pad(axes: (pad.axes[0], pad.axes[1], pad.axes[2], pad.axes[3]),
                           buttons: pad.buttons, lt: pad.lt, rt: pad.rt)
+        // Keyboard and mouse join as a pad here, so the menu pauses them too.
+        pw_input_pad(&wire, now)
         let events = pw_route_input(route, &wire, now)
         pad.axes = [wire.axes.0, wire.axes.1, wire.axes.2, wire.axes.3]
         pad.buttons = wire.buttons
