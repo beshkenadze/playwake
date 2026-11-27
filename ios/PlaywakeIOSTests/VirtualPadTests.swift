@@ -24,13 +24,13 @@ struct VirtualPadTests {
         }
     }
 
-    @Test func storedModeDefaultsToAuto() {
-        let defaults = UserDefaults.standard
-        let saved = defaults.object(forKey: VirtualPad.Mode.key)
-        defer { defaults.set(saved, forKey: VirtualPad.Mode.key) }
-        defaults.removeObject(forKey: VirtualPad.Mode.key)
-        #expect(VirtualPad.Mode.stored == .auto)
+    @Test func storedModeDefaultsToAuto() throws {
+        let defaults = try #require(UserDefaults(suiteName: "VirtualPadTests"))
+        defer { defaults.removePersistentDomain(forName: "VirtualPadTests") }
+        #expect(VirtualPad.Mode.stored(defaults) == .auto)
         defaults.set("never", forKey: VirtualPad.Mode.key)
-        #expect(VirtualPad.Mode.stored == .never)
+        #expect(VirtualPad.Mode.stored(defaults) == .never)
+        defaults.set("bogus", forKey: VirtualPad.Mode.key)
+        #expect(VirtualPad.Mode.stored(defaults) == .auto)
     }
 }

@@ -55,6 +55,7 @@ final class Gamepad {
     static let shared = Gamepad()
 
     private let lock = NSLock()
+    private let kind: (GCController) -> Kind
     private var current: GCController?
     private var changeHandler: (() -> Void)?
     private var overlay: UInt16 = 0
@@ -82,7 +83,10 @@ final class Gamepad {
     private var observing = false
     private var discoveryTimer: DispatchSourceTimer?
 
-    private init() {}
+    /// `kind` is replaceable for tests, which cannot make a touch controller.
+    init(kind: @escaping (GCController) -> Kind = Kind.init) {
+        self.kind = kind
+    }
 
     func start() {
         lock.lock()
@@ -95,14 +99,8 @@ final class Gamepad {
             self?.adopt(note.object as? GCController)
         }
         NotificationCenter.default.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] note in
-            guard let self, let controller = note.object as? GCController else { return }
-            lock.lock()
-            let wasCurrent = current === controller
-            if wasCurrent { current = nil }
-            lock.unlock()
-            guard wasCurrent else { return }
-            let rest = GCController.controllers().filter { $0 !== controller && $0.extendedGamepad != nil }
-            adopt(Self.fallback(rest, kind: Kind.init))
+            guard let controller = note.object as? GCController else { return }
+            self?.disconnected(controller, remaining: GCController.controllers())
         }
         #if os(macOS) || targetEnvironment(macCatalyst)
         // macOS only delivers controller input to the focused app by default.
@@ -111,7 +109,7 @@ final class Gamepad {
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
         let available = GCController.controllers()
         LabLog.write("gamepad scan: \(available.count) controller(s)")
-        adopt(Self.fallback(available, kind: Kind.init))
+        adopt(best(available))
         // The HID manager comes up asynchronously, and on macOS a pad already
         // connected is only exposed once the app is focused, so keep looking
         // until one shows up instead of guessing a timeout.
@@ -131,17 +129,22 @@ final class Gamepad {
             let found = GCController.controllers()
             if !found.isEmpty {
                 LabLog.write("gamepad retry: \(found.count) controller(s)")
-                self.adopt(Self.fallback(found, kind: Kind.init))
+                self.adopt(self.best(found))
             }
         }
         timer.resume()
         discoveryTimer = timer
     }
 
-    private func adopt(_ controller: GCController?) {
-        guard let controller else { return }
+    /// Only full gamepads count: `snapshot()` reads the extended profile.
+    private func best(_ controllers: [GCController]) -> GCController? {
+        Self.fallback(controllers.filter { $0.extendedGamepad != nil }, kind: kind)
+    }
+
+    func adopt(_ controller: GCController?) {
+        guard let controller, controller.extendedGamepad != nil else { return }
         lock.lock()
-        let replace = Self.prefers(current: current.map(Kind.init), new: Kind(controller))
+        let replace = Self.prefers(current: current.map(kind), new: kind(controller))
         if replace { current = controller }
         lock.unlock()
         guard replace else { return }
@@ -149,6 +152,16 @@ final class Gamepad {
         controller.handlerQueue = handlerQueue
         controller.extendedGamepad?.valueChangedHandler = { [weak self] _, _ in self?.onChange?() }
         LabLog.write("gamepad connected: \(controller.vendorName ?? "unknown")")
+    }
+
+    /// Falls back to another pad, physical first, when the current one goes.
+    func disconnected(_ controller: GCController, remaining: [GCController]) {
+        lock.lock()
+        let wasCurrent = current === controller
+        if wasCurrent { current = nil }
+        lock.unlock()
+        guard wasCurrent else { return }
+        adopt(best(remaining.filter { $0 !== controller }))
     }
 
     func snapshot() -> Snapshot {

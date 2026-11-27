@@ -1,3 +1,4 @@
+import GameController
 import Testing
 @testable import Playwake
 
@@ -20,51 +21,74 @@ struct GamepadPriorityTests {
     }
 
     @Test func fallbackPrefersAPhysicalPad() {
+        let kind: (String) -> Gamepad.Kind = { $0 == "touch" ? .touch : .physical }
         #expect(Gamepad.fallback(["touch", "pad"], kind: kind) == "pad")
         #expect(Gamepad.fallback(["touch"], kind: kind) == "touch")
         #expect(Gamepad.fallback([String](), kind: kind) == nil)
     }
+}
 
-    /// Always mode: the physical pad is in use when the on-screen one connects.
-    @Test func alwaysModeKeepsThePhysicalPad() {
-        var current = adopt(nil, "pad")
-        current = adopt(current, "touch")
-        #expect(current == "pad")
+/// Drives a real `Gamepad` with snapshot controllers: `physical` holds A,
+/// `touch` holds B, so the snapshot tells which one is current.
+struct GamepadSelectionTests {
+    let physical = Self.pad(holding: \.buttonA)
+    let touch = Self.pad(holding: \.buttonB)
+    let gamepad: Gamepad
+
+    init() {
+        let touch = touch
+        gamepad = Gamepad(kind: { $0 === touch ? .touch : .physical })
+    }
+
+    /// Always mode: the on-screen pad connects while a physical one is in use.
+    @Test func onScreenPadDoesNotTakeInputFromAPhysicalOne() {
+        gamepad.adopt(physical)
+        gamepad.adopt(touch)
+        #expect(gamepad.snapshot().buttons == Gamepad.Button.south)
     }
 
     /// Auto mode: a physical pad connects while the on-screen one is still
     /// connecting, then the on-screen one is disconnected.
-    @Test func hidingTheOnScreenPadDuringAPhysicalConnectKeepsThePhysicalPad() {
-        var current = adopt(nil, "pad")
-        current = adopt(current, "touch")
-        current = disconnect(current, "touch", remaining: ["pad"])
-        #expect(current == "pad")
+    @Test func hidingTheOnScreenPadKeepsThePhysicalOne() {
+        gamepad.adopt(physical)
+        gamepad.adopt(touch)
+        gamepad.disconnected(touch, remaining: [physical])
+        #expect(gamepad.snapshot().buttons == Gamepad.Button.south)
+    }
+
+    @Test func physicalPadTakesOverTheOnScreenOne() {
+        gamepad.adopt(touch)
+        gamepad.adopt(physical)
+        #expect(gamepad.snapshot().buttons == Gamepad.Button.south)
     }
 
     @Test func losingThePhysicalPadFallsBackToTheOnScreenOne() {
-        var current = adopt(nil, "touch")
-        current = adopt(current, "pad")
-        current = disconnect(current, "pad", remaining: ["touch"])
-        #expect(current == "touch")
+        gamepad.adopt(touch)
+        gamepad.adopt(physical)
+        gamepad.disconnected(physical, remaining: [physical, touch])
+        #expect(gamepad.snapshot().buttons == Gamepad.Button.east)
     }
 
-    @Test func overlayButtonsAreMergedIntoTheSnapshot() {
-        let gamepad = Gamepad.shared
-        defer { gamepad.overlayButtons = 0 }
+    @Test func padWithoutTheExtendedProfileIsIgnored() {
+        gamepad.adopt(touch)
+        gamepad.adopt(GCController.withMicroGamepad())
+        #expect(gamepad.snapshot().buttons == Gamepad.Button.east)
+    }
+
+    @Test func overlayButtonsAreMergedWithThePad() {
+        gamepad.adopt(physical)
         gamepad.overlayButtons = Gamepad.Button.view | Gamepad.Button.menu
-        let buttons = gamepad.snapshot().buttons
-        #expect(buttons & Gamepad.Button.view != 0)
-        #expect(buttons & Gamepad.Button.menu != 0)
+        #expect(gamepad.snapshot().buttons == Gamepad.Button.south | Gamepad.Button.view | Gamepad.Button.menu)
     }
 
-    // The same steps as `Gamepad.adopt` and its disconnect observer.
-    private func kind(_ name: String) -> Gamepad.Kind { name == "touch" ? .touch : .physical }
-
-    private func adopt(_ current: String?, _ new: String) -> String? {
-        Gamepad.prefers(current: current.map(kind), new: kind(new)) ? new : current
+    @Test func overlayButtonsWorkWithoutAPad() {
+        gamepad.overlayButtons = Gamepad.Button.menu
+        #expect(gamepad.snapshot().buttons == Gamepad.Button.menu)
     }
 
-    private func disconnect(_ current: String?, _ gone: String, remaining: [String]) -> String? {
-        current == gone ? Gamepad.fallback(remaining, kind: kind) : current
+    private static func pad(holding button: KeyPath<GCExtendedGamepad, GCControllerButtonInput>) -> GCController {
+        let controller = GCController.withExtendedGamepad()
+        controller.extendedGamepad?[keyPath: button].setValue(1)
+        return controller
     }
 }

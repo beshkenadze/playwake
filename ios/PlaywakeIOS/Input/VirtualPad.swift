@@ -11,8 +11,8 @@ final class VirtualPad: ObservableObject {
 
         static let key = "virtualPad"
 
-        static var stored: Mode {
-            UserDefaults.standard.string(forKey: key).flatMap(Mode.init(rawValue:)) ?? .auto
+        static func stored(_ defaults: UserDefaults = .standard) -> Mode {
+            defaults.string(forKey: key).flatMap(Mode.init(rawValue:)) ?? .auto
         }
     }
 
@@ -74,7 +74,7 @@ final class VirtualPad: ObservableObject {
     /// connects, so showing again must connect again.
     private func reconcile() {
         guard Self.supported, !connecting else { return }
-        let show = Self.shouldShow(mode: .stored, active: active, physicalPad: physicalPad)
+        let show = Self.shouldShow(mode: .stored(), active: active, physicalPad: physicalPad)
         if show && !connected {
             connecting = true
             pad.connect { error in
@@ -108,8 +108,10 @@ struct VirtualPadButtons: View {
                 PadButton(symbol: "rectangle.on.rectangle", label: "View", bit: Gamepad.Button.view)
                 PadButton(symbol: "line.3.horizontal", label: "Menu", bit: Gamepad.Button.menu)
             }
-            .padding(.bottom, 24)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            // The system pad fills the bottom corners, in portrait up to the
+            // middle; the top edge is the statistics line.
+            .padding(.top, 56)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
     }
 }
@@ -118,7 +120,8 @@ private struct PadButton: View {
     let symbol: String
     let label: String
     let bit: UInt16
-    @State private var pressed = false
+    /// Resets on release and also when the system cancels the touch.
+    @GestureState private var pressed = false
 
     var body: some View {
         Image(systemName: symbol)
@@ -127,17 +130,14 @@ private struct PadButton: View {
             .frame(width: 44, height: 44)
             .background(Circle().fill(Color.white.opacity(pressed ? 1 : 0.75)))
             .contentShape(Circle())
-            .gesture(DragGesture(minimumDistance: 0)
-                .onChanged { _ in set(true) }
-                .onEnded { _ in set(false) })
+            .gesture(DragGesture(minimumDistance: 0).updating($pressed) { _, state, _ in state = true })
+            .onChange(of: pressed) { _, down in set(down) }
             .onDisappear { set(false) }
             .accessibilityLabel(label)
             .accessibilityAddTraits(.isButton)
     }
 
     private func set(_ down: Bool) {
-        guard pressed != down else { return }
-        pressed = down
         let gamepad = Gamepad.shared
         gamepad.overlayButtons = down ? gamepad.overlayButtons | bit : gamepad.overlayButtons & ~bit
     }
