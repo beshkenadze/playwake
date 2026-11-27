@@ -77,6 +77,7 @@ final class SessionController: ObservableObject {
     private var autoStarted = false
     private var rtc: XboxRTC?
     private var pcPlayer: PcPlayer?
+    private var autoAdded = false
     private var streamStart: DispatchTime?
     private var accountActive = false
     private var lastTarget: StreamTarget?
@@ -113,6 +114,15 @@ final class SessionController: ObservableObject {
     func refreshPcs() {
         pcLoading = true
         core.pcCatalog()
+    }
+
+    /// Adds a PC by its address, for one the network search does not find.
+    func addPc(address: String) {
+        let address = address.trimmingCharacters(in: .whitespaces)
+        guard !address.isEmpty else { return }
+        pcLoading = true
+        status = "Looking for Sunshine at \(address)…"
+        core.addPc(address: address)
     }
 
     /// Pairs with an unpaired PC; `pairing` shows the PIN meanwhile.
@@ -408,9 +418,14 @@ final class SessionController: ObservableObject {
         func value(_ flag: String) -> String? {
             arguments.firstIndex(of: flag).flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil }
         }
-        if let address = value("-pcPair"), pairing == nil,
-           let computer = pcs.first(where: { $0.address == address && $0.state == .unpaired }) {
-            pair(computer)
+        if let address = value("-pcPair"), pairing == nil {
+            if let computer = pcs.first(where: { $0.address == address && $0.state == .unpaired }) {
+                pair(computer)
+            } else if !pcs.contains(where: { $0.address == address }), !autoAdded {
+                // The network search can miss it: add it by its address.
+                autoAdded = true
+                addPc(address: address)
+            }
         }
         if let name = value("-pcPlay"), !autoStarted, !streaming,
            let game = pcGames.first(where: { $0.name.localizedCaseInsensitiveContains(name) }) {

@@ -57,7 +57,22 @@ fn catalog_json(catalog: &pc::Catalog) -> Value {
 /// covers arrive.
 #[unsafe(no_mangle)]
 pub extern "C" fn pw_pc_catalog(callback: Emit) {
-    std::thread::spawn(move || match pc::catalog() {
+    std::thread::spawn(move || refresh(callback));
+}
+
+/// Remembers a PC the network search does not find, once Sunshine answers
+/// at `address`; then emits `pcs` as `pw_pc_catalog` does.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pw_pc_add(callback: Emit, address: *const c_char) {
+    let address = unsafe { read_string(address) }.unwrap_or_default();
+    std::thread::spawn(move || match pc::add(address.trim()) {
+        Ok(()) => refresh(callback),
+        Err(error) => emit_error(callback, error),
+    });
+}
+
+fn refresh(callback: Emit) {
+    match pc::catalog() {
         Ok(catalog) => {
             emit_event(callback, catalog_json(&catalog));
             let games = catalog.games.clone();
@@ -67,7 +82,7 @@ pub extern "C" fn pw_pc_catalog(callback: Emit) {
             });
         }
         Err(error) => emit_error(callback, error),
-    });
+    }
 }
 
 /// Pairs with the unpaired PC at `address`: emits `pcPin` with the PIN to

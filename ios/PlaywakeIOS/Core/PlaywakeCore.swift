@@ -155,6 +155,7 @@ final class PlaywakeCore {
 
     func pcCatalog() { pw_pc_catalog(trampoline) }
     func pairPc(address: String) { pw_pc_pair(trampoline, address) }
+    func addPc(address: String) { pw_pc_add(trampoline, address) }
 
     func streamPc(game id: String, width: UInt32, height: UInt32, fps: UInt32, bitrateKbps: UInt32,
                   video: pw_pc_video, audio: pw_pc_audio) {

@@ -462,7 +462,7 @@ fn saving() -> MutexGuard<'static, ()> {
 /// with Sunshine answers there.
 pub fn add(address: &str) -> Result<()> {
     let identity = identity(&mut load())?;
-    Host::new(address).info(&identity).map_err(|_| format!("No PC with Sunshine answered at {address}"))?;
+    Host::new(address).info(&identity).map_err(|error| format!("No PC with Sunshine answered at {address}: {error}"))?;
     let _saving = saving();
     let mut saved = load();
     saved.add_address(address);

@@ -214,6 +214,8 @@ struct CloudView: View {
 struct PcView: View {
     @ObservedObject var controller: SessionController
     @State private var query = ""
+    @State private var adding = false
+    @State private var address = ""
 
     var body: some View {
         let games = searched(controller.pcGames, query)
@@ -257,7 +259,18 @@ struct PcView: View {
         .navigationTitle("PC")
         .searchable(text: $query, prompt: "Search \(controller.pcGames.count) apps")
         .toolbar {
+            Button { adding = true } label: { Image(systemName: "plus") }
+                .help("Add a PC by its address")
             Button { controller.refreshPcs() } label: { Image(systemName: "arrow.clockwise") }
+        }
+        .alert("Add a PC", isPresented: $adding) {
+            TextField("192.168.1.10", text: $address)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Add") { controller.addPc(address: address) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The address of a PC with Sunshine that the search does not find.")
         }
         .alert("Enter the PIN in Sunshine", isPresented: .constant(controller.pairing != nil)) {
         } message: {
