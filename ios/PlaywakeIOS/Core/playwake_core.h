@@ -121,6 +121,60 @@ void pw_pc_gamepad(const pw_pad *pad);
 /// thread: after it returns no frame or sound of it arrives. `pcEnded` follows.
 void pw_pc_stop(void);
 
+/* Keyboard, mouse and touch for the current stream: a PC gets them as
+ * GameStream input; without one they become a gamepad that the Xbox stream
+ * mixes in with `pw_input_pad`. Safe from any thread. */
+enum {
+    PW_INPUT_GAME = 0,      /* mouse: relative motion, pointer captured */
+    PW_INPUT_DESKTOP = 1,   /* mouse: absolute position over the video */
+    PW_INPUT_TRACKPAD = 2,  /* touch: trackpad gestures */
+    PW_INPUT_DIRECT = 3,    /* touch: the finger touches the video */
+};
+enum {
+    PW_INPUT_BUTTON_LEFT = 0,
+    PW_INPUT_BUTTON_RIGHT = 1,
+    PW_INPUT_BUTTON_MIDDLE = 2,
+    PW_INPUT_BUTTON_X1 = 3,
+    PW_INPUT_BUTTON_X2 = 4,
+};
+enum {
+    PW_INPUT_PHASE_BEGAN = 0,
+    PW_INPUT_PHASE_MOVED = 1,
+    PW_INPUT_PHASE_ENDED = 2,
+    PW_INPUT_PHASE_CANCELLED = 3,
+};
+enum {
+    PW_INPUT_SHOW_KEYBOARD = 1 << 0,
+};
+/// Sets the mouse mode (GAME, DESKTOP) or the touch mode (TRACKPAD, DIRECT);
+/// a change lets go of everything held.
+void pw_input_mode(uint32_t mode);
+/// A key by HID usage; only the keyboard page 0x07 is taken.
+void pw_input_key(uint16_t usage_page, uint16_t usage, bool down);
+/// Types UTF-8 text on a PC.
+void pw_input_text(const char *text);
+/// Relative motion in host pixels, `dy` positive down; a PC in DESKTOP mode ignores it.
+void pw_input_mouse_move(float dx, float dy);
+/// The pointer over the video, 0…1 from its top left; only a PC in DESKTOP mode takes it.
+void pw_input_mouse_position(float x, float y);
+void pw_input_mouse_button(uint32_t button, bool down);
+/// Wheel notches, fractions allowed: `dy` positive scrolls up, `dx` right.
+void pw_input_scroll(float dx, float dy);
+/// The touch surface in points, for trackpad distances.
+void pw_input_surface(float width, float height);
+/// One touch (`phase` a PW_INPUT_PHASE_*, `now_ms` monotonic). TRACKPAD: `x`, `y`
+/// 0…1 over the surface, the core reads gestures. DIRECT: 0…1 over the video; a
+/// PC without touch gets the left button there. ENDED carries the last point.
+/// Returns PW_INPUT_SHOW_KEYBOARD when three fingers ask for the keyboard.
+uint32_t pw_input_touch(uint32_t id, uint32_t phase, float x, float y, float pressure, double now_ms);
+/// Lets go of every key and button: on focus loss or when the stream menu opens.
+void pw_input_release_all(void);
+/// Whether the PC stream takes touches; false without one.
+bool pw_input_host_supports_touch(void);
+/// Mixes the keyboard and mouse, as a gamepad, into `pad`; call it each Xbox
+/// input tick before `pw_route_input`.
+void pw_input_pad(pw_pad *pad, double now_ms);
+
 #ifdef __cplusplus
 }
 #endif

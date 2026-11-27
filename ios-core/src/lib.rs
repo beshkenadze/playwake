@@ -7,9 +7,11 @@
 use playwake_core::{cloud, handshake, library, route, sdp, session_store, wire, xbox};
 
 mod bridge;
+mod input_bridge;
 mod input_route;
 mod pc_bridge;
 
 pub use bridge::*;
+pub use input_bridge::*;
 pub use input_route::*;
 pub use pc_bridge::*;

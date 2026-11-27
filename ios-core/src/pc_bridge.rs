@@ -211,13 +211,18 @@ fn play(callback: Emit, session: u64, codec: gamestream::Codec, events: std::syn
     Ok(())
 }
 
+/// The connected PC stream, if any, with its session.
+pub(crate) fn stream() -> Option<(u64, Arc<gamestream::Stream>)> {
+    let slot = lock(&SLOT);
+    slot.stream.clone().map(|stream| (slot.session, stream))
+}
+
 /// Sends a routed pad state (see `pw_route_input`) to the PC stream.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pw_pc_gamepad(pad: *const PwPad) {
     let Some(pad) = (unsafe { pad.as_ref() }) else { return };
     let routed = Routed { axes: pad.axes, buttons: pad.buttons, lt: pad.lt, rt: pad.rt };
-    let stream = lock(&SLOT).stream.clone();
-    if let Some(stream) = stream { stream.gamepad(&pc::gamepad(&routed)); }
+    if let Some((_, stream)) = stream() { stream.gamepad(&pc::gamepad(&routed)); }
 }
 
 /// Ends the PC stream, also one still launching, and waits up to 3 s for its
