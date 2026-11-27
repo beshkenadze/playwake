@@ -11,8 +11,9 @@ use playwake_core::gamestream;
 use playwake_core::input::{
     Gesture, InputEvent, MouseButton, PadFromKeys, PadLayout, PcInput, Phase, Sink, Touch, Trackpad, Usage,
 };
+use std::collections::BTreeMap;
 use std::os::raw::c_char;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Mouse: relative motion, for a captured pointer.
 pub const PW_INPUT_GAME: u32 = 0;
@@ -53,6 +54,8 @@ struct Input {
     trackpad: Trackpad,
     /// Direct touch on a host without touch: the finger holding the left button.
     finger: Option<u32>,
+    /// Direct touches the host has down, with their last point.
+    touches: BTreeMap<u32, (f32, f32)>,
 }
 
 impl Default for Input {
@@ -65,6 +68,7 @@ impl Default for Input {
             pad: PadFromKeys::new(PadLayout::default()),
             trackpad: Trackpad::new(0.0, 0.0),
             finger: None,
+            touches: BTreeMap::new(),
         }
     }
 }
@@ -80,6 +84,7 @@ impl Input {
             self.pad.release_all();
             self.trackpad.reset();
             self.finger = None;
+            self.touches.clear();
         }
         pc.map(|(_, sink)| sink)
     }
@@ -125,6 +130,7 @@ impl Input {
     }
 
     fn surface<S: Sink>(&mut self, pc: Pc<S>, width: f32, height: f32) {
+        self.sync(pc);
         let gestures = self.trackpad.reset();
         self.gestures(pc, gestures);
         self.trackpad = Trackpad::new(width, height);
@@ -132,12 +138,18 @@ impl Input {
 
     fn touch<S: Sink>(&mut self, pc: Pc<S>, touch: Touch, now: f64) -> u32 {
         let Touch { id, phase, x, y, pressure } = touch;
+        // First, so a new stream's reset cannot cut a gesture short.
+        let sink = self.sync(pc);
         if !self.direct {
             let gestures = self.trackpad.touch(id, phase, x, y, now);
             return self.gestures(pc, gestures);
         }
-        match self.sync(pc) {
+        match sink {
             Some(sink) if sink.host_supports_touch() => {
+                match phase {
+                    Phase::Began | Phase::Moved => { self.touches.insert(id, (x, y)); }
+                    Phase::Ended | Phase::Cancelled => { self.touches.remove(&id); }
+                }
                 self.pc.send(sink, InputEvent::Touch { id, phase, x, y, pressure });
             }
             Some(sink) => self.touch_mouse(sink, id, phase, x, y),
@@ -181,7 +193,12 @@ impl Input {
         self.trackpad.reset();
         self.finger = None;
         match self.sync(pc) {
-            Some(sink) => self.pc.release_all(sink),
+            Some(sink) => {
+                for (id, (x, y)) in std::mem::take(&mut self.touches) {
+                    self.pc.send(sink, InputEvent::Touch { id, phase: Phase::Cancelled, x, y, pressure: 0.0 });
+                }
+                self.pc.release_all(sink);
+            }
             None => self.pad.release_all(),
         }
     }
@@ -203,8 +220,16 @@ static INPUT: LazyLock<Mutex<Input>> = LazyLock::new(Mutex::default);
 
 /// Runs `f` on the input state and the current PC stream.
 fn with<R>(f: impl FnOnce(&mut Input, Pc<gamestream::Stream>) -> R) -> R {
-    let stream = pc_bridge::stream();
-    let mut input = lock(&INPUT);
+    locked(&INPUT, pc_bridge::stream, f)
+}
+
+/// The stream is looked up under the input lock: a call that saw no stream
+/// cannot take the lock after one that already sent to a new stream.
+fn locked<R, S: Sink>(input: &Mutex<Input>, stream: impl FnOnce() -> Option<(u64, Arc<S>)>,
+    f: impl FnOnce(&mut Input, Pc<S>) -> R) -> R
+{
+    let mut input = input.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stream = stream();
     f(&mut input, stream.as_ref().map(|(session, stream)| (*session, &**stream)))
 }
 
@@ -520,6 +545,45 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_that_opens_a_new_stream_still_lets_go() {
+        let (host, mut input) = (Host::default(), Input::default());
+        input.surface(XBOX, 1000.0, 1000.0);
+        let pc = Some((1, &host));
+        input.touch(pc, touch(1, Phase::Began, 0.5, 0.5), 0.0);
+        input.touch(pc, touch(1, Phase::Moved, 0.6, 0.5), 600.0);
+        input.touch(pc, touch(1, Phase::Ended, 0.6, 0.5), 700.0);
+        let calls = host.take();
+        assert_eq!(calls.first(), Some(&Call::Button(MouseButton::Left, true)));
+        assert_eq!(calls.last(), Some(&Call::Button(MouseButton::Left, false)));
+    }
+
+    #[test]
+    fn leaving_direct_touch_cancels_the_touches_the_host_has_down() {
+        let (host, mut input) = (Host::default(), Input::default());
+        host.touch.set(true);
+        let pc = Some((1, &host));
+        input.mode(pc, PW_INPUT_DIRECT);
+        input.touch(pc, touch(7, Phase::Began, 0.2, 0.3), 0.0);
+        input.touch(pc, touch(8, Phase::Began, 0.4, 0.3), 0.0);
+        input.touch(pc, touch(8, Phase::Ended, 0.4, 0.3), 0.0);
+        host.take();
+        input.mode(pc, PW_INPUT_TRACKPAD);
+        assert_eq!(host.take(), [Call::Touch(7, Phase::Cancelled)]);
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn the_stream_is_looked_up_under_the_input_lock() {
+        let input = Mutex::new(Input::default());
+        let host = Arc::new(Host::default());
+        let sent = locked(&input, || {
+            assert!(input.try_lock().is_err(), "the stream was looked up before the lock");
+            Some((1, host.clone()))
+        }, |_, pc| pc.is_some());
+        assert!(sent);
+    }
+
+    #[test]
     fn text_and_scroll_reach_the_pc() {
         let (host, mut input) = (Host::default(), Input::default());
         let pc = Some((1, &host));
@@ -532,12 +596,16 @@ mod tests {
     /// drive the Xbox pad.
     #[test]
     fn c_calls_without_a_pc_drive_the_pad_and_ignore_bad_arguments() {
-        pw_input_key(KEYBOARD_PAGE, W, true);
-        pw_input_mouse_button(PW_INPUT_BUTTON_RIGHT, true);
-        pw_input_mouse_button(99, true);
+        for button in [5, 99, u32::MAX] { pw_input_mouse_button(button, true); }
+        pw_input_key(0x0C, W, true);
         assert_eq!(pw_input_touch(1, 99, 0.0, 0.0, 0.0, 0.0), 0);
         unsafe { pw_input_text(std::ptr::null()) };
         unsafe { pw_input_pad(std::ptr::null_mut(), 0.0) };
+        let mut neutral = pad();
+        unsafe { pw_input_pad(&mut neutral, 0.0) };
+        assert_eq!((neutral.axes, neutral.buttons, neutral.lt, neutral.rt), ([0; 4], 0, 0, 0));
+        pw_input_key(KEYBOARD_PAGE, W, true);
+        pw_input_mouse_button(PW_INPUT_BUTTON_RIGHT, true);
         let mut sample = pad();
         unsafe { pw_input_pad(&mut sample, 0.0) };
         assert_eq!(sample.axes[1], -i16::MAX);
