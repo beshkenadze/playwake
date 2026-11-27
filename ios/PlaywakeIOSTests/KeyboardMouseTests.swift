@@ -54,6 +54,7 @@ struct KeyboardMouseTests {
         #expect(KeyboardMouse.pointerEvents(at: place, pressed: false, held: true) == [.position(place), .left(false)])
         // Off the video or with no view left, the release still goes.
         #expect(KeyboardMouse.pointerEvents(at: nil, pressed: false, held: true) == [.left(false)])
+        #expect(KeyboardMouse.pointerEvents(at: nil, pressed: true, held: false) == [])
     }
 
     @Test func aClosingGateWaitsForTheSendInProgress() {
@@ -131,14 +132,18 @@ struct KeyboardMouseDisconnectTests {
     @Test func theReleaseComesAfterTheDevicesQueuedEvents() async throws {
         let keyboardMouse = KeyboardMouse.shared
         let queued = DispatchSemaphore(value: 0)
+        let pressed = OrderLog()
         let w = w
         keyboardMouse.queue.async {
             queued.wait()
             pw_input_key(KeyboardMouse.keyboardPage, w, true)
+            pressed.append("W")
         }
         NotificationCenter.default.post(name: .GCKeyboardDidDisconnect, object: nil)
         queued.signal()
         try await Task.sleep(for: .milliseconds(100))
+        keyboardMouse.queue.sync {}
+        #expect(pressed.entries == ["W"])
         #expect(stickY(at: 2) == 0)
     }
 }

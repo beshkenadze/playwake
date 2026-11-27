@@ -103,7 +103,7 @@ final class KeyboardMouse: ObservableObject {
     func pointer(at point: CGPoint?, in size: CGSize, pressed: Bool? = nil) {
         let place = point.flatMap { Self.videoPosition(of: $0, in: size, aspect: Self.videoAspect) }
         let events = Self.pointerEvents(at: place, pressed: pressed, held: leftHeld)
-        leftHeld = pressed ?? leftHeld
+        if case .left(let down) = events.last { leftHeld = down }
         gate.send {
             for event in events {
                 switch event {
@@ -128,7 +128,8 @@ final class KeyboardMouse: ObservableObject {
     /// separate button event could overtake the position.
     nonisolated static func pointerEvents(at place: CGPoint?, pressed: Bool?, held: Bool) -> [PointerEvent] {
         var events = place.map { [PointerEvent.position($0)] } ?? []
-        if let pressed, pressed != held { events.append(.left(pressed)) }
+        // A press needs a place to land; a release goes regardless.
+        if let pressed, pressed != held, place != nil || !pressed { events.append(.left(pressed)) }
         return events
     }
 
