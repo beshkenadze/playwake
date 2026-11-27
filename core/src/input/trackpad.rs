@@ -29,7 +29,9 @@ pub enum Gesture {
 enum State {
     Idle,
     One { id: u32, since: f64, start: Point, reported: Point, moved: bool, dragging: bool },
-    Two { start: Point, reported: Point, scrolled: bool },
+    /// `origins`: where each finger was when the second came down. Any of
+    /// them wandering off spoils the tap; the centroid scrolls.
+    Two { origins: Vec<(u32, Point)>, start: Point, reported: Point, scrolled: bool, wandered: bool },
     /// The gesture is over; the fingers left on the screen do nothing.
     Spent,
 }
@@ -56,10 +58,16 @@ impl Trackpad {
         match phase {
             Phase::Began => self.began(id, at, now, &mut out),
             Phase::Moved => self.moved(id, at, now, &mut out),
-            Phase::Ended => self.ended(id, &mut out),
+            Phase::Ended => {
+                self.moved(id, at, now, &mut out);
+                self.ended(id, &mut out);
+            }
             Phase::Cancelled => {
                 if self.fingers.iter().any(|finger| finger.0 == id) {
-                    self.release(&mut out);
+                    // An extra finger on a drag leaves the drag alone.
+                    if !matches!(self.state, State::One { id: primary, .. } if primary != id) {
+                        self.release(&mut out);
+                    }
                     self.lift(id);
                 }
             }
@@ -86,7 +94,9 @@ impl Trackpad {
             }
             (State::One { dragging: false, .. }, 2) => {
                 let start = self.centroid();
-                self.state = State::Two { start, reported: start, scrolled: false };
+                self.state = State::Two {
+                    origins: self.fingers.clone(), start, reported: start, scrolled: false, wandered: false,
+                };
             }
             (State::Two { .. }, 3) => {
                 out.push(Gesture::Keyboard);
@@ -98,6 +108,7 @@ impl Trackpad {
 
     fn moved(&mut self, id: u32, at: Point, now: f64, out: &mut Vec<Gesture>) {
         let Some(finger) = self.fingers.iter_mut().find(|finger| finger.0 == id) else { return };
+        if finger.1 == at { return; }
         finger.1 = at;
         let centroid = self.centroid();
         match &mut self.state {
@@ -116,7 +127,8 @@ impl Trackpad {
                     out.push(Gesture::Input(InputEvent::MouseMove { dx, dy }));
                 }
             }
-            State::Two { start, reported, scrolled } => {
+            State::Two { origins, start, reported, scrolled, wandered } => {
+                if origins.iter().any(|origin| origin.0 == id && distance(origin.1, at) > SLOP) { *wandered = true; }
                 if !*scrolled && distance(centroid, *start) > SLOP { *scrolled = true; }
                 if *scrolled {
                     let (dx, dy) = (centroid.0 - reported.0, centroid.1 - reported.1);
@@ -143,8 +155,8 @@ impl Trackpad {
                 }
                 self.state = State::Spent;
             }
-            State::Two { scrolled, .. } => {
-                if !scrolled {
+            State::Two { wandered, .. } => {
+                if !wandered {
                     out.extend([button(MouseButton::Right, true), button(MouseButton::Right, false)]);
                 }
                 self.state = State::Spent;
@@ -308,6 +320,38 @@ mod tests {
         }
         touch(&mut pad, 5, Phase::Began, 500.0, 250.0, 40.0);
         assert_eq!(touch(&mut pad, 5, Phase::Ended, 500.0, 250.0, 50.0), click(MouseButton::Left));
+    }
+
+    #[test]
+    fn the_lift_point_counts_as_a_move() {
+        let mut pad = pad();
+        touch(&mut pad, 1, Phase::Began, 500.0, 250.0, 0.0);
+        assert_eq!(touch(&mut pad, 1, Phase::Ended, 530.0, 250.0, 100.0), vec![moved(30.0, 0.0)], "no click");
+        touch(&mut pad, 1, Phase::Began, 500.0, 250.0, 200.0);
+        touch(&mut pad, 1, Phase::Moved, 510.0, 250.0, 800.0);
+        assert_eq!(touch(&mut pad, 1, Phase::Ended, 520.0, 250.0, 900.0),
+            vec![moved(10.0, 0.0), button(MouseButton::Left, false)], "a drag keeps its last stretch");
+    }
+
+    #[test]
+    fn a_pinch_does_not_click_right() {
+        let mut pad = pad();
+        touch(&mut pad, 1, Phase::Began, 400.0, 250.0, 0.0);
+        touch(&mut pad, 2, Phase::Began, 600.0, 250.0, 10.0);
+        assert_eq!(touch(&mut pad, 1, Phase::Moved, 382.0, 250.0, 20.0), vec![]);
+        assert_eq!(touch(&mut pad, 2, Phase::Moved, 618.0, 250.0, 30.0), vec![], "the centroid stays put");
+        assert_eq!(touch(&mut pad, 1, Phase::Ended, 382.0, 250.0, 40.0), vec![]);
+    }
+
+    #[test]
+    fn cancelling_an_extra_finger_keeps_the_drag() {
+        let mut pad = pad();
+        touch(&mut pad, 1, Phase::Began, 500.0, 250.0, 0.0);
+        touch(&mut pad, 1, Phase::Moved, 510.0, 250.0, 600.0);
+        touch(&mut pad, 2, Phase::Began, 700.0, 250.0, 650.0);
+        assert_eq!(touch(&mut pad, 2, Phase::Cancelled, 700.0, 250.0, 660.0), vec![]);
+        assert_eq!(touch(&mut pad, 1, Phase::Moved, 520.0, 250.0, 670.0), vec![moved(10.0, 0.0)]);
+        assert_eq!(touch(&mut pad, 1, Phase::Ended, 520.0, 250.0, 680.0), vec![button(MouseButton::Left, false)]);
     }
 
     #[test]
