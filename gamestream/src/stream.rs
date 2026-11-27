@@ -496,19 +496,16 @@ mod tests {
 
     #[test]
     fn holds_mouse_moves_while_the_link_is_busy_and_sends_them_before_a_click() {
-        let expected = IN_FLIGHT + 3;
         let (received, packets) = mpsc::channel();
         let (address, host) = crate::enet::tests::host(move |host, _| {
-            host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            host.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
             let mut datagram = [0u8; 2048];
-            let mut count = 0;
             // Nothing is acknowledged, so the link stays busy. A reliable send
-            // is the datagram header, command, channel, sequence and length, then the data.
-            while count < expected {
-                let (length, _) = host.recv_from(&mut datagram).unwrap();
+            // is the datagram header, command, channel, sequence and length,
+            // then the data. Reads until the client has been quiet a while.
+            while let Ok((length, _)) = host.recv_from(&mut datagram) {
                 if length > 10 && datagram[4] & 0x0f == 6 && [CHANNEL_MOUSE, CHANNEL_TOUCH].contains(&datagram[5]) {
                     received.send((datagram[5], opened(&datagram[10..length]))).unwrap();
-                    count += 1;
                 }
             }
         });
