@@ -91,6 +91,15 @@ struct TouchInputTests {
         #expect(abs(portrait.width - 402) < 0.001 && abs(portrait.height - 402 * 9 / 16) < 0.001)
     }
 
+    @Test func theSurfaceTakesFingersAndLeavesTheMouseToTheViewsBelow() {
+        #expect(TouchSurfaceView.takes(.touches, buttons: []))
+        // A mouse click over the video in desktop mode: `PointerArea` sends it.
+        #expect(!TouchSurfaceView.takes(.touches, buttons: .primary))
+        #expect(!TouchSurfaceView.takes(.touches, buttons: .secondary))
+        #expect(!TouchSurfaceView.takes(.hover, buttons: []))
+        #expect(!TouchSurfaceView.takes(.scroll, buttons: []))
+    }
+
     @Test func phasesAreTheCoreOnes() {
         #expect(TouchPhase.began.core == UInt32(PW_INPUT_PHASE_BEGAN))
         #expect(TouchPhase.moved.core == UInt32(PW_INPUT_PHASE_MOVED))

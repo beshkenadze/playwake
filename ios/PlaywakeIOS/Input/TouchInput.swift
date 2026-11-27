@@ -197,6 +197,17 @@ final class TouchSurfaceView: UIView {
         TouchInput.shared.layout(bounds.size)
     }
 
+    /// Fingers only: the mouse's hover, clicks and scrolls go on to the
+    /// views below (`PointerArea`) and to `KeyboardMouse`.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if let event, !Self.takes(event.type, buttons: event.buttonMask) { return nil }
+        return super.hitTest(point, with: event)
+    }
+
+    nonisolated static func takes(_ type: UIEvent.EventType, buttons: UIEvent.ButtonMask) -> Bool {
+        type == .touches && buttons.isEmpty
+    }
+
     /// The video, for VoiceOver and UI tests, not the bars beside it.
     override var accessibilityFrame: CGRect {
         get {

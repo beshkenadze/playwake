@@ -13,11 +13,12 @@ struct StreamView: View {
             Color.black.ignoresSafeArea()
             LowLatencyVideoView(renderer: controller.renderer)
                 .ignoresSafeArea()
-            if touchActive {
-                TouchSurface().ignoresSafeArea()
-            }
             if padActive && keyboardMouse.mouseConnected && keyboardMouse.mode == .desktop {
                 PointerArea().ignoresSafeArea()
+            }
+            // Over the pointer area, which it leaves the mouse to.
+            if touchActive {
+                TouchSurface().ignoresSafeArea()
             }
             if !controller.firstFrame {
                 ConnectingView(title: controller.streamTitle, status: controller.status) { controller.stop() }

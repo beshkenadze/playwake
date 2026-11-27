@@ -96,7 +96,8 @@ final class TouchInputUITests: XCTestCase {
         app.buttons["F4"].tap()
         XCTAssertTrue(waitForJournal(app, toContain: "key 0xE2 down\nkey 0x3D down\nkey 0x3D up\nkey 0xE2 up"), journal(app))
         app.buttons["Ctrl+Alt+Del"].tap()
-        XCTAssertTrue(waitForJournal(app, toContain: "key 0xE0 down\nkey 0xE2 down\nkey 0x4C down"), journal(app))
+        XCTAssertTrue(waitForJournal(app, toContain: "key 0xE0 down\nkey 0xE2 down\nkey 0x4C down\nkey 0x4C up\nkey 0xE2 up\nkey 0xE0 up"),
+                      journal(app))
         app.buttons["Hide keyboard"].tap()
         XCTAssertTrue(escape.waitForNonExistence(timeout: 5), "the keyboard did not hide")
     }
@@ -128,8 +129,10 @@ final class TouchInputUITests: XCTestCase {
         let app = launch(touch: "direct")
         // Portrait: the 16:9 video sits in the middle, bars above and below.
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.15)).tap()
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-        XCTAssertTrue(waitForJournal(app, toContain: "touch began 0.50 0.50"), journal(app))
+        // The surface's frame is the video: a quarter across, three quarters down.
+        app.otherElements["touchSurface"].coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.75)).tap()
+        XCTAssertTrue(waitForJournal(app, toContain: "touch began 0.25 0.75"), journal(app))
+        XCTAssertTrue(waitForJournal(app, toContain: "touch ended 0.25 0.75"), journal(app))
         XCTAssertEqual(journal(app).components(separatedBy: "touch began").count - 1, 1,
                        "a touch on the bars reached the stream: \(journal(app))")
     }

@@ -1,4 +1,5 @@
 import Testing
+import UIKit
 @testable import Playwake
 
 struct SoftKeyboardTests {
@@ -82,6 +83,40 @@ struct SoftKeyboardTests {
         #expect(StickyKeys.usage(of: " ")! == (0x2C, false))
         #expect(StickyKeys.usage(of: "ab") == nil)
         #expect(StickyKeys.usage(of: "ж") == nil)
+    }
+
+    @Test func aLetterWithACombiningAccentIsNotAShortcut() {
+        var keys = StickyKeys()
+        _ = keys.tap(.control)
+        #expect(StickyKeys.usage(of: "e\u{301}") == nil)
+        #expect(keys.type("e\u{301}") == [.text("e\u{301}")])
+    }
+
+    @MainActor
+    @Test func anUpdateQueuedBeforeANewerOneDoesNotUndoIt() async throws {
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        let field = KeyCatcherView()
+        window.addSubview(field)
+        window.makeKeyAndVisible()
+        let keyboard = SoftKeyboard.shared
+        defer {
+            keyboard.setStreamActive(false)
+            field.focus()
+            window.isHidden = true
+        }
+        keyboard.setStreamActive(true)
+        keyboard.show()
+        field.focus()
+        #expect(field.isFirstResponder)
+        // Hidden and shown again before either update runs.
+        keyboard.hide()
+        field.scheduleFocus()
+        keyboard.show()
+        field.scheduleFocus()
+        await withCheckedContinuation { done in DispatchQueue.main.async { done.resume() } }
+        #expect(keyboard.visible)
+        #expect(field.isFirstResponder)
     }
 
     @MainActor

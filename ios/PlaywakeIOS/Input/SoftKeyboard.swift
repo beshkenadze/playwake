@@ -160,7 +160,8 @@ struct StickyKeys: Equatable {
 
     /// The HID usage of a US-layout letter, digit or space, and whether it needs Shift.
     static func usage(of text: String) -> (UInt16, Bool)? {
-        guard text.count == 1, let scalar = text.unicodeScalars.first, scalar.isASCII else { return nil }
+        // One scalar: `e` with a combining accent is one character, but not E.
+        guard text.unicodeScalars.count == 1, let scalar = text.unicodeScalars.first, scalar.isASCII else { return nil }
         let value = UInt16(scalar.value)
         switch scalar {
         case "a"..."z": return (0x04 + value - 0x61, false)
@@ -180,12 +181,7 @@ struct SoftKeyboardField: UIViewRepresentable {
     func makeUIView(context: Context) -> KeyCatcherView { KeyCatcherView() }
 
     func updateUIView(_ view: KeyCatcherView, context: Context) {
-        let visible = keyboard.visible
-        // Not while SwiftUI updates: the view may not be in its window yet.
-        DispatchQueue.main.async {
-            if visible, !view.isFirstResponder { view.becomeFirstResponder() }
-            if !visible, view.isFirstResponder { view.resignFirstResponder() }
-        }
+        view.scheduleFocus()
     }
 }
 
@@ -202,6 +198,24 @@ final class KeyCatcherView: UIView, UIKeyInput {
 
     override var canBecomeFirstResponder: Bool { true }
     override var inputAccessoryView: UIView? { bar }
+
+    /// Later, not while SwiftUI updates the view. The state is read when it
+    /// runs, so an update queued before a newer one cannot undo it.
+    func scheduleFocus() {
+        DispatchQueue.main.async { [weak self] in self?.focus() }
+    }
+
+    /// Holds the keyboard while it is to be shown.
+    func focus() {
+        let visible = SoftKeyboard.shared.visible
+        if visible, !isFirstResponder, window != nil { becomeFirstResponder() }
+        if !visible, isFirstResponder { resignFirstResponder() }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { focus() }
+    }
 
     /// Always, so Backspace reaches the host with nothing typed here.
     var hasText: Bool { true }
