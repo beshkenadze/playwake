@@ -370,10 +370,9 @@ impl Pointer {
         let devices = connection.xinput_xi_query_device(Device::ALL_MASTER).map_err(|e| error(&e))?
             .reply().map_err(|e| error(&e))?.infos;
         let device = master_pointer(&devices).ok_or("XInput2 pointer: no master pointer")?;
-        // Raw motion goes only to the root window, whatever has the grab;
-        // it is read from the pointer the grab takes.
+        // Raw motion goes only to the root window, whatever has the grab.
         connection.xinput_xi_select_events(root, &[EventMask {
-            deviceid: device, mask: vec![XIEventMask::RAW_MOTION],
+            deviceid: Device::ALL_MASTER.into(), mask: vec![XIEventMask::RAW_MOTION],
         }]).map_err(|e| error(&e))?.check().map_err(|e| error(&e))?;
         let (pixmap, gc, blank) = (connection.generate_id().map_err(|e| error(&e))?,
             connection.generate_id().map_err(|e| error(&e))?, connection.generate_id().map_err(|e| error(&e))?);
