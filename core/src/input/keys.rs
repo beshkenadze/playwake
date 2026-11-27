@@ -244,6 +244,36 @@ mod tests {
         assert_eq!(Usage::Evdev(0xFFFF).vk(), None);
     }
 
+    #[test]
+    fn rows_keep_their_order() {
+        let rows: [(u16, &[u8]); 4] = [(16, b"QWERTYUIOP"), (30, b"ASDFGHJKL"), (44, b"ZXCVBNM"), (2, b"1234567890")];
+        for (first, row) in rows {
+            for (code, &vk) in (first..).zip(row) {
+                assert_eq!(Usage::Evdev(code).vk(), Some(vk), "evdev {code}");
+            }
+        }
+        for (usage, &vk) in (0x04..).zip(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890") {
+            assert_eq!(Usage::Hid(usage).vk(), Some(vk), "HID {usage:#x}");
+        }
+        // Keypad 7 8 9 - 4 5 6 + 1 2 3 0 .
+        let keypad = [0x67, 0x68, 0x69, 0x6D, 0x64, 0x65, 0x66, 0x6B, 0x61, 0x62, 0x63, 0x60, 0x6E];
+        for (code, vk) in (71..).zip(keypad) {
+            assert_eq!(Usage::Evdev(code).vk(), Some(vk), "evdev {code}");
+        }
+        // Keypad 1…9 0 .
+        let keypad = [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x60, 0x6E];
+        for (usage, vk) in (0x59..).zip(keypad) {
+            assert_eq!(Usage::Hid(usage).vk(), Some(vk), "HID {usage:#x}");
+        }
+        for (code, vk) in (59..=68).chain([87, 88]).chain(183..=194).zip(0x70..=0x87) {
+            assert_eq!(Usage::Evdev(code).vk(), Some(vk), "evdev F-key {code}");
+        }
+        for (usage, vk) in (0x3A..=0x45).chain(0x68..=0x73).zip(0x70..=0x87) {
+            assert_eq!(Usage::Hid(usage).vk(), Some(vk), "HID F-key {usage:#x}");
+        }
+        assert_eq!(Usage::Hid(0x32).vk(), Some(0xDC), "ISO # sits where \\ is");
+    }
+
     /// Every key lands on a virtual key of its own, but for the keys that
     /// share one on purpose, so a lost or misdirected row shows.
     fn distinct_keys(usage: fn(u16) -> Usage, shared: &[u8]) -> usize {

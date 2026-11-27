@@ -136,8 +136,8 @@ impl PadFromKeys {
             _ => return,
         };
         if down {
-            self.held.insert(source);
-            self.pressed.insert(source);
+            // A key's auto-repeat is no new press.
+            if self.held.insert(source) { self.pressed.insert(source); }
         } else {
             self.held.remove(&source);
         }
@@ -281,8 +281,9 @@ mod tests {
         let mut pad = PadFromKeys::new(PadLayout::default());
         key(&mut pad, ESCAPE, true);
         key(&mut pad, ENTER, true);
-        key(&mut pad, ESCAPE, false);
         assert_eq!(pad.state(0.0).buttons, 4);
+        key(&mut pad, ESCAPE, false);
+        assert_eq!(pad.state(4.0).buttons, 4, "Enter still holds Menu");
         key(&mut pad, ENTER, true);
         assert_eq!(pad.state(8.0).buttons, 4);
         key(&mut pad, ENTER, false);
@@ -343,6 +344,16 @@ mod tests {
         assert_eq!((state.rt, state.buttons), (u16::MAX, 16));
         let state = pad.state(8.0);
         assert_eq!((state.rt, state.buttons), (0, 0));
+    }
+
+    #[test]
+    fn an_auto_repeat_is_no_new_press() {
+        let mut pad = PadFromKeys::new(PadLayout::default());
+        key(&mut pad, W, true);
+        assert_eq!(pad.state(0.0).axes[1], -32767);
+        key(&mut pad, W, true);
+        key(&mut pad, W, false);
+        assert_eq!(pad.state(8.0).axes[1], 0);
     }
 
     #[test]
