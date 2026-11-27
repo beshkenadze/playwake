@@ -219,7 +219,8 @@ final class KeyboardMouse: ObservableObject {
 extension KeyboardMouse {
     /// `-inputScript "move 300 0; click; wait 800; text hi; key 0x29; snap /tmp/a.png"`
     /// drives the stream through the same C calls once it takes input, for
-    /// checks without hardware events. Runs once per launch.
+    /// checks without hardware events. Runs once per launch. Only the first
+    /// `snap` of a launch shows live video; later ones repeat its frame.
     private static var scriptStarted = false
 
     fileprivate func runScript() {
