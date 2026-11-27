@@ -58,9 +58,9 @@ impl Trackpad {
         let mut out = Vec::new();
         match phase {
             Phase::Began => self.began(id, at, now, &mut out),
-            Phase::Moved => self.moved(id, at, now, &mut out),
+            Phase::Moved => self.moved(id, at, now, true, &mut out),
             Phase::Ended => {
-                self.moved(id, at, now, &mut out);
+                self.moved(id, at, now, false, &mut out);
                 self.ended(id, &mut out);
             }
             Phase::Cancelled => {
@@ -107,7 +107,8 @@ impl Trackpad {
         }
     }
 
-    fn moved(&mut self, id: u32, at: Point, now: f64, out: &mut Vec<Gesture>) {
+    /// `may_drag`: false for the lift, which finishes a drag but starts none.
+    fn moved(&mut self, id: u32, at: Point, now: f64, may_drag: bool, out: &mut Vec<Gesture>) {
         let Some(finger) = self.fingers.iter_mut().find(|finger| finger.0 == id) else { return };
         if finger.1 == at { return; }
         finger.1 = at;
@@ -115,7 +116,7 @@ impl Trackpad {
         match &mut self.state {
             State::One { id: primary, since, start, reported, moved, dragging } if *primary == id => {
                 if !*moved && !*dragging {
-                    if now - *since >= HOLD_MS {
+                    if may_drag && now - *since >= HOLD_MS {
                         *dragging = true;
                         out.push(button(MouseButton::Left, true));
                     } else if distance(at, *start) > SLOP {
@@ -156,8 +157,8 @@ impl Trackpad {
                 }
                 self.state = State::Spent;
             }
-            State::Two { wandered, .. } => {
-                if !wandered {
+            State::Two { scrolled, wandered, .. } => {
+                if !scrolled && !wandered {
                     out.extend([button(MouseButton::Right, true), button(MouseButton::Right, false)]);
                 }
                 self.state = State::Spent;
@@ -332,6 +333,26 @@ mod tests {
         touch(&mut pad, 1, Phase::Moved, 510.0, 250.0, 800.0);
         assert_eq!(touch(&mut pad, 1, Phase::Ended, 520.0, 250.0, 900.0),
             vec![moved(10.0, 0.0), button(MouseButton::Left, false)], "a drag keeps its last stretch");
+    }
+
+    #[test]
+    fn a_rested_finger_lifted_inside_the_slop_clicks_without_a_drag() {
+        let mut pad = pad();
+        touch(&mut pad, 1, Phase::Began, 500.0, 250.0, 0.0);
+        assert_eq!(touch(&mut pad, 1, Phase::Ended, 502.0, 250.0, 600.0), click(MouseButton::Left));
+        touch(&mut pad, 1, Phase::Began, 500.0, 250.0, 700.0);
+        assert_eq!(touch(&mut pad, 1, Phase::Ended, 530.0, 250.0, 1300.0), vec![moved(30.0, 0.0)]);
+    }
+
+    #[test]
+    fn a_scroll_never_clicks_right() {
+        // Each finger stays inside the slop, yet rounding carries the centroid past it.
+        let mut pad = pad();
+        touch(&mut pad, 1, Phase::Began, 500.0, 250.0, 0.0);
+        touch(&mut pad, 2, Phase::Began, 510.0 + 6.0 / 32768.0, 250.0, 1.0);
+        touch(&mut pad, 1, Phase::Moved, 510.0, 250.0, 2.0);
+        assert_eq!(touch(&mut pad, 2, Phase::Moved, 520.0 + 6.0 / 32768.0, 250.0, 3.0).len(), 1, "it scrolls");
+        assert_eq!(touch(&mut pad, 1, Phase::Ended, 510.0, 250.0, 4.0), vec![]);
     }
 
     #[test]
