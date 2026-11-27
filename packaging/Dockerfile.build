@@ -1,0 +1,25 @@
+# Local Linux build and test image, the same system and Rust as CI
+# (.github/workflows/linux.yml and .github/actions/setup-linux-rust).
+#
+#   docker build --platform linux/amd64 -t playwake-build -f packaging/Dockerfile.build packaging
+#
+# Use it with cached volumes; give each parallel checkout its own target volume:
+#   docker run --rm --platform linux/amd64 -v "$PWD":/src/<name> \
+#     -v pw-cargo-registry:/root/.cargo/registry -v pw-cargo-git:/root/.cargo/git \
+#     -v pw-target-linux-<name>:/target-linux -e CARGO_TARGET_DIR=/target-linux \
+#     playwake-build bash -c 'cd /src/<name> && cargo test --release --locked --workspace'
+FROM registry.fedoraproject.org/fedora:44@sha256:aca68c361f2a89de8a64e8d91a47494f37fad05f88c2f503cdd8a284a74c70ac
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+      git curl gcc gcc-c++ make pkgconf-pkg-config binutils \
+      fontconfig-devel freetype-devel libxkbcommon-x11-devel libxcb-devel \
+      libX11-devel libXcursor-devel libXi-devel libXrandr-devel \
+      libXinerama-devel libXrender-devel libXfixes-devel libXext-devel \
+      wayland-devel openssl-devel vulkan-headers vulkan-loader-devel alsa-lib-devel \
+      gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-bad-free-devel cairo-devel cairo-gobject-devel \
+    && dnf clean all
+
+ENV CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup PATH=/root/.cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain 1.100.0 \
+    && rustc -V
