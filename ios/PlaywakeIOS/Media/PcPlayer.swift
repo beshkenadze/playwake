@@ -202,7 +202,10 @@ final class PcPlayer {
         let pad = Gamepad.shared.snapshot()
         var wire = pw_pad(axes: (pad.axes[0], pad.axes[1], pad.axes[2], pad.axes[3]),
                           buttons: pad.buttons, lt: pad.lt, rt: pad.rt)
-        let events = pw_route_input(route, &wire, CACurrentMediaTime() * 1000)
+        let now = CACurrentMediaTime() * 1000
+        // The on-screen pad joins here, so the menu pauses it too.
+        pw_input_pad(&wire, now)
+        let events = pw_route_input(route, &wire, now)
         pw_pc_gamepad(&wire)
         report(events)
     }

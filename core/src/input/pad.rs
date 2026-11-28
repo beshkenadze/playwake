@@ -3,7 +3,7 @@
 //! mouse motion pushes the right stick.
 
 use super::{InputEvent, MouseButton};
-use crate::route::Routed;
+use crate::route::{Routed, GUIDE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -17,7 +17,7 @@ pub enum Source {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
     A, B, X, Y,
-    View, Menu,
+    View, Menu, Guide,
     LeftBumper, RightBumper,
     LeftTrigger, RightTrigger,
     LeftThumb, RightThumb,
@@ -28,8 +28,9 @@ pub enum Target {
 
 impl Target {
     /// The button's bit in `Routed::buttons`, or 0 for the triggers and stick.
-    fn bit(self) -> u16 {
+    pub(super) fn bit(self) -> u16 {
         match self {
+            Target::Guide => GUIDE,
             Target::Menu => 4,
             Target::View => 8,
             Target::A => 16,
@@ -154,28 +155,17 @@ impl PadFromKeys {
     /// The pad at `now`, in milliseconds. Call it once each input tick: the
     /// right stick follows the mouse travel since the last call.
     pub fn state(&mut self, now: f64) -> Routed {
-        let mut routed = Routed { axes: [0; 4], buttons: 0, lt: 0, rt: 0 };
-        let (mut up, mut south, mut left, mut right) = (false, false, false, false);
         let pressed = std::mem::take(&mut self.pressed);
         let down = |source| self.held.contains(source) || pressed.contains(source);
-        for binding in self.layout.bindings.iter().filter(|binding| down(&binding.source)) {
-            match binding.target {
-                Target::LeftTrigger => routed.lt = u16::MAX,
-                Target::RightTrigger => routed.rt = u16::MAX,
-                Target::StickUp => up = true,
-                Target::StickDown => south = true,
-                Target::StickLeft => left = true,
-                Target::StickRight => right = true,
-                target => routed.buttons |= target.bit(),
-            }
-        }
-        let walk = (f32::from(right) - f32::from(left), f32::from(south) - f32::from(up));
-        let walk = scaled(walk, length(walk).min(1.0));
+        let targets: Vec<Target> = self.layout.bindings.iter()
+            .filter(|binding| down(&binding.source)).map(|binding| binding.target).collect();
+        let mut routed = press(targets);
         self.look(now);
         let reach = length(self.look);
         let reach = if reach > 0.0 { self.layout.dead_zone + (1.0 - self.layout.dead_zone) * reach } else { 0.0 };
         let look = scaled(self.look, reach);
-        routed.axes = [axis(walk.0), axis(walk.1), axis(look.0), axis(look.1)];
+        routed.axes[2] = axis(look.0);
+        routed.axes[3] = axis(look.1);
         routed
     }
 
@@ -200,18 +190,41 @@ impl PadFromKeys {
     }
 }
 
-fn length(vector: (f32, f32)) -> f32 {
+/// The pad with `targets` held: their buttons, full triggers, and the left
+/// stick pushed all the way toward the held directions.
+pub(super) fn press(targets: impl IntoIterator<Item = Target>) -> Routed {
+    let mut routed = Routed { axes: [0; 4], buttons: 0, lt: 0, rt: 0 };
+    let (mut up, mut south, mut left, mut right) = (false, false, false, false);
+    for target in targets {
+        match target {
+            Target::LeftTrigger => routed.lt = u16::MAX,
+            Target::RightTrigger => routed.rt = u16::MAX,
+            Target::StickUp => up = true,
+            Target::StickDown => south = true,
+            Target::StickLeft => left = true,
+            Target::StickRight => right = true,
+            target => routed.buttons |= target.bit(),
+        }
+    }
+    let walk = (f32::from(right) - f32::from(left), f32::from(south) - f32::from(up));
+    let walk = scaled(walk, length(walk).min(1.0));
+    routed.axes[0] = axis(walk.0);
+    routed.axes[1] = axis(walk.1);
+    routed
+}
+
+pub(super) fn length(vector: (f32, f32)) -> f32 {
     vector.0.hypot(vector.1)
 }
 
 /// `vector` with its length set to `reach`, the zero vector staying zero.
-fn scaled(vector: (f32, f32), reach: f32) -> (f32, f32) {
+pub(super) fn scaled(vector: (f32, f32), reach: f32) -> (f32, f32) {
     let length = length(vector);
     if length <= 0.0 { return (0.0, 0.0); }
     (vector.0 / length * reach, vector.1 / length * reach)
 }
 
-fn axis(value: f32) -> i16 {
+pub(super) fn axis(value: f32) -> i16 {
     (value.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
 }
 

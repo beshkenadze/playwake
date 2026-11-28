@@ -288,6 +288,8 @@ struct SettingsView: View {
     @State private var controllerName = GCController.current?.vendorName
     @State private var confirmSignOut = false
     @AppStorage(VirtualPad.Mode.key) private var virtualPad = VirtualPad.Mode.auto
+    @AppStorage(VirtualPad.Style.key) private var virtualPadStyle = VirtualPad.Style.custom
+    @State private var editingPad = false
 
     private var version: String {
         let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "–"
@@ -341,12 +343,21 @@ struct SettingsView: View {
                         Text("Always").tag(VirtualPad.Mode.always)
                         Text("Never").tag(VirtualPad.Mode.never)
                     }
+                    if virtualPad != .never {
+                        Picker("Style", selection: $virtualPadStyle) {
+                            Text("Playwake").tag(VirtualPad.Style.custom)
+                            Text("System").tag(VirtualPad.Style.system)
+                        }
+                        if virtualPadStyle == .custom {
+                            Button("Edit on-screen controller") { editingPad = true }
+                        }
+                    }
                 }
             } header: {
                 Text("Controls")
             } footer: {
                 if VirtualPad.supported {
-                    Text("Auto shows the on-screen controller during a stream when no controller is connected.")
+                    Text("Auto shows the on-screen controller during a stream when no controller is connected. Playwake's has every Xbox control and can be rearranged; the system one has fewer.")
                 }
             }
             Section("Diagnostics") {
@@ -364,6 +375,7 @@ struct SettingsView: View {
         .scrollContentBackground(.hidden)
         .background(Theme.canvas)
         .navigationTitle("Settings")
+        .fullScreenCover(isPresented: $editingPad) { TouchPadEditor(game: nil) }
         .confirmationDialog("Sign out of Microsoft?", isPresented: $confirmSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { controller.signOut() }
         }

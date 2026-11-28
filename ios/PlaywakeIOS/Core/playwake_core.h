@@ -187,9 +187,47 @@ uint32_t pw_input_touch(uint32_t id, uint32_t phase, float x, float y, float pre
 void pw_input_release_all(void);
 /// Whether the PC stream takes touches; false without one.
 bool pw_input_host_supports_touch(void);
-/// Mixes the keyboard and mouse, as a gamepad, into `pad`; call it each Xbox
-/// input tick before `pw_route_input`.
+/// Mixes the keyboard and mouse, as a gamepad, and the on-screen pad into
+/// `pad`; call it each input tick before `pw_route_input`.
 void pw_input_pad(pw_pad *pad, double now_ms);
+
+/* The on-screen pad over the stream. Its layout is JSON (`Layout` in
+ * core/src/input/overlay.rs); points are over the surface the pad covers.
+ * Its pad state joins in `pw_input_pad`; its keys and mouse buttons go to a
+ * PC from PW_INPUT_SOURCE_PANEL. Safe from any thread. */
+enum {
+    PW_OVERLAY_HAPTIC = 1 << 0,  /* a control was newly pressed */
+};
+typedef struct {
+    bool pressed;
+    float x;  /* a stick's lean or the d-pad's direction, -1…1, y down; a trigger's press 0…1 */
+    float y;
+} pw_look;
+/// Puts `json` in use (the default pad if it is no layout) and returns the layout
+/// in use, values in range; lets go of every finger. Free with pw_free_string.
+char *pw_overlay_set_layout(const char *json);
+/// `json` with values in range (the default pad if it is no layout). Free with pw_free_string.
+char *pw_overlay_normalize(const char *json);
+/// What an element's `size` is a fraction of on a `width` by `height` surface.
+float pw_overlay_unit(float width, float height);
+/// The default pad as JSON. Free with pw_free_string.
+char *pw_overlay_default_layout(void);
+/// The surface in points; a new size lets go of every finger.
+void pw_overlay_surface(float width, float height);
+/// The element at a point of the surface, or -1.
+int32_t pw_overlay_hit(float x, float y);
+/// One finger (`phase` a PW_INPUT_PHASE_*, `pressure` 0…1, 0 without force
+/// sensing). Returns PW_OVERLAY_* bits.
+uint32_t pw_overlay_touch(uint32_t id, uint32_t phase, float x, float y, float pressure);
+/// How the element at `index` looks now.
+void pw_overlay_look(uint32_t index, pw_look *look);
+/// Lets go of every finger, as the pad hides; they stay out until they lift.
+void pw_overlay_release(void);
+/// `json` with element `index` of a `width` by `height` surface's orientation
+/// centred at `x`, `y` (0…1) with diameter `size`, kept on the surface. Free with pw_free_string.
+char *pw_overlay_place(const char *json, float width, float height, uint32_t index, float x, float y, float size);
+/// `json` with the pad's opacity, 0.1…1. Free with pw_free_string.
+char *pw_overlay_opacity(const char *json, float opacity);
 
 #ifdef __cplusplus
 }

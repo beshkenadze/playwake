@@ -6,6 +6,7 @@ import SwiftUI
 struct StreamView: View {
     @ObservedObject var controller: SessionController
     @ObservedObject private var keyboardMouse = KeyboardMouse.shared
+    @ObservedObject private var virtualPad = VirtualPad.shared
     private let touch = TouchInput.shared
 
     var body: some View {
@@ -29,7 +30,8 @@ struct StreamView: View {
                     .allowsHitTesting(false)
             }
             VirtualPadButtons()
-            StreamMenuButton(action: touchActive ? { controller.openMenu() } : nil)
+            TouchPadView()
+            StreamMenuButton(action: tapsTaken ? { controller.openMenu() } : nil)
             SoftKeyboardField().frame(width: 0, height: 0)
             // Shown while connecting too: View+Menu opens the route's menu and
             // pauses the pad, so the menu must be visible whenever it is open.
@@ -45,8 +47,9 @@ struct StreamView: View {
             }
         }
         .contentShape(Rectangle())
-        // When the stream takes touches, a tap on the video clicks and the
-        // menu has its button; a tap gesture here would hold back the fingers' lift.
+        // When the stream or Playwake's pad takes touches, a tap on the video
+        // clicks or presses and the menu has its button; a tap gesture here
+        // would hold back the fingers' lift.
         .gesture(TapGesture().onEnded {
             // Otherwise Cmd+K and View+Menu open the menu.
             guard controller.firstFrame,
@@ -54,9 +57,18 @@ struct StreamView: View {
                                              pointerLocked: keyboardMouse.pointerLocked)
             else { return }
             controller.menuOpen ? controller.closeMenu() : controller.openMenu()
-        }, including: touchActive ? .subviews : .all)
+        }, including: tapsTaken ? .subviews : .all)
         .background { shortcuts }
         .onAppear {
+            #if DEBUG && !targetEnvironment(macCatalyst)
+            // `-uiLandscape`: UI tests turn the stream sideways; the simulator
+            // does not follow `XCUIDevice.orientation` here.
+            if ProcessInfo.processInfo.arguments.contains("-uiLandscape") {
+                let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
+                scene?.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight))
+            }
+            #endif
+            TouchPad.shared.load(game: controller.streamTitle)
             VirtualPad.shared.setActive(padActive)
             keyboardMouse.setStreamActive(padActive)
             touch.setStreamActive(padActive)
@@ -73,12 +85,18 @@ struct StreamView: View {
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        .fullScreenCover(isPresented: $controller.editingPad) {
+            TouchPadEditor(game: controller.streamTitle)
+        }
     }
 
     /// The on-screen pad would cover the menu, which takes taps instead.
     private var padActive: Bool { controller.firstFrame && !controller.menuOpen }
 
     private var touchActive: Bool { padActive && controller.streamTakesTouches }
+
+    /// Taps on the video belong to the stream or to Playwake's pad, not to the menu.
+    private var tapsTaken: Bool { touchActive || virtualPad.customShown }
 
     /// A PC in desktop mode takes the pointer's place over the video.
     private var pointerActive: Bool {
@@ -220,6 +238,9 @@ private struct StreamMenu: View {
                     Text(touch.mode == .trackpad ? "Trackpad" : "Direct").foregroundStyle(Theme.muted)
                 }
                 row(.keyboard, "Keyboard")
+            }
+            if controller.menuItems.contains(.controls) {
+                row(.controls, "On-screen controller")
             }
             row(.reconnect, "Reconnect")
             Spacer(minLength: 12)

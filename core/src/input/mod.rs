@@ -4,6 +4,7 @@
 //! for an Xbox (`PadFromKeys`), and recognises trackpad gestures (`Trackpad`).
 
 mod keys;
+pub mod overlay;
 mod pad;
 mod trackpad;
 
