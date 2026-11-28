@@ -232,7 +232,7 @@ impl Stream {
 
         let ports = rtsp::handshake(address, config)?;
         // The host ends the session unless both media streams ping it soon.
-        let mut video = Media::open(on_port(ports.video), &ports.ping_payload, Duration::ZERO)?;
+        let video = Media::open(on_port(ports.video), &ports.ping_payload, Duration::ZERO)?;
         // The system grants what its limit allows; a smaller buffer still works.
         let _ = socket2::SockRef::from(&video.socket).set_recv_buffer_size(VIDEO_RECEIVE_BUFFER);
         let mut audio = Media::open(on_port(ports.audio), &ports.ping_payload, AUDIO_PING_OFFSET)?;
@@ -300,22 +300,7 @@ impl Stream {
         }));
 
         let (running, sender, link) = (stop.clone(), events.clone(), control.clone());
-        threads.push(thread::spawn(move || {
-            let mut assembler = Assembler::new();
-            let mut buffer = vec![0u8; 2048];
-            // `start` asked for the first key frame.
-            let mut asked_at = Instant::now();
-            while !running.load(Ordering::Relaxed) {
-                let frame = video.receive(&mut buffer).and_then(|datagram| assembler.push(datagram));
-                if let Some(frame) = frame { let _ = sender.send(Event::Video(frame)); }
-                // The answer to a request can be lost as well, so ask again
-                // for as long as the picture needs a key frame.
-                if assembler.needs_key_frame() && asked_at.elapsed() >= KEY_FRAME_REQUEST_GAP {
-                    asked_at = Instant::now();
-                    link.send(CHANNEL_URGENT, control::REQUEST_IDR, &[0, 0]);
-                }
-            }
-        }));
+        threads.push(thread::spawn(move || play_video(video, &link, &sender, &running)));
 
         let running = stop.clone();
         threads.push(thread::spawn(move || {
@@ -403,6 +388,29 @@ impl Stream {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         for thread in self.threads.lock().unwrap().drain(..) { let _ = thread.join(); }
+    }
+}
+
+/// Turns the video datagrams into frames until `running` says stop, and asks
+/// the host for a key frame for as long as the picture needs one. `start`
+/// asked for the first.
+fn play_video(mut video: Media, link: &Control, sender: &mpsc::Sender<Event>, running: &AtomicBool) {
+    let mut assembler = Assembler::new();
+    let mut buffer = vec![0u8; 2048];
+    let mut asked_at = Instant::now();
+    while !running.load(Ordering::Relaxed) {
+        let frame = match video.receive(&mut buffer) {
+            Some(datagram) => assembler.push(datagram),
+            // Nothing for RECEIVE_WAIT: a frame still missing packets is lost.
+            None => { assembler.idle(); None }
+        };
+        if let Some(frame) = frame { let _ = sender.send(Event::Video(frame)); }
+        // The answer to a request can be lost as well, so ask again
+        // for as long as the picture needs a key frame.
+        if assembler.needs_key_frame() && asked_at.elapsed() >= KEY_FRAME_REQUEST_GAP {
+            asked_at = Instant::now();
+            link.send(CHANNEL_URGENT, control::REQUEST_IDR, &[0, 0]);
+        }
     }
 }
 
@@ -536,6 +544,57 @@ mod tests {
         want.push(mouse(&control::mouse_button_packet(MouseButton::Left, true)));
         want.push((CHANNEL_TOUCH, (control::INPUT, touch(2).packet().to_vec())));
         assert_eq!(packets.try_iter().collect::<Vec<_>>(), want);
+    }
+
+    #[test]
+    fn a_frame_cut_off_before_a_still_picture_makes_the_client_ask_for_a_key_frame() {
+        let (asked, requests) = mpsc::channel();
+        let (address, host) = crate::enet::tests::host(move |host, _| {
+            host.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut datagram = [0u8; 2048];
+            let mut seen = Vec::new();
+            // Nothing is acknowledged, so a reliable send may come again:
+            // one message per sequence number.
+            while let Ok((length, _)) = host.recv_from(&mut datagram) {
+                let number = [datagram[6], datagram[7]];
+                if length > 10 && datagram[4] & 0x0f == 6 && datagram[5] == CHANNEL_URGENT && !seen.contains(&number) {
+                    seen.push(number);
+                    let _ = asked.send(opened(&datagram[10..length]));
+                }
+            }
+        });
+        let control = Arc::new(Control {
+            enet: Enet::connect(address, 0, CONNECT_TIMEOUT).unwrap(),
+            cipher: Mutex::new(Cipher::new(&[7; 16])),
+            gamepads: Mutex::new(VecDeque::new()),
+            motion: Mutex::new(None),
+        });
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let video = Media::open(sender.local_addr().unwrap(), &[0; 16], Duration::ZERO).unwrap();
+        let to = ("127.0.0.1", video.socket.local_addr().unwrap().port());
+        let (events, frames) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (link, stopped) = (control.clone(), stop.clone());
+        let player = thread::spawn(move || play_video(video, &link, &events, &stopped));
+
+        for packet in crate::video::tests::packets(1, true, &[1; 40], 1) { sender.send_to(&packet, to).unwrap(); }
+        assert!(matches!(frames.recv_timeout(Duration::from_secs(2)), Ok(Event::Video(Frame { index: 1, key: true, .. }))));
+        // Requests for the first key frame, if the machine was slow to deliver it, do not count.
+        thread::sleep(Duration::from_millis(50));
+        let _ = requests.try_iter().count();
+        // The end of the next frame never comes, and the host sends nothing
+        // more on a still picture: the client asks, and asks again.
+        sender.send_to(&crate::video::tests::packets(2, false, &[2; 40], 1)[0], to).unwrap();
+        let sent = Instant::now();
+        for _ in 0..2 {
+            assert_eq!(requests.recv_timeout(Duration::from_secs(2)), Ok((control::REQUEST_IDR, vec![0, 0])));
+        }
+        assert!(sent.elapsed() >= RECEIVE_WAIT + KEY_FRAME_REQUEST_GAP / 2);
+
+        stop.store(true, Ordering::Relaxed);
+        player.join().unwrap();
+        drop(control);
+        host.join().unwrap();
     }
 
     #[test]
