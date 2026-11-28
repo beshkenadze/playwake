@@ -33,17 +33,101 @@ struct KeyboardMouseTests {
         #expect(KeyboardMouse.videoPosition(of: .zero, in: .zero, aspect: wide) == nil)
     }
 
-    @Test func commandAndTheKeysPressedWithItStayOnThisDevice() {
-        let leftCommand: UInt16 = 0xE3, rightCommand: UInt16 = 0xE7, k: UInt16 = 0x0E
-        #expect(!KeyboardMouse.forwards(usage: leftCommand, pressed: true, command: true))
-        #expect(!KeyboardMouse.forwards(usage: rightCommand, pressed: false, command: false))
-        #expect(!KeyboardMouse.forwards(usage: k, pressed: true, command: true))
-        #expect(KeyboardMouse.forwards(usage: k, pressed: true, command: false))
+    private func keys(_ command: inout CommandKey, _ usage: UInt16, _ pressed: Bool) -> [String] {
+        command.keys(usage: usage, pressed: pressed).map { "\(String($0.usage, radix: 16))\($0.pressed ? "+" : "-")" }
     }
 
-    @Test func releasesAlwaysReachTheHost() {
+    @Test func commandAloneTapsTheWindowsKey() {
+        var command = CommandKey()
+        #expect(keys(&command, 0xE3, true) == [])
+        #expect(keys(&command, 0xE3, false) == ["e3+", "e3-"])
+    }
+
+    @Test func commandWithAKeyIsWindowsWithThatKey() {
+        // Cmd+D: Win+D shows the PC's desktop; no Start tap after it.
+        var command = CommandKey()
+        #expect(keys(&command, 0xE3, true) == [])
+        #expect(keys(&command, 0x07, true) == ["e3+", "7+"])
+        #expect(keys(&command, 0x07, false) == ["7-"])
+        #expect(keys(&command, 0x08, true) == ["8+"])
+        #expect(keys(&command, 0x08, false) == ["8-"])
+        #expect(keys(&command, 0xE3, false) == ["e3-"])
+    }
+
+    @Test func theMacsShortcutsStayOnTheMacWithNoStartTap() {
+        // Cmd+K opens the stream menu, Cmd+Tab switches apps: nothing reaches the PC.
+        for key: UInt16 in [0x0E, 0x2B] {
+            var command = CommandKey()
+            #expect(keys(&command, 0xE7, true) == [])
+            #expect(keys(&command, key, true) == [])
+            #expect(keys(&command, key, false) == ["\(String(key, radix: 16))-"])
+            #expect(keys(&command, 0xE7, false) == [])
+        }
+    }
+
+    @Test func bothCommandKeysMakeOnePress() {
+        // Released together, each key may see the other already up: still one tap.
+        var command = CommandKey()
+        #expect(keys(&command, 0xE3, true) == [])
+        #expect(keys(&command, 0xE7, true) == [])
+        #expect(keys(&command, 0xE3, false) == [])
+        #expect(keys(&command, 0xE7, false) == ["e3+", "e3-"])
+        // And with a key: Win comes up once, after the last Command key.
+        #expect(keys(&command, 0xE3, true) == [])
+        #expect(keys(&command, 0x07, true) == ["e3+", "7+"])
+        #expect(keys(&command, 0xE7, true) == [])
+        #expect(keys(&command, 0xE3, false) == [])
+        #expect(keys(&command, 0xE7, false) == ["e3-"])
+    }
+
+    @Test func aCommandPressedBeforeTheInputOpenedIsNoWinTap() {
+        // Command went down while the input was closed (menu open, another app):
+        // it counts for nothing, keys typed with it go plain and its release taps nothing.
+        let gate = InputGate(), command = CommandKey.Box()
+        var sent: [String] = []
+        func change(_ usage: UInt16, _ pressed: Bool) {
+            command.keyChanged(usage, pressed, command: false, gate: gate) { sent.append("\(String($0, radix: 16))\($1 ? "+" : "-")") }
+        }
+        change(0xE3, true)
+        gate.set(open: true, desktop: false) { _, _ in }
+        change(0x07, true)
+        change(0x07, false)
+        change(0xE3, false)
+        #expect(sent == ["7+", "7-"])
+    }
+
+    @Test func closingTheInputForgetsTheCommandPress() {
+        // Cmd+D, the input closes (the host lets go of Win) and opens again while
+        // Command is still down: its release sends nothing more.
+        let gate = InputGate(), command = CommandKey.Box()
+        var sent: [String] = []
+        func change(_ usage: UInt16, _ pressed: Bool) {
+            command.keyChanged(usage, pressed, command: false, gate: gate) { sent.append("\(String($0, radix: 16))\($1 ? "+" : "-")") }
+        }
+        gate.set(open: true, desktop: false) { _, _ in }
+        change(0xE3, true)
+        change(0x07, true)
+        gate.set(open: false, desktop: false) { closing, _ in if closing { KeyboardMouse.inputClosed(command) } }
+        gate.set(open: true, desktop: false) { _, _ in }
+        change(0x07, false)
+        change(0xE3, false)
+        #expect(sent == ["e3+", "7+", "7-"])
+    }
+
+    @Test func theMacsShortcutsStayOnTheMacWithACommandTheStateMissed() {
+        // Command held through Resume (the gate was closed when it went down): Cmd+K
+        // still opens the menu here and sends no K; other keys go plain, with no Win.
+        var command = CommandKey()
+        #expect(command.keys(usage: 0x0E, pressed: true, command: true).isEmpty)
+        #expect(command.keys(usage: 0x07, pressed: true, command: true).map(\.usage) == [0x07])
+    }
+
+    @Test func keysWithoutCommandAndAllReleasesGoAsTheyAre() {
+        var command = CommandKey()
+        #expect(keys(&command, 0x0E, true) == ["e+"])
         // K pressed alone, then Command held before K comes up: the release still goes.
-        #expect(KeyboardMouse.forwards(usage: 0x0E, pressed: false, command: true))
+        #expect(keys(&command, 0xE3, true) == [])
+        #expect(keys(&command, 0x0E, false) == ["e-"])
     }
 
     @Test func theLeftButtonFollowsThePositionAndOnlyWhenItChanges() {

@@ -28,8 +28,6 @@ final class KeyboardMouse: ObservableObject {
     nonisolated static let keyboardPage: UInt16 = 0x07
     nonisolated static let keyboard = UInt32(PW_INPUT_SOURCE_KEYBOARD)
     nonisolated static let mouse = UInt32(PW_INPUT_SOURCE_MOUSE)
-    private nonisolated static let leftCommand: UInt16 = 0xE3
-    private nonisolated static let rightCommand: UInt16 = 0xE7
     /// `GCMouse` scroll units in one wheel notch (Moonlight: ×20 of 120).
     private nonisolated static let scrollPerNotch: Float = 6
 
@@ -51,6 +49,8 @@ final class KeyboardMouse: ObservableObject {
     /// Desktop mode: the left button as the view over the video saw it.
     private var leftHeld = false
     private let gate = InputGate()
+    /// Command as the PC's Windows key; one for the app, touched on `queue`.
+    private let commandKey = CommandKey.Box()
     /// Where keyboard and mouse events arrive.
     let queue = DispatchQueue(label: "io.playwake.keyboard-mouse", qos: .userInteractive)
 
@@ -70,7 +70,10 @@ final class KeyboardMouse: ObservableObject {
                 MainActor.assumeIsolated {
                     // After the device's events already queued, so none of them presses again.
                     let gate = KeyboardMouse.shared.gate
-                    KeyboardMouse.shared.queue.async { gate.locked { pw_input_release_all() } }
+                    let commandKey = KeyboardMouse.shared.commandKey
+                    KeyboardMouse.shared.queue.async {
+                        gate.locked { KeyboardMouse.inputClosed(commandKey) }
+                    }
                     KeyboardMouse.shared.connect()
                 }
             }
@@ -155,12 +158,11 @@ final class KeyboardMouse: ObservableObject {
         return CGPoint(x: (point.x - origin.x) / width, y: (point.y - origin.y) / height)
     }
 
-    /// Command belongs to the Mac and iPad (Cmd+Tab, the app's shortcuts):
-    /// it and the keys pressed with it stay here. Releases always go out,
-    /// so nothing stays held on the host.
-    nonisolated static func forwards(usage: UInt16, pressed: Bool, command: Bool) -> Bool {
-        if usage == leftCommand || usage == rightCommand { return false }
-        return !pressed || !command
+    /// The host lets go of everything, and a Command held meanwhile makes no Win tap.
+    /// Under the gate's lock.
+    nonisolated static func inputClosed(_ commandKey: CommandKey.Box) {
+        pw_input_release_all()
+        commandKey.state = CommandKey()
     }
 
     private func setAppActive(_ active: Bool) {
@@ -173,9 +175,10 @@ final class KeyboardMouse: ObservableObject {
         let open = streamActive && appActive
         let core = mode.core
         // Under the gate, so no event of the old mode slips in between.
+        let commandKey = commandKey
         gate.set(open: open, desktop: mode == .desktop) { closing, modeChanged in
             if modeChanged { pw_input_mode(core) }
-            if closing { pw_input_release_all() }
+            if closing { Self.inputClosed(commandKey) }
         }
         if !open || mode != .desktop { leftHeld = false }
         PointerLock.wanted = open && mode == .game && mouseConnected
@@ -191,12 +194,13 @@ final class KeyboardMouse: ObservableObject {
     private func configure(_ keyboard: GCKeyboard) {
         keyboard.handlerQueue = queue
         let gate = gate
+        let commandKey = commandKey
         keyboard.keyboardInput?.keyChangedHandler = { input, _, code, pressed in
-            let usage = UInt16(truncatingIfNeeded: code.rawValue)
             let command = input.button(forKeyCode: .leftGUI)?.isPressed == true
                 || input.button(forKeyCode: .rightGUI)?.isPressed == true
-            guard Self.forwards(usage: usage, pressed: pressed, command: command) else { return }
-            gate.send { pw_input_key(Self.keyboard, Self.keyboardPage, usage, pressed) }
+            commandKey.keyChanged(UInt16(truncatingIfNeeded: code.rawValue), pressed, command: command, gate: gate) { usage, pressed in
+                pw_input_key(Self.keyboard, Self.keyboardPage, usage, pressed)
+            }
         }
     }
 
@@ -460,5 +464,73 @@ final class PointerAreaView: UIView {
         guard let press, touches.contains(press) else { return }
         self.press = nil
         KeyboardMouse.shared.pointerLifted()
+    }
+}
+
+/// Command is the PC's Windows key, as in Moonlight, apart from the Mac's own
+/// shortcuts. Win goes out only once a key that is not the Mac's comes with
+/// Command, or as a tap when Command comes up alone (the Start menu), so
+/// Cmd+K (the stream menu) and Cmd+Tab never reach the PC as Win+K or Win+Tab.
+/// Releases of other keys always go out, so nothing stays held on the host.
+struct CommandKey {
+    static let left: UInt16 = 0xE3
+    static let right: UInt16 = 0xE7
+    /// Sent as the Windows key.
+    static let win: UInt16 = left
+    /// With Command these stay on the Mac: K (stream menu), Tab and ` (switch
+    /// apps and windows), Q, H, M and Space.
+    static let macKeys: Set<UInt16> = [0x0E, 0x2B, 0x35, 0x14, 0x0B, 0x10, 0x2C]
+
+    /// Changed only under the input gate's lock, so a change and the keys
+    /// it sends happen together, and a closed gate neither sends nor counts.
+    final class Box: @unchecked Sendable {
+        var state = CommandKey()
+
+        /// `command`: Command is down on the keyboard, seen by the gate or not.
+        func keyChanged(_ usage: UInt16, _ pressed: Bool, command: Bool, gate: InputGate,
+                        send: (UInt16, Bool) -> Void) {
+            gate.send {
+                for key in state.keys(usage: usage, pressed: pressed, command: command) { send(key.usage, key.pressed) }
+            }
+        }
+    }
+
+    /// Command keys seen going down since this state began. A press made
+    /// before it (another app had the focus) counts for nothing.
+    private var held: Set<UInt16> = []
+    private var winDown = false
+    /// A key came with this Command press, so its release is no Win tap.
+    private var used = false
+
+    /// The keys to send for one keyboard change. `command`: Command is down on
+    /// the keyboard, even a press made before this state began; the Mac's
+    /// shortcuts stay on the Mac then too.
+    mutating func keys(usage: UInt16, pressed: Bool, command: Bool = false) -> [(usage: UInt16, pressed: Bool)] {
+        if usage == Self.left || usage == Self.right {
+            if pressed {
+                if held.isEmpty {
+                    winDown = false
+                    used = false
+                }
+                held.insert(usage)
+                return []
+            }
+            // Only the last Command key seen down ends the press, once.
+            guard held.remove(usage) != nil, held.isEmpty else { return [] }
+            if winDown {
+                winDown = false
+                return [(Self.win, false)]
+            }
+            return used ? [] : [(Self.win, true), (Self.win, false)]
+        }
+        if pressed, Self.macKeys.contains(usage), command || !held.isEmpty {
+            used = true
+            return []
+        }
+        guard pressed, !held.isEmpty else { return [(usage, pressed)] }
+        used = true
+        if winDown { return [(usage, true)] }
+        winDown = true
+        return [(Self.win, true), (usage, true)]
     }
 }
