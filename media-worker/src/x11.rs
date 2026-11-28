@@ -686,12 +686,14 @@ mod tests {
 }
 
 /// The text a key typed. XLookupString gives Latin-1 bytes, and nothing for a
-/// character outside Latin-1, which an X keysym then carries as Unicode.
+/// character outside Latin-1, which the keysym then carries: as Unicode, or
+/// as a legacy keysym such as the one Gamescope gives я, Cyrillic_ya.
 pub fn typed_text(keysym: u64, latin1: &[u8]) -> String {
-    match keysym {
-        0x0100_0000..=0x0110_ffff => char::from_u32((keysym - 0x0100_0000) as u32).map(String::from).unwrap_or_default(),
-        _ => latin1.iter().map(|&byte| byte as char).collect(),
+    if !latin1.is_empty() && !(0x0100_0000..=0x0110_ffff).contains(&keysym) {
+        return latin1.iter().map(|&byte| byte as char).collect();
     }
+    u32::try_from(keysym).ok().and_then(|keysym| xkeysym::Keysym::new(keysym).key_char())
+        .filter(|c| !c.is_control()).map(String::from).unwrap_or_default()
 }
 
 /// Gamescope's name for its scaling filter number.
@@ -775,8 +777,11 @@ mod key_tests {
     fn typed_text_keeps_accents_and_unicode_letters() {
         assert_eq!(super::typed_text(0xe9, &[0xe9]), "é");
         assert_eq!(super::typed_text(0x61, b"a"), "a");
-        // Cyrillic "я" as a Unicode keysym.
+        // Cyrillic "я" as a Unicode keysym and as Cyrillic_ya, and the euro sign.
         assert_eq!(super::typed_text(0x0100_044f, &[]), "я");
+        assert_eq!(super::typed_text(0x6d1, &[]), "я");
+        assert_eq!(super::typed_text(0x20ac, &[]), "€");
+        assert_eq!(super::typed_text(0, &[]), "");
     }
 
     #[test]
