@@ -99,7 +99,7 @@ if [[ -f "$bundle_dir/playwake-media" ]]; then
 fi
 install -m755 "$bundle_dir/launch-steamos.sh" "$dir/launch-steamos.sh"
 install -m644 "$bundle_dir"/assets/branding/*.png "$dir/assets/branding/"
-install -m644 "$bundle_dir/packaging/steam_shortcut.py" "$dir/packaging/"
+install -m644 "$bundle_dir/packaging/steam_shortcut.py" "$bundle_dir/packaging/steam_input_neptune.vdf" "$dir/packaging/"
 install -m755 "$bundle_dir/packaging/install.sh" "$bundle_dir/packaging/uninstall.sh" "$dir/packaging/"
 rm -rf "$dir/runtime"
 cp -a "$bundle_dir/runtime" "$dir/runtime"

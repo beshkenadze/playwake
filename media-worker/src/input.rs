@@ -3,8 +3,8 @@
 //! machine, pulse overrides and external gamepad state.
 //! Port of media/gstreamer_player.py:859-921 + StreamInput wiring.
 
-use crate::{clock, protocol, route::{Route, Routed, RouteEvent, GUIDE}, x11::PointerEvent};
-use playwake_core::input::{Device, InputEvent, MouseButton, PcInput, Sink};
+use crate::{clock, protocol, route::{Route, Routed, RouteEvent, GUIDE}, x11::{self, PointerEvent}};
+use playwake_core::input::{Device, InputEvent, MouseButton, PcInput, Sink, Usage};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
@@ -375,6 +375,51 @@ impl Mouse {
     }
 }
 
+/// The keyboard of a PC stream. A keyboard's key goes to the PC as that key,
+/// held until it is let go, while the stream has the keys; what Steam's
+/// on-screen keyboard types goes as text, as do keys pressed while it is up.
+#[derive(Default)]
+pub struct Keys {
+    /// ALLY_MOUSE_DEBUG: log every key.
+    debug: bool,
+    active: bool,
+    pc: PcInput,
+    /// X keycodes sent down as keys and not let go yet.
+    held: std::collections::BTreeSet<u32>,
+}
+
+impl Keys {
+    pub fn new(debug: bool) -> Self { Self { debug, ..Self::default() } }
+
+    /// Sends `keys`, as keys while `active`: the stream has the keys and
+    /// Steam's on-screen keyboard is down. Becoming inactive lets go of every
+    /// key held first.
+    pub fn send(&mut self, sink: &impl Sink, keys: &[x11::Key], active: bool) {
+        if self.active && !active {
+            self.held.clear();
+            self.pc.release_all(sink);
+        }
+        self.active = active;
+        for key in keys {
+            if self.debug { eprintln!("pw-key {key:?} own {:?} active {}", x11::own_key(key), self.active); }
+            let usage = |code| InputEvent::Key { usage: Usage::Evdev(code), down: key.down };
+            if !key.down {
+                if self.held.remove(&key.keycode) {
+                    self.pc.send(sink, Device::Keyboard, usage((key.keycode - 8) as u16));
+                }
+            } else if let Some(code) = x11::own_key(key).filter(|_| self.active) {
+                // The host repeats a held key itself, as it does for Moonlight.
+                if self.held.insert(key.keycode) { self.pc.send(sink, Device::Keyboard, usage(code)); }
+            } else if let Some(code) = x11::virtual_key(key.keysym) {
+                sink.key(code, true, 0);
+                sink.key(code, false, 0);
+            } else if !key.text.is_empty() {
+                self.pc.send(sink, Device::Keyboard, InputEvent::Text(key.text.clone()));
+            }
+        }
+    }
+}
+
 /// The core event of an X button; the wheel scrolls one notch on a press.
 fn button_event(button: u32, down: bool) -> Option<InputEvent> {
     let press = |button| Some(InputEvent::MouseButton { button, down });
@@ -497,7 +542,7 @@ mod tests {
     }
 
     impl Sink for Recorder {
-        fn key(&self, key: u8, down: bool, _: u8) { self.push(format!("key {key} {down}")) }
+        fn key(&self, key: u8, down: bool, modifiers: u8) { self.push(format!("key {key:#x} {down} {modifiers}")) }
         fn text(&self, text: &str) { self.push(format!("text {text}")) }
         fn mouse_move(&self, dx: i16, dy: i16) { self.push(format!("move {dx} {dy}")) }
         fn mouse_position(&self, x: i16, y: i16, _: i16, _: i16) { self.push(format!("at {x} {y}")) }
@@ -645,5 +690,51 @@ mod tests {
     #[test]
     fn guide_constant_matches_protocol() {
         assert_eq!(GUIDE, 2);
+    }
+
+    fn key(keycode: u32, keysym: u64, text: &str, down: bool) -> x11::Key {
+        x11::Key { keycode, keysym, text: text.into(), shortcut: false, down }
+    }
+
+
+    #[test]
+    fn keyboard_keys_go_down_and_up_with_their_modifiers() {
+        let sink = Recorder::default();
+        let mut keys = Keys::default();
+        // Shift, A typed as "A" and held through a repeat, which the PC makes itself, then both let go.
+        keys.send(&sink, &[key(50, 0xffe1, "", true), key(38, 0x41, "A", true), key(38, 0x41, "A", true),
+            key(38, 0x41, "", false), key(50, 0xffe1, "", false)], true);
+        assert_eq!(sink.take(), ["key 0xa0 true 1", "key 0x41 true 1", "key 0x41 false 1", "key 0xa0 false 0"]);
+    }
+
+    #[test]
+    fn what_the_on_screen_keyboard_puts_on_another_key_goes_as_text() {
+        let sink = Recorder::default();
+        let mut keys = Keys::default();
+        // Gamescope types я with KEY_1 under a keymap of its own.
+        keys.send(&sink, &[key(10, 0x0100_044f, "я", true), key(10, 0x0100_044f, "", false)], true);
+        assert_eq!(sink.take(), ["text я"]);
+    }
+
+    #[test]
+    fn while_the_on_screen_keyboard_is_up_keys_go_as_text_and_named_keys() {
+        let sink = Recorder::default();
+        let mut keys = Keys::default();
+        keys.send(&sink, &[key(50, 0xffe1, "", true), key(38, 0x61, "a", true), key(38, 0x61, "", false),
+            key(22, 0xff08, "\u{8}", true), key(22, 0xff08, "", false), key(50, 0xffe1, "", false)], false);
+        assert_eq!(sink.take(), ["text a", "key 0x8 true 0", "key 0x8 false 0"]);
+    }
+
+    #[test]
+    fn losing_the_keys_lets_go_of_the_held_ones_and_skips_their_releases() {
+        let sink = Recorder::default();
+        let mut keys = Keys::default();
+        keys.send(&sink, &[key(37, 0xffe3, "", true), key(54, 0x63, "", true)], true);
+        sink.take();
+        // The on-screen keyboard came up: the held keys go up before what was typed on it.
+        keys.send(&sink, &[key(38, 0x61, "a", true), key(54, 0x63, "", false), key(37, 0xffe3, "", false)], false);
+        assert_eq!(sink.take(), ["key 0x43 false 0", "key 0xa2 false 0", "text a"]);
+        keys.send(&sink, &[], false);
+        assert_eq!(sink.take(), Vec::<String>::new());
     }
 }
