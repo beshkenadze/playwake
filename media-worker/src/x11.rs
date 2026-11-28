@@ -33,6 +33,10 @@ pub struct X11Window {
     pub fixed: bool,
     /// Windows of this process taken inside the video window: the Vulkan sink's.
     embedded: Vec<xlib::Window>,
+    /// Events read and not yet handed out.
+    pending: Tick,
+    /// Dies with this window, whose display closes then.
+    alive: std::sync::Arc<()>,
 }
 
 /// Where the video goes while an on-screen keyboard covers the lower half of
@@ -42,14 +46,26 @@ fn above_keyboard((x, y, width, height): (i32, i32, u32, u32)) -> (i32, i32, u32
     (x + ((width - half_width) / 2) as i32, y, half_width.max(1), half_height.max(1))
 }
 
+#[derive(Default)]
 pub struct Tick {
     pub size_changed: Option<(u32, u32)>,
-    /// Keys pressed in the video window: the X keysym and the text it types.
-    pub keys: Vec<(u64, String)>,
+    /// Keys pressed and let go in the video window.
+    pub keys: Vec<Key>,
     pub adopted: bool,
     pub adopt_timeout: bool,
     pub buttons: Vec<(u32, u32, i32, i32)>,
     pub exposes: Vec<u32>,
+}
+
+/// A key pressed or let go in the video window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Key {
+    /// The X keycode: the evdev code plus 8.
+    pub keycode: u32,
+    pub keysym: u64,
+    /// What a press types; nothing with Ctrl or Alt held.
+    pub text: String,
+    pub down: bool,
 }
 
 extern "C" fn x_error_handler(_display: *mut xlib::Display, event: *mut xlib::XErrorEvent) -> i32 {
@@ -99,7 +115,7 @@ impl X11Window {
                 (xlib.XStoreName)(display, xid, b"Greenlight Native Video\0".as_ptr() as *const i8);
                 (xlib.XSetWMProtocols)(display, xid, &mut delete_atom, 1);
                 (xlib.XSelectInput)(display, xid,
-                    xlib::ExposureMask | xlib::ButtonPressMask | xlib::StructureNotifyMask | xlib::KeyPressMask);
+                    xlib::ExposureMask | xlib::ButtonPressMask | xlib::StructureNotifyMask | xlib::KeyPressMask | xlib::KeyReleaseMask);
                 if parent_xid != root && !fixed {
                     let mut pr: xlib::Window = 0;
                     let mut px: i32 = 0; let mut py: i32 = 0;
@@ -114,6 +130,11 @@ impl X11Window {
                 let res_conn = if vulkan { Some(x11rb::connect(None).map_err(|e| format!("X11 res connect: {e}"))?.0) } else { None };
                 (xid, parent_xid, res_conn)
             };
+            // A held key repeats as presses alone, not as a release and a press.
+            let mut supported = 0;
+            if (xlib.XkbSetDetectableAutoRepeat)(display, 1, &mut supported) == 0 || supported == 0 {
+                eprintln!("pw-key no detectable auto-repeat");
+            }
             (xlib.XFlush)(display);
             (xlib.XSync)(display, 0);
             let known_children = if let Some(conn) = res_conn.as_ref() {
@@ -126,7 +147,7 @@ impl X11Window {
                 xlib, display, xid, parent: parent_xid, size: (width, height), delete_atom,
                 deleted: false, adopt, adopted: false, adopt_started: None, known_children,
                 res_conn, root, baselayer_previous: None, keyboard: false, placed: None, fixed,
-                embedded: Vec::new(),
+                embedded: Vec::new(), pending: Tick::default(), alive: std::sync::Arc::new(()),
             })
         }
     }
@@ -183,9 +204,21 @@ impl X11Window {
         unsafe { (self.xlib.XSync)(self.display, 0); }
     }
 
-    pub fn tick(&mut self, now: f64) -> Result<Tick, String> {
-        let mut tick = Tick { size_changed: None, keys: Vec::new(), adopted: false, adopt_timeout: false,
-            buttons: Vec::new(), exposes: Vec::new() };
+    /// The display's fd to watch for events, and a token that dies with this window.
+    pub fn watch(&self) -> (std::os::fd::RawFd, std::sync::Weak<()>) {
+        (unsafe { (self.xlib.XConnectionNumber)(self.display) }, std::sync::Arc::downgrade(&self.alive))
+    }
+
+    /// The keys pressed and let go since the last call, read as they come
+    /// rather than on the next tick.
+    pub fn take_keys(&mut self) -> Vec<Key> {
+        self.read_events();
+        std::mem::take(&mut self.pending.keys)
+    }
+
+    /// Reads the events that arrived into `pending`.
+    fn read_events(&mut self) {
+        let tick = &mut self.pending;
         unsafe {
             while (self.xlib.XPending)(self.display) > 0 {
                 let mut event: xlib::XEvent = std::mem::zeroed();
@@ -203,20 +236,26 @@ impl X11Window {
                         let expose: xlib::XExposeEvent = event.into();
                         tick.exposes.push(expose.window as u32);
                     }
-                    xlib::KeyPress => {
+                    xlib::KeyPress | xlib::KeyRelease => {
                         let mut key: xlib::XKeyEvent = event.into();
                         let mut text = [0u8; 32];
                         let mut keysym: xlib::KeySym = 0;
                         let length = (self.xlib.XLookupString)(&mut key, text.as_mut_ptr() as *mut i8, text.len() as i32,
                             &mut keysym, std::ptr::null_mut());
-                        let typed = if key.state & (xlib::ControlMask | xlib::Mod1Mask) != 0 { String::new() }
+                        let down = key.type_ == xlib::KeyPress;
+                        let typed = if !down || key.state & (xlib::ControlMask | xlib::Mod1Mask) != 0 { String::new() }
                             else { typed_text(keysym as u64, &text[..length.max(0) as usize]) };
-                        tick.keys.push((keysym as u64, typed));
+                        tick.keys.push(Key { keycode: key.keycode, keysym: keysym as u64, text: typed, down });
                     }
                     _ => {}
                 }
             }
         }
+    }
+
+    pub fn tick(&mut self, now: f64) -> Result<Tick, String> {
+        self.read_events();
+        let mut tick = std::mem::take(&mut self.pending);
         if self.adopt && !self.adopted {
             if let Some(started) = self.adopt_started {
                 if now - started > 5000.0 { tick.adopt_timeout = true; }
@@ -667,6 +706,17 @@ pub fn scaling_filter_name(filter: u32) -> &'static str {
     }
 }
 
+/// The evdev code of a key event that a keyboard's own key made, or `None`
+/// for one Steam's on-screen keyboard made up: Gamescope types a character
+/// that the keymap lacks with a key of a keymap of its own for the moment,
+/// so the key stands for nothing and the character goes as text. Every key
+/// reaches X from the same Gamescope keyboard, so only the keysym tells:
+/// a Latin-1 character or a key that types none, as Shift or F1, is a key.
+pub fn own_key(keycode: u32, keysym: u64) -> Option<u16> {
+    let code = u16::try_from(keycode.checked_sub(8)?).ok()?;
+    playwake_core::input::Usage::Evdev(code).vk()?;
+    matches!(keysym, 0..=0xff | 0xfd00..=0xffff).then_some(code)
+}
 /// The Windows virtual-key code of a key that types no text, by its X keysym.
 pub fn virtual_key(keysym: u64) -> Option<u8> {
     Some(match keysym {
@@ -697,6 +747,30 @@ mod key_tests {
         assert_eq!(super::virtual_key(0x61), None);
     }
 
+    #[test]
+    fn a_keyboard_key_goes_as_itself() {
+        // KEY_A (38 in X) typing a or A, KEY_1 typing ! or, on AZERTY, &,
+        // KEY_2 typing é on AZERTY, left Shift, F1, keypad End.
+        assert_eq!(super::own_key(38, 0x61), Some(30));
+        assert_eq!(super::own_key(38, 0x41), Some(30));
+        assert_eq!(super::own_key(10, 0x21), Some(2));
+        assert_eq!(super::own_key(10, 0x26), Some(2));
+        assert_eq!(super::own_key(11, 0xe9), Some(3));
+        assert_eq!(super::own_key(50, 0xffe1), Some(42));
+        assert_eq!(super::own_key(67, 0xffbe), Some(59));
+        assert_eq!(super::own_key(87, 0xff9c), Some(79));
+        assert_eq!(super::own_key(38, 0), Some(30));
+    }
+    #[test]
+    fn a_character_beyond_latin_1_goes_as_text() {
+        // Gamescope's generated keymap types я (Unicode or legacy keysym) and € on KEY_1.
+        assert_eq!(super::own_key(10, 0x0100_044f), None);
+        assert_eq!(super::own_key(10, 0x6d1), None);
+        assert_eq!(super::own_key(10, 0x20ac), None);
+        // No key: below the evdev range, or a code without a virtual key.
+        assert_eq!(super::own_key(7, 0xff0d), None);
+        assert_eq!(super::own_key(8 + 0x2ff, 0xff0d), None);
+    }
     #[test]
     fn typed_text_keeps_accents_and_unicode_letters() {
         assert_eq!(super::typed_text(0xe9, &[0xe9]), "é");
