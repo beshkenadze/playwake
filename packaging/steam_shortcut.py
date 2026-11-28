@@ -185,6 +185,11 @@ def scan_vdf(text: str) -> tuple[dict, int | None]:
     return entries, None
 
 
+def read_vdf(path: Path) -> str:
+    """A text VDF with its line endings as they are."""
+    return path.read_bytes().decode("utf-8")
+
+
 def whole_lines(text: str, start: int, end: int) -> tuple[int, int]:
     """The span widened to whole lines when nothing else shares them."""
     line = text.rfind("\n", 0, start) + 1
@@ -197,9 +202,10 @@ def whole_lines(text: str, start: int, end: int) -> tuple[int, int]:
 
 def install_layout(configs: Path, layout: Path, dry_run: bool) -> str:
     """Makes the shortcut's layout ours unless the user picked one; returns
-    what was done: "added", "kept" or "missing" (no layout file to add)."""
+    what was done: "added", "kept" or "missing" (no layout file to add). A
+    layout file already there is the user's, which uninstall left, and stays."""
     configset = configs / CONFIGSET
-    text = configset.read_text(encoding="utf-8") if configset.is_file() else '"controller_config"\n{\n}\n'
+    text = read_vdf(configset) if configset.is_file() else '"controller_config"\n{\n}\n'
     entries, close = scan_vdf(text)
     if LAYOUT_KEY in entries:
         return "kept"
@@ -211,10 +217,12 @@ def install_layout(configs: Path, layout: Path, dry_run: bool) -> str:
     if dry_run:
         return "added"
     target = configs / LAYOUT_KEY / "controller_neptune.vdf"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(layout, target)
+    if not target.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(layout, target)
+    entry = LAYOUT_ENTRY.replace("\n", "\r\n") if "\r\n" in text else LAYOUT_ENTRY
     backup(configset)
-    write_atomic(configset, (text[:close] + LAYOUT_ENTRY + text[close:]).encode("utf-8"))
+    write_atomic(configset, (text[:close] + entry + text[close:]).encode("utf-8"))
     return "added"
 
 
@@ -224,7 +232,7 @@ def remove_layout(configs: Path, layout: Path, dry_run: bool) -> bool:
     configset = configs / CONFIGSET
     if not configset.is_file():
         return False
-    text = configset.read_text(encoding="utf-8")
+    text = read_vdf(configset)
     span = scan_vdf(text)[0].get(LAYOUT_KEY)
     if span is None:
         return False

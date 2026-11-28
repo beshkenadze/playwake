@@ -358,6 +358,22 @@ class LayoutTests(unittest.TestCase):
         self.tree.cli("install")
         self.assertEqual(self.tree.configset.read_text(), commented[:-2] + OUR_ENTRY + "}\n")
 
+    def test_reinstall_brings_back_the_layout_the_user_edited(self):
+        self.tree.cli("install")
+        layout = self.tree.configs / "playwake/controller_neptune.vdf"
+        layout.write_text("edited in Steam")
+        self.tree.cli("uninstall")
+        self.assertEqual(self.tree.cli("install")["layout"], "added")
+        self.assertEqual(layout.read_text(), "edited in Steam")
+
+    def test_windows_line_endings_stay(self):
+        crlf = CONFIGSET.replace("\n", "\r\n")
+        self.tree.configset.write_bytes(crlf.encode())
+        self.tree.cli("install")
+        self.assertEqual(self.tree.configset.read_bytes().decode(), crlf[:-3] + OUR_ENTRY.replace("\n", "\r\n") + "}\r\n")
+        self.tree.cli("uninstall")
+        self.assertEqual(self.tree.configset.read_bytes().decode(), crlf)
+
     def test_uninstall_keeps_a_layout_the_user_edited(self):
         self.tree.cli("install")
         layout = self.tree.configs / "playwake/controller_neptune.vdf"
