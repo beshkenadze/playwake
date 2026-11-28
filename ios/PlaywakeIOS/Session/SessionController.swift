@@ -109,6 +109,8 @@ final class SessionController: ObservableObject {
     private var lastTarget: StreamTarget?
     private var fixture = false
     private var pairedPc = false
+    /// `pcStatus` says a PC added by its address is looked for.
+    private var addingPc = false
     private var opensSection = false
     private var streamStartedAt: CFAbsoluteTime = 0
 
@@ -205,10 +207,11 @@ final class SessionController: ObservableObject {
         open(.pcs)
     }
 
-    /// Opens home on `section`, as the menu's Settings does from the welcome.
+    /// Opens home on `section`, as the menu's Settings does from the splash
+    /// or the welcome.
     func open(_ section: Section) {
         self.section = section
-        if screen != .splash { screen = .home }
+        screen = .home
     }
 
     func refreshPcs() {
@@ -221,6 +224,7 @@ final class SessionController: ObservableObject {
         let address = address.trimmingCharacters(in: .whitespaces)
         guard !address.isEmpty else { return }
         pcLoading = true
+        addingPc = true
         pcStatus = "Looking for Sunshine at \(address)…"
         core.addPc(address: address)
     }
@@ -426,7 +430,7 @@ final class SessionController: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = true
     }
 
-    private func handle(_ event: CoreEvent) {
+    func handle(_ event: CoreEvent) {
         switch event {
         case .device(let url, let code, let prefilled):
             device = DeviceCode(url: url, code: code, prefilled: prefilled)
@@ -477,6 +481,10 @@ final class SessionController: ObservableObject {
             pcs = computers
             pcGames = games
             pcLoading = false
+            if addingPc {
+                addingPc = false
+                pcStatus = ""
+            }
             #if DEBUG
             autoPc()
             #endif
@@ -502,6 +510,7 @@ final class SessionController: ObservableObject {
         case .pcError(let message):
             pairing = nil
             pcLoading = false
+            addingPc = false
             pcStatus = message
             LabLog.write("pc: \(message)")
         }
