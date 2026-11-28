@@ -391,24 +391,23 @@ pub struct Keys {
 impl Keys {
     pub fn new(debug: bool) -> Self { Self { debug, ..Self::default() } }
 
-    /// Starts or stops sending keys as keys; stopping lets go of every key held.
-    pub fn hold(&mut self, sink: &impl Sink, active: bool) {
+    /// Sends `keys`, as keys while `active`: the stream has the keys and
+    /// Steam's on-screen keyboard is down. Becoming inactive lets go of every
+    /// key held first.
+    pub fn send(&mut self, sink: &impl Sink, keys: &[x11::Key], active: bool) {
         if self.active && !active {
             self.held.clear();
             self.pc.release_all(sink);
         }
         self.active = active;
-    }
-
-    pub fn send(&mut self, sink: &impl Sink, keys: &[x11::Key]) {
         for key in keys {
-            if self.debug { eprintln!("pw-key {key:?} own {:?} active {}", x11::own_key(key.keycode, key.keysym), self.active); }
+            if self.debug { eprintln!("pw-key {key:?} own {:?} active {}", x11::own_key(key), self.active); }
             let usage = |code| InputEvent::Key { usage: Usage::Evdev(code), down: key.down };
             if !key.down {
                 if self.held.remove(&key.keycode) {
                     self.pc.send(sink, Device::Keyboard, usage((key.keycode - 8) as u16));
                 }
-            } else if let Some(code) = x11::own_key(key.keycode, key.keysym).filter(|_| self.active) {
+            } else if let Some(code) = x11::own_key(key).filter(|_| self.active) {
                 self.held.insert(key.keycode);
                 self.pc.send(sink, Device::Keyboard, usage(code));
             } else if let Some(code) = x11::virtual_key(key.keysym) {
@@ -694,31 +693,26 @@ mod tests {
     }
 
     fn key(keycode: u32, keysym: u64, text: &str, down: bool) -> x11::Key {
-        x11::Key { keycode, keysym, text: text.into(), down }
+        x11::Key { keycode, keysym, text: text.into(), shortcut: false, down }
     }
 
-    fn active_keys(sink: &Recorder) -> Keys {
-        let mut keys = Keys::default();
-        keys.hold(sink, true);
-        keys
-    }
 
     #[test]
     fn keyboard_keys_go_down_and_up_with_their_modifiers() {
         let sink = Recorder::default();
-        let mut keys = active_keys(&sink);
+        let mut keys = Keys::default();
         // Shift, A typed as "A" and held through a repeat, then both let go.
         keys.send(&sink, &[key(50, 0xffe1, "", true), key(38, 0x41, "A", true), key(38, 0x41, "A", true),
-            key(38, 0x41, "", false), key(50, 0xffe1, "", false)]);
+            key(38, 0x41, "", false), key(50, 0xffe1, "", false)], true);
         assert_eq!(sink.take(), ["key 0xa0 true 1", "key 0x41 true 1", "key 0x41 true 1", "key 0x41 false 1", "key 0xa0 false 0"]);
     }
 
     #[test]
     fn what_the_on_screen_keyboard_puts_on_another_key_goes_as_text() {
         let sink = Recorder::default();
-        let mut keys = active_keys(&sink);
+        let mut keys = Keys::default();
         // Gamescope types я with KEY_1 under a keymap of its own.
-        keys.send(&sink, &[key(10, 0x0100_044f, "я", true), key(10, 0x0100_044f, "", false)]);
+        keys.send(&sink, &[key(10, 0x0100_044f, "я", true), key(10, 0x0100_044f, "", false)], true);
         assert_eq!(sink.take(), ["text я"]);
     }
 
@@ -727,20 +721,20 @@ mod tests {
         let sink = Recorder::default();
         let mut keys = Keys::default();
         keys.send(&sink, &[key(50, 0xffe1, "", true), key(38, 0x61, "a", true), key(38, 0x61, "", false),
-            key(22, 0xff08, "\u{8}", true), key(22, 0xff08, "", false), key(50, 0xffe1, "", false)]);
+            key(22, 0xff08, "\u{8}", true), key(22, 0xff08, "", false), key(50, 0xffe1, "", false)], false);
         assert_eq!(sink.take(), ["text a", "key 0x8 true 0", "key 0x8 false 0"]);
     }
 
     #[test]
     fn losing_the_keys_lets_go_of_the_held_ones_and_skips_their_releases() {
         let sink = Recorder::default();
-        let mut keys = active_keys(&sink);
-        keys.send(&sink, &[key(37, 0xffe3, "", true), key(54, 0x63, "", true)]);
+        let mut keys = Keys::default();
+        keys.send(&sink, &[key(37, 0xffe3, "", true), key(54, 0x63, "", true)], true);
         sink.take();
-        keys.hold(&sink, false);
-        assert_eq!(sink.take(), ["key 0x43 false 0", "key 0xa2 false 0"]);
-        keys.send(&sink, &[key(54, 0x63, "", false), key(37, 0xffe3, "", false)]);
-        keys.hold(&sink, false);
+        // The on-screen keyboard came up: the held keys go up before what was typed on it.
+        keys.send(&sink, &[key(38, 0x61, "a", true), key(54, 0x63, "", false), key(37, 0xffe3, "", false)], false);
+        assert_eq!(sink.take(), ["key 0x43 false 0", "key 0xa2 false 0", "text a"]);
+        keys.send(&sink, &[], false);
         assert_eq!(sink.take(), Vec::<String>::new());
     }
 }

@@ -233,8 +233,9 @@ fn run() -> Result<(), String> {
                 // A PC stream takes typed text, so its picture moves out of
                 // the way of Steam's on-screen keyboard.
                 let keyboard = w.pc.is_some() && w.focus.as_mut().is_some_and(|focus| focus.keyboard_shown());
+                if let Some(x11) = w.x11.as_mut() { x11.keyboard = keyboard; }
+                let keys_active = w.keys_active();
                 if let Some(x11) = w.x11.as_mut() {
-                    x11.keyboard = keyboard;
                     match x11.tick(now) {
                         Ok(tick) => {
                             // The video window has the keyboard focus: what is
@@ -249,7 +250,7 @@ fn run() -> Result<(), String> {
                                 }
                             }
                             if let Some(pc) = w.pc.as_ref().filter(|_| !w.input.route.overlay) {
-                                w.keys.send(pc.as_ref(), &tick.keys);
+                                w.keys.send(pc.as_ref(), &tick.keys, keys_active);
                             }
                             if tick.adopted {
                                 protocol::event("vulkan-window-embedded", serde_json::json!({}));
@@ -349,7 +350,7 @@ fn run() -> Result<(), String> {
 
     if let Some(mut w) = slot.lock().unwrap().take() {
         if let Some(pc) = &w.pc {
-            w.keys.hold(pc.as_ref(), false);
+            w.keys.send(pc.as_ref(), &[], false);
             w.mouse.update(pc.as_ref(), false, [], (0, 0), (0, 0));
         }
         if let Some(overlay) = w.overlay.as_mut() { overlay.close(); }
@@ -787,11 +788,19 @@ fn arm_input(slot: &Slot, w: &mut Worker) {
 impl Worker {
     /// Sends the keys pressed in the video window to a PC stream, unless its menu is open.
     fn send_keys(&mut self) {
+        let active = self.keys_active();
         let Some(x11) = self.x11.as_mut() else { return };
         let keys = x11.take_keys();
         if let Some(pc) = self.pc.as_ref().filter(|_| !self.input.route.overlay) {
-            self.keys.send(pc.as_ref(), &keys);
+            self.keys.send(pc.as_ref(), &keys, active);
         }
+    }
+
+    /// Whether keys go to a PC stream as keys: it has them and Steam's
+    /// on-screen keyboard is down.
+    fn keys_active(&self) -> bool {
+        let typing = self.x11.as_ref().is_some_and(|x11| x11.keyboard);
+        self.focused && !self.input.route.overlay && self.pc.as_ref().is_some_and(|pc| !pc.ended()) && !typing
     }
 
     /// Gives the keys to a PC stream while it has them and Steam's on-screen
@@ -799,10 +808,8 @@ impl Worker {
     /// then grabs the pointer while the stream has the mouse and lets it go
     /// otherwise.
     fn sync_pc_input(&mut self) {
-        if let Some(pc) = self.pc.as_ref() {
-            let typing = self.x11.as_ref().is_some_and(|x11| x11.keyboard);
-            self.keys.hold(pc.as_ref(), self.focused && !self.input.route.overlay && !pc.ended() && !typing);
-        }
+        let active = self.keys_active();
+        if let Some(pc) = self.pc.as_ref() { self.keys.send(pc.as_ref(), &[], active); }
         let Some(pointer) = self.pointer.as_mut() else { return };
         let events = pointer.events();
         let Some(pc) = self.pc.as_ref() else { return };

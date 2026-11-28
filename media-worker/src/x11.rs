@@ -65,6 +65,8 @@ pub struct Key {
     pub keysym: u64,
     /// What a press types; nothing with Ctrl or Alt held.
     pub text: String,
+    /// Ctrl or Alt is held.
+    pub shortcut: bool,
     pub down: bool,
 }
 
@@ -243,9 +245,10 @@ impl X11Window {
                         let length = (self.xlib.XLookupString)(&mut key, text.as_mut_ptr() as *mut i8, text.len() as i32,
                             &mut keysym, std::ptr::null_mut());
                         let down = key.type_ == xlib::KeyPress;
-                        let typed = if !down || key.state & (xlib::ControlMask | xlib::Mod1Mask) != 0 { String::new() }
+                        let shortcut = key.state & (xlib::ControlMask | xlib::Mod1Mask) != 0;
+                        let typed = if !down || shortcut { String::new() }
                             else { typed_text(keysym as u64, &text[..length.max(0) as usize]) };
-                        tick.keys.push(Key { keycode: key.keycode, keysym: keysym as u64, text: typed, down });
+                        tick.keys.push(Key { keycode: key.keycode, keysym: keysym as u64, text: typed, shortcut, down });
                     }
                     _ => {}
                 }
@@ -713,11 +716,13 @@ pub fn scaling_filter_name(filter: u32) -> &'static str {
 /// that the keymap lacks with a key of a keymap of its own for the moment,
 /// so the key stands for nothing and the character goes as text. Every key
 /// reaches X from the same Gamescope keyboard, so only the keysym tells:
-/// a Latin-1 character or a key that types none, as Shift or F1, is a key.
-pub fn own_key(keycode: u32, keysym: u64) -> Option<u16> {
-    let code = u16::try_from(keycode.checked_sub(8)?).ok()?;
+/// a Latin-1 character or a key that types none, as Shift or F1, is a key,
+/// and so is any key with Ctrl or Alt held, which Gamescope never holds
+/// for its own keymap.
+pub fn own_key(key: &Key) -> Option<u16> {
+    let code = u16::try_from(key.keycode.checked_sub(8)?).ok()?;
     playwake_core::input::Usage::Evdev(code).vk()?;
-    matches!(keysym, 0..=0xff | 0xfd00..=0xffff).then_some(code)
+    (key.shortcut || matches!(key.keysym, 0..=0xff | 0xfd00..=0xffff)).then_some(code)
 }
 /// The Windows virtual-key code of a key that types no text, by its X keysym.
 pub fn virtual_key(keysym: u64) -> Option<u8> {
@@ -749,29 +754,34 @@ mod key_tests {
         assert_eq!(super::virtual_key(0x61), None);
     }
 
+    fn own(keycode: u32, keysym: u64) -> Option<u16> {
+        super::own_key(&super::Key { keycode, keysym, text: String::new(), shortcut: false, down: true })
+    }
     #[test]
     fn a_keyboard_key_goes_as_itself() {
         // KEY_A (38 in X) typing a or A, KEY_1 typing ! or, on AZERTY, &,
         // KEY_2 typing é on AZERTY, left Shift, F1, keypad End.
-        assert_eq!(super::own_key(38, 0x61), Some(30));
-        assert_eq!(super::own_key(38, 0x41), Some(30));
-        assert_eq!(super::own_key(10, 0x21), Some(2));
-        assert_eq!(super::own_key(10, 0x26), Some(2));
-        assert_eq!(super::own_key(11, 0xe9), Some(3));
-        assert_eq!(super::own_key(50, 0xffe1), Some(42));
-        assert_eq!(super::own_key(67, 0xffbe), Some(59));
-        assert_eq!(super::own_key(87, 0xff9c), Some(79));
-        assert_eq!(super::own_key(38, 0), Some(30));
+        assert_eq!(own(38, 0x61), Some(30));
+        assert_eq!(own(38, 0x41), Some(30));
+        assert_eq!(own(10, 0x21), Some(2));
+        assert_eq!(own(10, 0x26), Some(2));
+        assert_eq!(own(11, 0xe9), Some(3));
+        assert_eq!(own(50, 0xffe1), Some(42));
+        assert_eq!(own(67, 0xffbe), Some(59));
+        assert_eq!(own(87, 0xff9c), Some(79));
+        assert_eq!(own(38, 0), Some(30));
     }
     #[test]
     fn a_character_beyond_latin_1_goes_as_text() {
         // Gamescope's generated keymap types я (Unicode or legacy keysym) and € on KEY_1.
-        assert_eq!(super::own_key(10, 0x0100_044f), None);
-        assert_eq!(super::own_key(10, 0x6d1), None);
-        assert_eq!(super::own_key(10, 0x20ac), None);
+        assert_eq!(own(10, 0x0100_044f), None);
+        assert_eq!(own(10, 0x6d1), None);
+        assert_eq!(own(10, 0x20ac), None);
+        // With Ctrl held a key is a key, whatever the layout's letter on it: Ctrl+С.
+        assert_eq!(super::own_key(&super::Key { keycode: 54, keysym: 0x6d3, text: String::new(), shortcut: true, down: true }), Some(46));
         // No key: below the evdev range, or a code without a virtual key.
-        assert_eq!(super::own_key(7, 0xff0d), None);
-        assert_eq!(super::own_key(8 + 0x2ff, 0xff0d), None);
+        assert_eq!(own(7, 0xff0d), None);
+        assert_eq!(own(8 + 0x2ff, 0xff0d), None);
     }
     #[test]
     fn typed_text_keeps_accents_and_unicode_letters() {
