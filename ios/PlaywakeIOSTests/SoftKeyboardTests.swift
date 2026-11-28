@@ -2,6 +2,8 @@ import Testing
 import UIKit
 @testable import Playwake
 
+/// Serialized: the tests share `SoftKeyboard.shared`.
+@Suite(.serialized)
 struct SoftKeyboardTests {
     private let control = StickyKeys.Modifier.control.rawValue
     private let alt = StickyKeys.Modifier.alt.rawValue
@@ -105,16 +107,27 @@ struct SoftKeyboardTests {
             field.focus()
             window.isHidden = true
         }
+        func settle() async { await withCheckedContinuation { done in DispatchQueue.main.async { done.resume() } } }
         keyboard.setStreamActive(true)
         keyboard.show()
-        field.focus()
+        field.scheduleFocus()
+        #expect(!field.isFirstResponder)
+        await settle()
+        #expect(field.isFirstResponder)
+        keyboard.hide()
+        field.scheduleFocus()
+        await settle()
+        #expect(!field.isFirstResponder)
+        keyboard.show()
+        field.scheduleFocus()
+        await settle()
         #expect(field.isFirstResponder)
         // Hidden and shown again before either update runs.
         keyboard.hide()
         field.scheduleFocus()
         keyboard.show()
         field.scheduleFocus()
-        await withCheckedContinuation { done in DispatchQueue.main.async { done.resume() } }
+        await settle()
         #expect(keyboard.visible)
         #expect(field.isFirstResponder)
     }
