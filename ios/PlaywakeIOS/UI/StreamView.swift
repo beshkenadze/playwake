@@ -6,12 +6,17 @@ import SwiftUI
 struct StreamView: View {
     @ObservedObject var controller: SessionController
     @ObservedObject private var keyboardMouse = KeyboardMouse.shared
+    private let touch = TouchInput.shared
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             LowLatencyVideoView(renderer: controller.renderer)
                 .ignoresSafeArea()
+            if touchActive {
+                TouchSurface().ignoresSafeArea()
+            }
+            // With a mouse in desktop mode it takes fingers too, as the pointer.
             if padActive && keyboardMouse.mouseConnected && keyboardMouse.mode == .desktop {
                 PointerArea().ignoresSafeArea()
             }
@@ -24,6 +29,10 @@ struct StreamView: View {
                     .allowsHitTesting(false)
             }
             VirtualPadButtons()
+            if touchActive {
+                StreamMenuButton { controller.openMenu() }
+            }
+            SoftKeyboardField().frame(width: 0, height: 0)
             // Shown while connecting too: View+Menu opens the route's menu and
             // pauses the pad, so the menu must be visible whenever it is open.
             if controller.menuOpen {
@@ -38,23 +47,28 @@ struct StreamView: View {
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture {
+        // With touch, a tap on the video clicks and the menu has its button;
+        // a tap gesture here would hold back the fingers' lift.
+        .gesture(TapGesture().onEnded {
             // A mouse click belongs to the stream; Cmd+K opens the menu.
             guard controller.firstFrame, !keyboardMouse.mouseConnected else { return }
             controller.menuOpen ? controller.closeMenu() : controller.openMenu()
-        }
+        }, including: touchActive ? .subviews : .all)
         .background { shortcuts }
         .onAppear {
             VirtualPad.shared.setActive(padActive)
             keyboardMouse.setStreamActive(padActive)
+            touch.setStreamActive(padActive)
         }
         .onChange(of: padActive) { _, active in
             VirtualPad.shared.setActive(active)
             keyboardMouse.setStreamActive(active)
+            touch.setStreamActive(active)
         }
         .onDisappear {
             VirtualPad.shared.setActive(false)
             keyboardMouse.setStreamActive(false)
+            touch.setStreamActive(false)
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -62,6 +76,8 @@ struct StreamView: View {
 
     /// The on-screen pad would cover the menu, which takes taps instead.
     private var padActive: Bool { controller.firstFrame && !controller.menuOpen }
+
+    private var touchActive: Bool { padActive && TouchInput.supported }
 
     /// Keyboard shortcuts (Mac, iPad with a keyboard).
     private var shortcuts: some View {
@@ -156,6 +172,7 @@ private struct StatsHUD: View {
 private struct StreamMenu: View {
     @ObservedObject var controller: SessionController
     @ObservedObject private var keyboardMouse = KeyboardMouse.shared
+    @ObservedObject private var touch = TouchInput.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -166,6 +183,22 @@ private struct StreamMenu: View {
             }
             .padding(.horizontal, 6)
             .padding(.bottom, 8)
+            // A phone in landscape is too short for every row: they scroll there.
+            ViewThatFits(in: .vertical) {
+                rows
+                ScrollView { rows }
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+        .frame(maxHeight: 480)
+        .background(.ultraThinMaterial.opacity(0.9), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .background(Color(hex: 0x1C1F1E).opacity(0.6), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Color.white.opacity(0.1)))
+    }
+
+    private var rows: some View {
+        VStack(alignment: .leading, spacing: 4) {
             row(.resume, "Resume")
             row(.guide, "Xbox Guide")
             row(.statistics, "Statistics") {
@@ -175,22 +208,31 @@ private struct StreamMenu: View {
             row(.mouse, "Mouse") {
                 Text(keyboardMouse.mode == .game ? "Game" : "Desktop").foregroundStyle(Theme.muted)
             }
+            if TouchInput.supported {
+                // Touch only, so outside `MenuItem`, which the gamepad steps through.
+                button("Touch", selected: false, action: touch.toggleMode) {
+                    Text(touch.mode == .trackpad ? "Trackpad" : "Direct").foregroundStyle(Theme.muted)
+                }
+                button("Keyboard", selected: false, action: {
+                    SoftKeyboard.shared.show()
+                    controller.closeMenu()
+                })
+            }
             row(.reconnect, "Reconnect")
             Spacer(minLength: 12)
             row(.end, "End stream", danger: true)
         }
-        .padding(16)
-        .frame(width: 300)
-        .frame(maxHeight: 420)
-        .background(.ultraThinMaterial.opacity(0.9), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .background(Color(hex: 0x1C1F1E).opacity(0.6), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Color.white.opacity(0.1)))
     }
 
     private func row(_ item: SessionController.MenuItem, _ title: String, danger: Bool = false,
                      @ViewBuilder trailing: () -> some View = { EmptyView() }) -> some View {
         let selected = SessionController.MenuItem.allCases.firstIndex(of: item) == controller.menuSelection
-        return Button { controller.perform(item) } label: {
+        return button(title, selected: selected, danger: danger, action: { controller.perform(item) }, trailing: trailing)
+    }
+
+    private func button(_ title: String, selected: Bool, danger: Bool = false, action: @escaping () -> Void,
+                        @ViewBuilder trailing: () -> some View = { EmptyView() }) -> some View {
+        Button(action: action) {
             HStack {
                 Text(title)
                 Spacer()
