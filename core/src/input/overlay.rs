@@ -89,9 +89,10 @@ impl Default for Layout {
                 (Spot::LeftThumb, 0.07, 0.95, 0.09), (Spot::RightThumb, 0.93, 0.95, 0.09),
             ]),
             landscape: pad(&[
-                (Spot::LeftTrigger, 0.07, 0.17, 0.15), (Spot::LeftBumper, 0.20, 0.17, 0.15),
-                (Spot::View, 0.40, 0.14, 0.11), (Spot::Guide, 0.50, 0.14, 0.11), (Spot::Menu, 0.60, 0.14, 0.11),
-                (Spot::RightBumper, 0.80, 0.17, 0.15), (Spot::RightTrigger, 0.93, 0.17, 0.15),
+                // Below the stream menu button in the top left corner.
+                (Spot::LeftTrigger, 0.07, 0.23, 0.15), (Spot::LeftBumper, 0.20, 0.23, 0.15),
+                (Spot::View, 0.40, 0.19, 0.11), (Spot::Guide, 0.50, 0.19, 0.11), (Spot::Menu, 0.60, 0.19, 0.11),
+                (Spot::RightBumper, 0.80, 0.23, 0.15), (Spot::RightTrigger, 0.93, 0.23, 0.15),
                 (Spot::LeftStick, 0.14, 0.55, 0.40), (Spot::LeftThumb, 0.30, 0.42, 0.12),
                 (Spot::Dpad, 0.32, 0.80, 0.30),
                 (Spot::Y, 0.88, 0.375, 0.14), (Spot::X, 0.805, 0.52, 0.14),

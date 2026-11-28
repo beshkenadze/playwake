@@ -77,8 +77,14 @@ final class Gamepad {
             let changed = overlay != newValue
             overlay = newValue
             lock.unlock()
-            if changed { handlerQueue.async { [weak self] in self?.onChange?() } }
+            if changed { self.changed() }
         }
+    }
+
+    /// Input outside the controller changed (the on-screen pad in the core):
+    /// the stream sends at once instead of at its next tick.
+    func changed() {
+        handlerQueue.async { [weak self] in self?.onChange?() }
     }
     private var observing = false
     private var discoveryTimer: DispatchSourceTimer?

@@ -100,7 +100,7 @@ final class TouchInput: ObservableObject {
     }
 
     /// 0…1; a finger without force sensing presses fully.
-    private static func pressure(of touch: UITouch) -> Float {
+    static func pressure(of touch: UITouch) -> Float {
         touch.maximumPossibleForce > 0 ? Float(touch.force / touch.maximumPossibleForce) : 1
     }
 }

@@ -1,12 +1,13 @@
 import XCTest
 
+/// The system on-screen pad; Playwake's own is `TouchPadUITests`.
 final class VirtualPadUITests: XCTestCase {
     /// Touches on the on-screen pad play the game; only touches elsewhere
     /// open the stream menu.
     @MainActor
     func testViewAndMenuShowWithThePad() {
         let app = XCUIApplication()
-        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "always"]
+        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "always", "-virtualPadStyle", "system"]
         app.launch()
         XCTAssertTrue(app.buttons["View"].waitForExistence(timeout: 20), "the on-screen pad did not appear")
         XCTAssertTrue(app.buttons["Menu"].exists)
@@ -19,7 +20,7 @@ final class VirtualPadUITests: XCTestCase {
     @MainActor
     func testPadHiddenWhenSetToNever() {
         let app = XCUIApplication()
-        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "never"]
+        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "never", "-virtualPadStyle", "system"]
         app.launch()
         let stats = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'fps'")).firstMatch
         XCTAssertTrue(stats.waitForExistence(timeout: 20), "the stream did not open")
@@ -30,7 +31,7 @@ final class VirtualPadUITests: XCTestCase {
     func testPadTouchesDoNotOpenTheStreamMenu() {
         XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()
-        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "always"]
+        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "always", "-virtualPadStyle", "system"]
         app.launch()
 
         let view = app.buttons["View"]

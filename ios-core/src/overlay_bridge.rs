@@ -42,6 +42,23 @@ pub unsafe extern "C" fn pw_overlay_set_layout(json: *const c_char) -> *mut c_ch
     result
 }
 
+/// `json` with its values in range, or the default pad if it is no layout.
+/// Release the result with `pw_free_string`.
+///
+/// # Safety
+/// `json` must be a valid C string, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pw_overlay_normalize(json: *const c_char) -> *mut c_char {
+    layout_pointer(&unsafe { read_layout(json) })
+}
+
+/// What an element's `size` is a fraction of on a surface of `width` by
+/// `height` points.
+#[unsafe(no_mangle)]
+pub extern "C" fn pw_overlay_unit(width: f32, height: f32) -> f32 {
+    Surface { width, height }.unit()
+}
+
 /// The default pad as JSON. Release the result with `pw_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn pw_overlay_default_layout() -> *mut c_char {
@@ -162,6 +179,16 @@ mod tests {
         unsafe { crate::input_bridge::pw_input_pad(&mut pad, 8.0) };
         assert_eq!(pad.buttons, 0, "released");
         pw_overlay_surface(0.0, 0.0);
+    }
+
+    #[test]
+    fn normalize_and_unit_need_no_state() {
+        let default = take(pw_overlay_default_layout());
+        assert_eq!(take(unsafe { pw_overlay_normalize(layout("[]").as_ptr()) }), default);
+        let used = Layout::from_json(&take(unsafe { pw_overlay_normalize(layout(r#"{"dead_zone": 3}"#).as_ptr()) }));
+        assert_eq!(used.dead_zone, 0.9);
+        assert_eq!(pw_overlay_unit(402.0, 778.0), 402.0);
+        assert_eq!(pw_overlay_unit(1376.0, 990.0), 480.0);
     }
 
     #[test]

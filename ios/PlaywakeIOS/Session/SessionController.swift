@@ -42,11 +42,12 @@ final class SessionController: ObservableObject {
 
     /// In the order the menu shows them.
     enum MenuItem: CaseIterable {
-        case resume, guide, statistics, mouse, touch, keyboard, reconnect, end
+        case resume, guide, statistics, mouse, touch, keyboard, controls, reconnect, end
 
-        /// The rows shown: Touch and Keyboard only while the stream takes touches.
-        static func shown(touches: Bool) -> [MenuItem] {
-            allCases.filter { touches || ($0 != .touch && $0 != .keyboard) }
+        /// The rows shown: Touch and Keyboard only while the stream takes
+        /// touches, the on-screen pad's editor only with Playwake's pad.
+        static func shown(touches: Bool, customPad: Bool = false) -> [MenuItem] {
+            allCases.filter { (touches || ($0 != .touch && $0 != .keyboard)) && (customPad || $0 != .controls) }
         }
     }
 
@@ -75,6 +76,8 @@ final class SessionController: ObservableObject {
     /// False until the first decoded frame; the connecting screen covers the video.
     @Published private(set) var firstFrame = false
     @Published private(set) var menuOpen = false
+    /// The on-screen pad's editor is over the open menu.
+    @Published var editingPad = false
     @Published var menuSelection = 0
     @Published var playoutMs: Int
     @Published var vsyncOn: Bool
@@ -251,7 +254,10 @@ final class SessionController: ObservableObject {
     /// on a touch screen.
     var streamTakesTouches: Bool { pcStream && TouchInput.supported }
 
-    var menuItems: [MenuItem] { MenuItem.shown(touches: streamTakesTouches) }
+    var menuItems: [MenuItem] {
+        MenuItem.shown(touches: streamTakesTouches,
+                       customPad: VirtualPad.supported && VirtualPad.Style.stored() == .custom)
+    }
 
     func perform(_ item: MenuItem) {
         switch item {
@@ -263,6 +269,7 @@ final class SessionController: ObservableObject {
         case .keyboard:
             SoftKeyboard.shared.show()
             closeMenu()
+        case .controls: editingPad = true
         case .reconnect: reconnect()
         case .end: stop()
         }

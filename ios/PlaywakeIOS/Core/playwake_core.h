@@ -206,6 +206,10 @@ typedef struct {
 /// Puts `json` in use (the default pad if it is no layout) and returns the layout
 /// in use, values in range; lets go of every finger. Free with pw_free_string.
 char *pw_overlay_set_layout(const char *json);
+/// `json` with values in range (the default pad if it is no layout). Free with pw_free_string.
+char *pw_overlay_normalize(const char *json);
+/// What an element's `size` is a fraction of on a `width` by `height` surface.
+float pw_overlay_unit(float width, float height);
 /// The default pad as JSON. Free with pw_free_string.
 char *pw_overlay_default_layout(void);
 /// The surface in points; a new size lets go of every finger.

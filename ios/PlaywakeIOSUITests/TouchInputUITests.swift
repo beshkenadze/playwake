@@ -12,7 +12,8 @@ final class TouchInputUITests: XCTestCase {
     @MainActor
     private func launch(touch: String = "trackpad", pad: String = "never", extra: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = ["-uiFixture", "pcstream", "-virtualPad", pad, "-touchMode", touch, "-inputJournal"] + extra
+        app.launchArguments = ["-uiFixture", "pcstream", "-virtualPad", pad, "-virtualPadStyle", "system",
+                              "-touchMode", touch, "-inputJournal"] + extra
         app.launch()
         XCTAssertTrue(app.otherElements["touchSurface"].waitForExistence(timeout: 20), "the stream did not take touches")
         return app

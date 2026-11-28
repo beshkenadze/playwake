@@ -1,9 +1,10 @@
 import GameController
 import SwiftUI
 
-/// The system on-screen gamepad (`GCVirtualController`) shown over a stream.
-/// It appears to the app as an ordinary `GCController`, so `Gamepad` reads it
-/// like a physical pad.
+/// The on-screen gamepad over a stream: the system one (`GCVirtualController`),
+/// which appears to the app as an ordinary `GCController`, so `Gamepad` reads
+/// it like a physical pad, or Playwake's own (`TouchPad`), which the core
+/// works out and mixes into the pad.
 @MainActor
 final class VirtualPad: ObservableObject {
     enum Mode: String {
@@ -13,6 +14,16 @@ final class VirtualPad: ObservableObject {
 
         static func stored(_ defaults: UserDefaults = .standard) -> Mode {
             defaults.string(forKey: key).flatMap(Mode.init(rawValue:)) ?? .auto
+        }
+    }
+
+    enum Style: String {
+        case custom, system
+
+        static let key = "virtualPadStyle"
+
+        static func stored(_ defaults: UserDefaults = .standard) -> Style {
+            defaults.string(forKey: key).flatMap(Style.init(rawValue:)) ?? .custom
         }
     }
 
@@ -48,6 +59,8 @@ final class VirtualPad: ObservableObject {
     }()
     private var active = false
     @Published private(set) var connected = false
+    /// Playwake's own pad is on screen.
+    @Published private(set) var customShown = false
     private var connecting = false
 
     private init() {
@@ -73,8 +86,19 @@ final class VirtualPad: ObservableObject {
     /// disconnects rather than hides: `Gamepad` adopts a pad only when it
     /// connects, so showing again must connect again.
     private func reconcile() {
-        guard Self.supported, !connecting else { return }
+        guard Self.supported else { return }
         let show = Self.shouldShow(mode: .stored(), active: active, physicalPad: physicalPad)
+        let custom = show && Style.stored() == .custom
+        if custom != customShown {
+            customShown = custom
+            // Fingers on it when it hides stay out until they lift.
+            if !custom { TouchPad.shared.release() }
+        }
+        reconcileSystem(show: show && !custom)
+    }
+
+    private func reconcileSystem(show: Bool) {
+        guard !connecting else { return }
         if show && !connected {
             connecting = true
             pad.connect { error in
