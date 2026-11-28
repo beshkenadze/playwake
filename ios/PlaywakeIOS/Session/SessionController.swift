@@ -275,6 +275,13 @@ final class SessionController: ObservableObject {
         }
     }
 
+    /// Whether the pad editor stays over the menu after route `events`:
+    /// controller keys do not move the menu under it, Back closes it, and it
+    /// goes with the menu.
+    static func editorStays(after events: UInt32, menuOpen: Bool) -> Bool {
+        menuOpen && events & UInt32(PW_ROUTE_KEY_BACK) == 0
+    }
+
     private func handleMenu(_ events: UInt32) {
         if events & UInt32(PW_ROUTE_MENU_OPENED) != 0 {
             menuOpen = true
@@ -282,6 +289,10 @@ final class SessionController: ObservableObject {
         }
         if events & UInt32(PW_ROUTE_MENU_CLOSED) != 0 {
             menuOpen = false
+        }
+        if editingPad {
+            editingPad = Self.editorStays(after: events, menuOpen: menuOpen)
+            return
         }
         let items = menuItems
         let count = items.count

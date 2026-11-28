@@ -85,15 +85,16 @@ pub extern "C" fn pw_overlay_touch(id: u32, phase: u32, x: f32, y: f32, pressure
     with(|input, pc| input.overlay_touch(pc, id, phase, x, y, pressure))
 }
 
-/// Fills `look` for the element at `index` of the layout in use.
+/// Fills `look`, which may be uninitialised, for the element at `index` of
+/// the layout in use.
 ///
 /// # Safety
-/// `look` must be valid, or null.
+/// `look` must be valid for writes, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pw_overlay_look(index: u32, look: *mut PwOverlayLook) {
-    let Some(look) = (unsafe { look.as_mut() }) else { return };
+    if look.is_null() { return; }
     let now = with(|input, _| input.overlay().look(index as usize));
-    *look = PwOverlayLook { pressed: now.pressed, x: now.x, y: now.y };
+    unsafe { look.write(PwOverlayLook { pressed: now.pressed, x: now.x, y: now.y }) };
 }
 
 /// Lets go of every finger on the pad, as it hides: they stay out until they lift.
@@ -189,6 +190,22 @@ mod tests {
         assert_eq!(used.dead_zone, 0.9);
         assert_eq!(pw_overlay_unit(402.0, 778.0), 402.0);
         assert_eq!(pw_overlay_unit(1376.0, 990.0), 480.0);
+    }
+
+    #[test]
+    fn a_new_route_starts_with_the_pad_let_go() {
+        let _global = global();
+        unsafe { crate::input_route::pw_route_free(crate::input_route::pw_route_new()) };
+        unsafe { pw_overlay_set_layout(std::ptr::null()) };
+        pw_overlay_surface(750.0, 381.0);
+        let (x, y) = (0.88 * 750.0, 0.665 * 381.0);
+        pw_overlay_touch(9, PW_INPUT_PHASE_BEGAN, x, y, 0.0);
+        let route = crate::input_route::pw_route_new();
+        let mut pad = PwPad { axes: [0; 4], buttons: 0, lt: 0, rt: 0 };
+        unsafe { crate::input_bridge::pw_input_pad(&mut pad, 0.0) };
+        assert_eq!(pad.buttons, 0, "A held through the last stream reached the new one");
+        unsafe { crate::input_route::pw_route_free(route) };
+        pw_overlay_surface(0.0, 0.0);
     }
 
     #[test]

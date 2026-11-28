@@ -114,6 +114,7 @@ final class TouchPadUITests: XCTestCase {
         let center = stick.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         center.press(forDuration: 0.3, thenDragTo: center.withOffset(CGVector(dx: 50, dy: -20)))
         XCTAssertTrue(waitForJournal(app, toContain: "pad Left stick down"), journal(app))
+        XCTAssertTrue(waitForJournal(app, toContain: "pad Left stick leans right"), "the stick did not lean: \(journal(app))")
         XCTAssertTrue(waitForJournal(app, toContain: "pad Left stick up"), journal(app))
     }
 

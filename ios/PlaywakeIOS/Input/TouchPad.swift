@@ -149,6 +149,17 @@ final class TouchPad: ObservableObject {
         refresh()
     }
 
+    #if DEBUG
+    /// Where a stick leans more than half way, for the input journal.
+    private static func way(_ look: pw_look) -> String? {
+        if abs(look.x) >= abs(look.y) {
+            look.x > 0.5 ? "right" : look.x < -0.5 ? "left" : nil
+        } else {
+            look.y > 0.5 ? "down" : look.y < -0.5 ? "up" : nil
+        }
+    }
+    #endif
+
     private func refresh() {
         let count = elements.count
         let next = (0..<count).map { index in
@@ -158,9 +169,12 @@ final class TouchPad: ObservableObject {
         }
         #if DEBUG
         for (index, element) in elements.enumerated() {
-            let was = index < looks.count && looks[index].pressed
-            if was != next[index].pressed {
+            let old = index < looks.count ? looks[index] : pw_look()
+            if old.pressed != next[index].pressed {
                 InputJournal.shared.write("pad \(element.name) \(next[index].pressed ? "down" : "up")")
+            }
+            if element.type == "stick", let way = Self.way(next[index]), way != Self.way(old) {
+                InputJournal.shared.write("pad \(element.name) leans \(way)")
             }
         }
         #endif

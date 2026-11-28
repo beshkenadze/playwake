@@ -55,6 +55,13 @@ struct TouchPadTests {
         #expect(!SessionController.MenuItem.shown(touches: true).contains(.controls))
     }
 
+    @Test func theEditorHoldsTheMenuKeysAndGoesWithBackOrTheMenu() {
+        let next = UInt32(PW_ROUTE_KEY_NEXT) | UInt32(PW_ROUTE_KEY_ACTIVATE)
+        #expect(SessionController.editorStays(after: next, menuOpen: true))
+        #expect(!SessionController.editorStays(after: UInt32(PW_ROUTE_KEY_BACK), menuOpen: true))
+        #expect(!SessionController.editorStays(after: UInt32(PW_ROUTE_MENU_CLOSED), menuOpen: false))
+    }
+
     @Test func editsGoThroughTheCoreAndStayOnTheSurface() throws {
         let json = PadLayout.defaultJSON
         let placed = try #require(PadLayout.decode(PadLayout.take(pw_overlay_place(json, 750, 381, 0, -1, 0.5, 0.2))))

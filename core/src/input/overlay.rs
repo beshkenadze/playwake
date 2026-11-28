@@ -252,6 +252,9 @@ pub struct Overlay {
     layout: Layout,
     surface: Surface,
     fingers: BTreeMap<u32, Finger>,
+    /// Buttons pressed since the last `sample`, so a tap between two
+    /// samples still shows in one.
+    latched: u16,
 }
 
 impl Overlay {
@@ -321,6 +324,7 @@ impl Overlay {
             Phase::Ended | Phase::Cancelled => { self.fingers.remove(&id); }
         }
         let haptic = self.presses().difference(&before.0).next().is_some();
+        self.latched |= self.state().buttons;
         Change { events: changes(&before.1, &self.held()), haptic }
     }
 
@@ -329,7 +333,16 @@ impl Overlay {
     pub fn release_all(&mut self) -> Vec<InputEvent> {
         let held = self.held();
         self.fingers.clear();
+        self.latched = 0;
         changes(&held, &BTreeSet::new())
+    }
+
+    /// The state for the next packet: `state` with the buttons tapped since
+    /// the last sample. Call it once each input tick.
+    pub fn sample(&mut self) -> Routed {
+        let mut routed = self.state();
+        routed.buttons |= std::mem::take(&mut self.latched);
+        routed
     }
 
     /// The gamepad the fingers hold: axes with `y` down, triggers 0…65535.
@@ -559,6 +572,20 @@ mod tests {
         assert_eq!(overlay.state().buttons, A);
         overlay.touch(1, Phase::Ended, x, y, 1.0);
         assert_eq!(overlay.state(), Routed { axes: [0; 4], buttons: 0, lt: 0, rt: 0 });
+    }
+
+    #[test]
+    fn a_tap_between_two_samples_shows_in_one() {
+        let mut overlay = overlay(PHONE_LANDSCAPE);
+        let (x, y) = at(&overlay, &button(Target::A));
+        overlay.touch(1, Phase::Began, x, y, 1.0);
+        overlay.touch(1, Phase::Ended, x, y, 1.0);
+        assert_eq!(overlay.state().buttons, 0);
+        assert_eq!(overlay.sample().buttons, A);
+        assert_eq!(overlay.sample().buttons, 0, "only once");
+        overlay.touch(2, Phase::Began, x, y, 1.0);
+        overlay.release_all();
+        assert_eq!(overlay.sample().buttons, 0, "letting go forgets the tap");
     }
 
     #[test]

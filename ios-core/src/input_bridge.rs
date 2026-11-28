@@ -246,7 +246,7 @@ impl Input {
     /// Mixes the keyboard-and-mouse pad and the on-screen pad into `pad`.
     fn pad(&mut self, pad: &mut PwPad, now: f64) {
         mix(pad, self.pad.state(now));
-        mix(pad, self.overlay.state());
+        mix(pad, self.overlay.sample());
     }
 
     /// The on-screen pad's keys and mouse buttons, from the panel.
@@ -312,12 +312,13 @@ fn locked<R, S: Sink>(input: &Mutex<Input>, stream: impl FnOnce() -> Option<(u64
     f(&mut input, stream.as_ref().map(|(session, stream)| (*session, &**stream)))
 }
 
-/// A new stream's route: its gate starts open, and an older route's menu
-/// no longer moves it.
+/// A new stream's route: its gate starts open, an older route's menu no
+/// longer moves it, and the on-screen pad holds nothing from the last stream.
 pub(crate) fn route_started(route: usize) {
     with(|input, pc| {
         input.route = route;
         input.menu(pc, false);
+        input.overlay_release(pc);
     });
 }
 
