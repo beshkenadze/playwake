@@ -2,14 +2,16 @@
 //! PC stream the core sends it as GameStream packets (`PcInput`); without
 //! one it becomes a gamepad (`PadFromKeys`) that the Xbox stream mixes into
 //! its controller with `pw_input_pad` before the stream-input route.
-//! Every call is safe from any thread.
+//! While the route's menu is open (`menu`) the gate is shut: input calls
+//! change nothing. Every call is safe from any thread.
 
 use crate::bridge::{lock, read_string};
 use crate::input_route::PwPad;
 use crate::pc_bridge;
 use playwake_core::gamestream;
 use playwake_core::input::{
-    Gesture, InputEvent, MouseButton, PadFromKeys, PadLayout, PcInput, Phase, Sink, Touch, Trackpad, Usage,
+    char_usage, Device, Gesture, InputEvent, MouseButton, PadFromKeys, PadLayout, PcInput, Phase, Sink, Touch,
+    Trackpad, Usage,
 };
 use std::collections::BTreeMap;
 use std::os::raw::c_char;
@@ -35,6 +37,16 @@ pub const PW_INPUT_PHASE_MOVED: u32 = 1;
 pub const PW_INPUT_PHASE_ENDED: u32 = 2;
 pub const PW_INPUT_PHASE_CANCELLED: u32 = 3;
 
+/// Where a key or button comes from: the host hears it let go only once no
+/// source holds it. Touch is the core's own, from `pw_input_touch`.
+pub const PW_INPUT_SOURCE_KEYBOARD: u32 = 0;
+pub const PW_INPUT_SOURCE_MOUSE: u32 = 1;
+/// The on-screen key bar and keyboard.
+pub const PW_INPUT_SOURCE_PANEL: u32 = 2;
+
+/// Set in `pw_input_char_usage`'s result: the character takes Shift.
+pub const PW_INPUT_CHAR_SHIFT: u32 = 1 << 16;
+
 /// Returned by `pw_input_touch`: three fingers asked for the on-screen keyboard.
 pub const PW_INPUT_SHOW_KEYBOARD: u32 = 1 << 0;
 
@@ -45,6 +57,8 @@ const KEYBOARD_PAGE: u16 = 0x07;
 type Pc<'a, S> = Option<(u64, &'a S)>;
 
 struct Input {
+    /// The route's menu is open: input waits, nothing is held.
+    paused: bool,
     desktop: bool,
     direct: bool,
     /// The PC session `pc` holds keys and buttons for; `None` without one.
@@ -61,6 +75,7 @@ struct Input {
 impl Default for Input {
     fn default() -> Self {
         Self {
+            paused: false,
             desktop: false,
             direct: false,
             session: None,
@@ -89,11 +104,19 @@ impl Input {
         pc.map(|(_, sink)| sink)
     }
 
-    fn send<S: Sink>(&mut self, pc: Pc<S>, event: InputEvent) {
+    fn send<S: Sink>(&mut self, pc: Pc<S>, device: Device, event: InputEvent) {
+        if self.paused { return; }
         match self.sync(pc) {
-            Some(sink) => self.pc.send(sink, event),
+            Some(sink) => self.pc.send(sink, device, event),
             None => self.pad.event(&event),
         }
+    }
+
+    /// Shuts the gate as the route's menu opens, letting go of everything
+    /// in the same step, and opens it as the menu closes.
+    fn menu<S: Sink>(&mut self, pc: Pc<S>, open: bool) {
+        if open && !self.paused { self.release_all(pc); }
+        self.paused = open;
     }
 
     fn mode<S: Sink>(&mut self, pc: Pc<S>, mode: u32) {
@@ -110,22 +133,22 @@ impl Input {
         }
     }
 
-    fn key<S: Sink>(&mut self, pc: Pc<S>, page: u16, usage: u16, down: bool) {
+    fn key<S: Sink>(&mut self, pc: Pc<S>, device: Device, page: u16, usage: u16, down: bool) {
         if page == KEYBOARD_PAGE {
-            self.send(pc, InputEvent::Key { usage: Usage::Hid(usage), down });
+            self.send(pc, device, InputEvent::Key { usage: Usage::Hid(usage), down });
         }
     }
 
     /// A PC in desktop mode takes positions only; the Xbox pad always takes motion.
     fn mouse_move<S: Sink>(&mut self, pc: Pc<S>, dx: f32, dy: f32) {
         if !(self.desktop && pc.is_some()) {
-            self.send(pc, InputEvent::MouseMove { dx, dy });
+            self.send(pc, Device::Mouse, InputEvent::MouseMove { dx, dy });
         }
     }
 
     fn mouse_position<S: Sink>(&mut self, pc: Pc<S>, x: f32, y: f32) {
         if self.desktop && pc.is_some() {
-            self.send(pc, InputEvent::MousePosition { x, y });
+            self.send(pc, Device::Mouse, InputEvent::MousePosition { x, y });
         }
     }
 
@@ -138,6 +161,7 @@ impl Input {
 
     fn touch<S: Sink>(&mut self, pc: Pc<S>, touch: Touch, now: f64) -> u32 {
         let Touch { id, phase, x, y, pressure } = touch;
+        if self.paused { return 0; }
         // First, so a new stream's reset cannot cut a gesture short.
         let sink = self.sync(pc);
         if !self.direct {
@@ -152,7 +176,7 @@ impl Input {
                     Phase::Moved => self.touches.get_mut(&id).map(|point| *point = (x, y)).is_some(),
                     Phase::Ended | Phase::Cancelled => self.touches.remove(&id).is_some(),
                 };
-                if known { self.pc.send(sink, InputEvent::Touch { id, phase, x, y, pressure }); }
+                if known { self.pc.send(sink, Device::Touch, InputEvent::Touch { id, phase, x, y, pressure }); }
             }
             Some(sink) => self.touch_mouse(sink, id, phase, x, y),
             // An Xbox has no pointer to touch with.
@@ -163,7 +187,7 @@ impl Input {
 
     /// The first finger as the mouse: it presses the left button where it lands.
     fn touch_mouse<S: Sink>(&mut self, sink: &S, id: u32, phase: Phase, x: f32, y: f32) {
-        let mut send = |event| self.pc.send(sink, event);
+        let mut send = |event| self.pc.send(sink, Device::Touch, event);
         match (phase, self.finger) {
             (Phase::Began, None) => {
                 self.finger = Some(id);
@@ -183,7 +207,7 @@ impl Input {
     fn gestures<S: Sink>(&mut self, pc: Pc<S>, gestures: Vec<Gesture>) -> u32 {
         gestures.into_iter().fold(0, |shown, gesture| match gesture {
             Gesture::Input(event) => {
-                self.send(pc, event);
+                self.send(pc, Device::Touch, event);
                 shown
             }
             Gesture::Keyboard => shown | PW_INPUT_SHOW_KEYBOARD,
@@ -197,7 +221,7 @@ impl Input {
         match self.sync(pc) {
             Some(sink) => {
                 for (id, (x, y)) in std::mem::take(&mut self.touches) {
-                    self.pc.send(sink, InputEvent::Touch { id, phase: Phase::Cancelled, x, y, pressure: 0.0 });
+                    self.pc.send(sink, Device::Touch, InputEvent::Touch { id, phase: Phase::Cancelled, x, y, pressure: 0.0 });
                 }
                 self.pc.release_all(sink);
             }
@@ -235,6 +259,27 @@ fn locked<R, S: Sink>(input: &Mutex<Input>, stream: impl FnOnce() -> Option<(u64
     f(&mut input, stream.as_ref().map(|(session, stream)| (*session, &**stream)))
 }
 
+/// Opens or shuts the input gate with the route's menu.
+pub(crate) fn menu(open: bool) {
+    with(|input, pc| input.menu(pc, open));
+}
+
+/// Serialises the tests that use the global input state.
+#[cfg(test)]
+pub(crate) fn global() -> std::sync::MutexGuard<'static, ()> {
+    static GLOBAL: Mutex<()> = Mutex::new(());
+    lock(&GLOBAL)
+}
+
+fn source(source: u32) -> Option<Device> {
+    Some(match source {
+        PW_INPUT_SOURCE_KEYBOARD => Device::Keyboard,
+        PW_INPUT_SOURCE_MOUSE => Device::Mouse,
+        PW_INPUT_SOURCE_PANEL => Device::Panel,
+        _ => return None,
+    })
+}
+
 fn button(button: u32) -> Option<MouseButton> {
     Some(match button {
         PW_INPUT_BUTTON_LEFT => MouseButton::Left,
@@ -264,10 +309,20 @@ pub extern "C" fn pw_input_mode(mode: u32) {
     with(|input, pc| input.mode(pc, mode));
 }
 
-/// A key by its HID usage; only the keyboard page (0x07) is taken.
+/// A key by its HID usage from a `PW_INPUT_SOURCE_*`; only the keyboard
+/// page (0x07) is taken.
 #[unsafe(no_mangle)]
-pub extern "C" fn pw_input_key(usage_page: u16, usage: u16, down: bool) {
-    with(|input, pc| input.key(pc, usage_page, usage, down));
+pub extern "C" fn pw_input_key(source: u32, usage_page: u16, usage: u16, down: bool) {
+    let Some(device) = self::source(source) else { return };
+    with(|input, pc| input.key(pc, device, usage_page, usage, down));
+}
+
+/// The HID usage that types the Unicode scalar `c` on a US keyboard, with
+/// `PW_INPUT_CHAR_SHIFT` if it takes Shift; 0 for none.
+#[unsafe(no_mangle)]
+pub extern "C" fn pw_input_char_usage(c: u32) -> u32 {
+    char::from_u32(c).and_then(char_usage)
+        .map_or(0, |(usage, shift)| u32::from(usage) | if shift { PW_INPUT_CHAR_SHIFT } else { 0 })
 }
 
 /// Types UTF-8 `text` on a PC.
@@ -277,7 +332,7 @@ pub extern "C" fn pw_input_key(usage_page: u16, usage: u16, down: bool) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pw_input_text(text: *const c_char) {
     let Some(text) = (unsafe { read_string(text) }) else { return };
-    with(|input, pc| input.send(pc, InputEvent::Text(text)));
+    with(|input, pc| input.send(pc, Device::Panel, InputEvent::Text(text)));
 }
 
 /// Relative mouse motion in host pixels, `dy` positive down. A PC in
@@ -294,17 +349,17 @@ pub extern "C" fn pw_input_mouse_position(x: f32, y: f32) {
     with(|input, pc| input.mouse_position(pc, x, y));
 }
 
-/// A `PW_INPUT_BUTTON_*` pressed or released.
+/// A `PW_INPUT_BUTTON_*` pressed or released by a `PW_INPUT_SOURCE_*`.
 #[unsafe(no_mangle)]
-pub extern "C" fn pw_input_mouse_button(button: u32, down: bool) {
-    let Some(button) = self::button(button) else { return };
-    with(|input, pc| input.send(pc, InputEvent::MouseButton { button, down }));
+pub extern "C" fn pw_input_mouse_button(source: u32, button: u32, down: bool) {
+    let (Some(device), Some(button)) = (self::source(source), self::button(button)) else { return };
+    with(|input, pc| input.send(pc, device, InputEvent::MouseButton { button, down }));
 }
 
 /// Wheel notches, fractions allowed: `dy` positive scrolls up, `dx` right.
 #[unsafe(no_mangle)]
 pub extern "C" fn pw_input_scroll(dx: f32, dy: f32) {
-    with(|input, pc| input.send(pc, InputEvent::Scroll { dx, dy }));
+    with(|input, pc| input.send(pc, Device::Mouse, InputEvent::Scroll { dx, dy }));
 }
 
 /// The touch surface in points, for the trackpad's distances.
@@ -404,9 +459,9 @@ mod tests {
     fn pc_keys_carry_held_modifiers_and_other_pages_are_ignored() {
         let (host, mut input) = (Host::default(), Input::default());
         let pc = Some((1, &host));
-        input.key(pc, KEYBOARD_PAGE, SHIFT, true);
-        input.key(pc, KEYBOARD_PAGE, A, true);
-        input.key(pc, 0x0C, A, true);
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, SHIFT, true);
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, A, true);
+        input.key(pc, Device::Keyboard, 0x0C, A, true);
         assert_eq!(host.take(), [Call::Key(0xA0, true, 1), Call::Key(0x41, true, 1)]);
     }
 
@@ -427,7 +482,7 @@ mod tests {
     fn a_mode_change_lets_go_of_held_buttons() {
         let (host, mut input) = (Host::default(), Input::default());
         let pc = Some((1, &host));
-        input.send(pc, InputEvent::MouseButton { button: MouseButton::Left, down: true });
+        input.send(pc, Device::Mouse, InputEvent::MouseButton { button: MouseButton::Left, down: true });
         host.take();
         input.mode(pc, PW_INPUT_DESKTOP);
         assert_eq!(host.take(), [Call::Button(MouseButton::Left, false)]);
@@ -439,8 +494,8 @@ mod tests {
     fn release_all_lets_go_of_keys_and_buttons() {
         let (host, mut input) = (Host::default(), Input::default());
         let pc = Some((1, &host));
-        input.key(pc, KEYBOARD_PAGE, A, true);
-        input.send(pc, InputEvent::MouseButton { button: MouseButton::Right, down: true });
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, A, true);
+        input.send(pc, Device::Mouse, InputEvent::MouseButton { button: MouseButton::Right, down: true });
         host.take();
         input.release_all(pc);
         assert_eq!(host.take(), [Call::Key(0x41, false, 0), Call::Button(MouseButton::Right, false)]);
@@ -449,10 +504,10 @@ mod tests {
     #[test]
     fn a_new_stream_starts_with_nothing_held() {
         let (old, new, mut input) = (Host::default(), Host::default(), Input::default());
-        input.key(Some((1, &old)), KEYBOARD_PAGE, SHIFT, true);
+        input.key(Some((1, &old)), Device::Keyboard, KEYBOARD_PAGE, SHIFT, true);
         // Shift is let go while no PC stream runs.
-        input.key(XBOX, KEYBOARD_PAGE, SHIFT, false);
-        input.key(Some((2, &new)), KEYBOARD_PAGE, A, true);
+        input.key(XBOX, Device::Keyboard, KEYBOARD_PAGE, SHIFT, false);
+        input.key(Some((2, &new)), Device::Keyboard, KEYBOARD_PAGE, A, true);
         assert_eq!(new.take(), [Call::Key(0x41, true, 0)]);
         input.release_all(Some((2, &new)));
         assert_eq!(new.take(), [Call::Key(0x41, false, 0)]);
@@ -461,8 +516,8 @@ mod tests {
     #[test]
     fn without_a_pc_keys_and_mouse_become_the_xbox_pad() {
         let mut input = Input::default();
-        input.key(XBOX, KEYBOARD_PAGE, W, true);
-        input.send(XBOX, InputEvent::MouseButton { button: MouseButton::Left, down: true });
+        input.key(XBOX, Device::Keyboard, KEYBOARD_PAGE, W, true);
+        input.send(XBOX, Device::Mouse, InputEvent::MouseButton { button: MouseButton::Left, down: true });
         let mut physical = PwPad { axes: [100, 0, 200, 0], buttons: 16, lt: 9, rt: 0 };
         input.pad(&mut physical, 0.0);
         assert_eq!(physical.axes, [100, -i16::MAX, 200, 0]);
@@ -484,7 +539,7 @@ mod tests {
     #[test]
     fn release_all_lets_go_of_the_xbox_pad() {
         let mut input = Input::default();
-        input.key(XBOX, KEYBOARD_PAGE, W, true);
+        input.key(XBOX, Device::Keyboard, KEYBOARD_PAGE, W, true);
         input.release_all(XBOX);
         let mut sample = pad();
         input.pad(&mut sample, 0.0);
@@ -614,25 +669,28 @@ mod tests {
     fn text_and_scroll_reach_the_pc() {
         let (host, mut input) = (Host::default(), Input::default());
         let pc = Some((1, &host));
-        input.send(pc, InputEvent::Text("hé".into()));
-        input.send(pc, InputEvent::Scroll { dx: 0.0, dy: 1.0 });
+        input.send(pc, Device::Panel, InputEvent::Text("hé".into()));
+        input.send(pc, Device::Mouse, InputEvent::Scroll { dx: 0.0, dy: 1.0 });
         assert_eq!(host.take(), [Call::Text("hé".into()), Call::Scroll(120)]);
     }
 
-    /// The only test of the global state: without a PC stream the C calls
-    /// drive the Xbox pad.
+    /// Without a PC stream the C calls drive the Xbox pad.
     #[test]
     fn c_calls_without_a_pc_drive_the_pad_and_ignore_bad_arguments() {
-        for button in [5, 99, u32::MAX] { pw_input_mouse_button(button, true); }
-        pw_input_key(0x0C, W, true);
+        let _global = global();
+        menu(false);
+        for button in [5, 99, u32::MAX] { pw_input_mouse_button(PW_INPUT_SOURCE_MOUSE, button, true); }
+        pw_input_mouse_button(7, PW_INPUT_BUTTON_LEFT, true);
+        pw_input_key(PW_INPUT_SOURCE_KEYBOARD, 0x0C, W, true);
+        pw_input_key(7, KEYBOARD_PAGE, W, true);
         assert_eq!(pw_input_touch(1, 99, 0.0, 0.0, 0.0, 0.0), 0);
         unsafe { pw_input_text(std::ptr::null()) };
         unsafe { pw_input_pad(std::ptr::null_mut(), 0.0) };
         let mut neutral = pad();
         unsafe { pw_input_pad(&mut neutral, 0.0) };
         assert_eq!((neutral.axes, neutral.buttons, neutral.lt, neutral.rt), ([0; 4], 0, 0, 0));
-        pw_input_key(KEYBOARD_PAGE, W, true);
-        pw_input_mouse_button(PW_INPUT_BUTTON_RIGHT, true);
+        pw_input_key(PW_INPUT_SOURCE_KEYBOARD, KEYBOARD_PAGE, W, true);
+        pw_input_mouse_button(PW_INPUT_SOURCE_MOUSE, PW_INPUT_BUTTON_RIGHT, true);
         let mut sample = pad();
         unsafe { pw_input_pad(&mut sample, 0.0) };
         assert_eq!(sample.axes[1], -i16::MAX);
@@ -642,5 +700,89 @@ mod tests {
         let mut sample = pad();
         unsafe { pw_input_pad(&mut sample, 1.0) };
         assert_eq!((sample.axes, sample.lt), ([0; 4], 0));
+    }
+
+    #[test]
+    fn a_route_menu_shuts_the_gate_until_it_closes_or_a_new_route_starts() {
+        let _global = global();
+        let route = crate::pw_route_new();
+        pw_input_key(PW_INPUT_SOURCE_KEYBOARD, KEYBOARD_PAGE, W, true);
+        assert_eq!(unsafe { crate::pw_route_open(route) }, crate::PW_ROUTE_MENU_OPENED);
+        let mut sample = pad();
+        unsafe { pw_input_pad(&mut sample, 0.0) };
+        assert_eq!(sample.axes, [0; 4], "the open menu did not let go of W");
+        pw_input_key(PW_INPUT_SOURCE_KEYBOARD, KEYBOARD_PAGE, W, true);
+        unsafe { pw_input_pad(&mut sample, 1.0) };
+        assert_eq!(sample.axes, [0; 4], "a key reached the pad behind the menu");
+        unsafe { crate::pw_route_close(route, false) };
+        pw_input_key(PW_INPUT_SOURCE_KEYBOARD, KEYBOARD_PAGE, W, true);
+        unsafe { pw_input_pad(&mut sample, 2.0) };
+        assert_eq!(sample.axes[1], -i16::MAX, "the closed menu kept the gate shut");
+        // A stream stopped with its menu open leaves the next one open.
+        unsafe { crate::pw_route_open(route) };
+        unsafe { crate::pw_route_free(route) };
+        let next = crate::pw_route_new();
+        pw_input_key(PW_INPUT_SOURCE_KEYBOARD, KEYBOARD_PAGE, W, true);
+        let mut sample = pad();
+        unsafe { pw_input_pad(&mut sample, 3.0) };
+        assert_eq!(sample.axes[1], -i16::MAX, "the new stream started with the gate shut");
+        pw_input_release_all();
+        unsafe { crate::pw_route_free(next) };
+    }
+
+    #[test]
+    fn the_shut_gate_lets_go_once_and_drops_input() {
+        let (host, mut input) = (Host::default(), Input::default());
+        let pc = Some((1, &host));
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, A, true);
+        host.take();
+        input.menu(pc, true);
+        input.menu(pc, true);
+        assert_eq!(host.take(), [Call::Key(0x41, false, 0)]);
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, A, true);
+        input.send(pc, Device::Mouse, InputEvent::MouseButton { button: MouseButton::Left, down: true });
+        input.mouse_move(pc, 5.0, 0.0);
+        input.mode(pc, PW_INPUT_DIRECT);
+        input.touch(pc, touch(1, Phase::Began, 0.5, 0.5), 0.0);
+        assert_eq!(host.take(), []);
+        input.menu(pc, false);
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, A, true);
+        assert_eq!(host.take(), [Call::Key(0x41, true, 0)]);
+    }
+
+    #[test]
+    fn a_direct_touch_lift_leaves_the_held_mouse_button_down() {
+        let (host, mut input) = (Host::default(), Input::default());
+        let pc = Some((1, &host));
+        input.mode(pc, PW_INPUT_DIRECT);
+        input.send(pc, Device::Mouse, InputEvent::MouseButton { button: MouseButton::Left, down: true });
+        input.touch(pc, touch(1, Phase::Began, 0.5, 0.5), 0.0);
+        input.touch(pc, touch(1, Phase::Ended, 0.5, 0.5), 0.0);
+        let left = |down| Call::Button(MouseButton::Left, down);
+        assert_eq!(host.take(), [left(true), Call::Position(16384, 16384), left(true), Call::Position(16384, 16384)]);
+        input.send(pc, Device::Mouse, InputEvent::MouseButton { button: MouseButton::Left, down: false });
+        assert_eq!(host.take(), [left(false)]);
+    }
+
+    #[test]
+    fn panel_keys_leave_the_physical_ctrl_down() {
+        let (host, mut input) = (Host::default(), Input::default());
+        let pc = Some((1, &host));
+        const CTRL: u16 = 0xE0;
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, CTRL, true);
+        for (usage, down) in [(CTRL, true), (0xE2, true), (0x4C, true), (0x4C, false), (0xE2, false), (CTRL, false)] {
+            input.key(pc, Device::Panel, KEYBOARD_PAGE, usage, down);
+        }
+        assert!(!host.take().contains(&Call::Key(0xA2, false, 0)), "the host saw Ctrl let go");
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, CTRL, false);
+        assert_eq!(host.take(), [Call::Key(0xA2, false, 0)]);
+    }
+
+    #[test]
+    fn characters_give_their_usage_and_shift() {
+        assert_eq!(pw_input_char_usage('c' as u32), 0x06);
+        assert_eq!(pw_input_char_usage('?' as u32), 0x38 | PW_INPUT_CHAR_SHIFT);
+        assert_eq!(pw_input_char_usage('é' as u32), 0);
+        assert_eq!(pw_input_char_usage(0xD800), 0);
     }
 }

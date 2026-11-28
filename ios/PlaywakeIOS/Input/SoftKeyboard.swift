@@ -80,7 +80,7 @@ final class SoftKeyboard: ObservableObject {
         guard visible else { return }
         for output in outputs {
             switch output {
-            case .key(let usage, let down): pw_input_key(KeyboardMouse.keyboardPage, usage, down)
+            case .key(let usage, let down): pw_input_key(UInt32(PW_INPUT_SOURCE_PANEL), KeyboardMouse.keyboardPage, usage, down)
             case .text(let text): pw_input_text(text)
             }
             #if DEBUG
@@ -111,7 +111,6 @@ struct StickyKeys: Equatable {
     static let escape: UInt16 = 0x29
     static let backspace: UInt16 = 0x2A
     static let tab: UInt16 = 0x2B
-    static let space: UInt16 = 0x2C
     static let delete: UInt16 = 0x4C
     static let leftShift: UInt16 = 0xE1
     static let f1: UInt16 = 0x3A
@@ -145,7 +144,7 @@ struct StickyKeys: Equatable {
     }
 
     /// Text goes as text: it types what it says whatever the host's layout.
-    /// Return is a key, and with modifiers latched a letter, digit or space
+    /// Return is a key, and with modifiers latched a character on a US key
     /// is a key too, so Ctrl and C make Ctrl+C.
     mutating func type(_ text: String) -> [Output] {
         if text == "\n" { return press(Self.enter) }
@@ -158,19 +157,14 @@ struct StickyKeys: Equatable {
         latched = []
     }
 
-    /// The HID usage of a US-layout letter, digit or space, and whether it needs Shift.
+    /// The HID usage of a character on a US keyboard, and whether it needs
+    /// Shift (`pw_input_char_usage`).
     static func usage(of text: String) -> (UInt16, Bool)? {
         // One scalar: `e` with a combining accent is one character, but not E.
-        guard text.unicodeScalars.count == 1, let scalar = text.unicodeScalars.first, scalar.isASCII else { return nil }
-        let value = UInt16(scalar.value)
-        switch scalar {
-        case "a"..."z": return (0x04 + value - 0x61, false)
-        case "A"..."Z": return (0x04 + value - 0x41, true)
-        case "1"..."9": return (0x1E + value - 0x31, false)
-        case "0": return (0x27, false)
-        case " ": return (space, false)
-        default: return nil
-        }
+        guard text.unicodeScalars.count == 1, let scalar = text.unicodeScalars.first else { return nil }
+        let key = pw_input_char_usage(scalar.value)
+        guard key != 0 else { return nil }
+        return (UInt16(truncatingIfNeeded: key), key & UInt32(PW_INPUT_CHAR_SHIFT) != 0)
     }
 }
 

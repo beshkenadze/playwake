@@ -122,7 +122,7 @@ struct KeyboardMouseDisconnectTests {
 
     @Test func aKeyboardThatGoesAwayLetsGoOfItsKeys() async throws {
         _ = KeyboardMouse.shared
-        pw_input_key(KeyboardMouse.keyboardPage, w, true)
+        pw_input_key(KeyboardMouse.keyboard, KeyboardMouse.keyboardPage, w, true)
         #expect(stickY(at: 0) != 0)
         NotificationCenter.default.post(name: .GCKeyboardDidDisconnect, object: nil)
         try await Task.sleep(for: .milliseconds(100))
@@ -136,7 +136,7 @@ struct KeyboardMouseDisconnectTests {
         let w = w
         keyboardMouse.queue.async {
             queued.wait()
-            pw_input_key(KeyboardMouse.keyboardPage, w, true)
+            pw_input_key(KeyboardMouse.keyboard, KeyboardMouse.keyboardPage, w, true)
             pressed.append("W")
         }
         NotificationCenter.default.post(name: .GCKeyboardDidDisconnect, object: nil)

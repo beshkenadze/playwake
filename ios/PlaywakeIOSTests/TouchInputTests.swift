@@ -74,12 +74,13 @@ struct TouchInputTests {
         #expect(call8 == nil)
     }
 
-    @Test func directTouchStopsAtTheVideoEdge() throws {
+    /// The core stops it at the video's edge.
+    @Test func directTouchFollowsAFingerThatSlidesOntoTheBars() throws {
         var tracker = TouchTracker<Int>()
         _ = tracker.call(for: 1, phase: .began, at: place(0.9, 0.5), direct: true, pressure: 1, now: 0)
         let movedCall = tracker.call(for: 1, phase: .moved, at: place(1.4, -0.3), direct: true, pressure: 1, now: 1)
         let moved = try #require(movedCall)
-        #expect(moved.x == 1 && moved.y == 0)
+        #expect(moved.x == 1.4 && moved.y == -0.3)
     }
 
     @Test func theSurfaceIsTheVideoNotTheBars() {

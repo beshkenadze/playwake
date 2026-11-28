@@ -22,6 +22,14 @@ pub struct PwPad {
     pub rt: u16,
 }
 
+/// The event mask, after opening or shutting the input gate with the menu.
+fn report(events: &[RouteEvent]) -> u32 {
+    for event in events {
+        if let RouteEvent::Overlay(open) = event { crate::input_bridge::menu(*open); }
+    }
+    mask(events)
+}
+
 fn mask(events: &[RouteEvent]) -> u32 {
     events.iter().fold(0, |mask, event| mask | match event {
         RouteEvent::Overlay(true) => PW_ROUTE_MENU_OPENED,
@@ -36,6 +44,8 @@ fn mask(events: &[RouteEvent]) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pw_route_new() -> *mut Route {
+    // A stream stopped with its menu open never closed it.
+    crate::input_bridge::menu(false);
     Box::into_raw(Box::new(Route::default()))
 }
 
@@ -63,7 +73,7 @@ pub unsafe extern "C" fn pw_route_input(route: *mut Route, pad: *mut PwPad, now_
     pad.buttons = routed.buttons;
     pad.lt = routed.lt;
     pad.rt = routed.rt;
-    mask(&events)
+    report(&events)
 }
 
 /// Opens the stream menu (touch, keyboard). Returns the event mask.
@@ -72,7 +82,7 @@ pub unsafe extern "C" fn pw_route_input(route: *mut Route, pad: *mut PwPad, now_
 /// `route` must be valid, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pw_route_open(route: *mut Route) -> u32 {
-    unsafe { route.as_mut() }.map_or(0, |route| mask(&route.open_overlay()))
+    unsafe { route.as_mut() }.map_or(0, |route| report(&route.open_overlay()))
 }
 
 /// Closes the stream menu; `guide` sends one Xbox Guide press afterwards.
@@ -81,7 +91,7 @@ pub unsafe extern "C" fn pw_route_open(route: *mut Route) -> u32 {
 /// `route` must be valid, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pw_route_close(route: *mut Route, guide: bool) -> u32 {
-    unsafe { route.as_mut() }.map_or(0, |route| mask(&route.close_overlay(guide)))
+    unsafe { route.as_mut() }.map_or(0, |route| report(&route.close_overlay(guide)))
 }
 
 #[cfg(test)]
@@ -95,6 +105,7 @@ mod tests {
 
     #[test]
     fn view_menu_tap_opens_the_menu_without_reaching_the_console() {
+        let _global = crate::input_bridge::global();
         let route = pw_route_new();
         let mut sample = pad(VIEW_MENU);
         let events = unsafe { pw_route_input(route, &mut sample, 0.0) };
@@ -105,6 +116,7 @@ mod tests {
 
     #[test]
     fn menu_keys_are_reported_and_swallowed() {
+        let _global = crate::input_bridge::global();
         let route = pw_route_new();
         assert_eq!(unsafe { pw_route_open(route) }, PW_ROUTE_MENU_OPENED);
         let mut down = pad(512);
@@ -118,6 +130,7 @@ mod tests {
 
     #[test]
     fn closing_with_guide_presses_guide_once_the_pad_is_released() {
+        let _global = crate::input_bridge::global();
         let route = pw_route_new();
         unsafe { pw_route_open(route) };
         assert_eq!(unsafe { pw_route_close(route, true) }, PW_ROUTE_MENU_CLOSED);

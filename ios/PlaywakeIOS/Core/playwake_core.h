@@ -123,7 +123,9 @@ void pw_pc_stop(void);
 
 /* Keyboard, mouse and touch for the current stream: a PC gets them as
  * GameStream input; without one they become a gamepad that the Xbox stream
- * mixes in with `pw_input_pad`. Safe from any thread. */
+ * mixes in with `pw_input_pad`. While a route's menu is open (from the
+ * moment the route reports MENU_OPENED) input calls change nothing.
+ * Safe from any thread. */
 enum {
     PW_INPUT_GAME = 0,      /* mouse: relative motion, pointer captured */
     PW_INPUT_DESKTOP = 1,   /* mouse: absolute position over the video */
@@ -146,18 +148,32 @@ enum {
 enum {
     PW_INPUT_SHOW_KEYBOARD = 1 << 0,
 };
+/* Where a key or button comes from: the host hears it let go only once no
+ * source holds it. */
+enum {
+    PW_INPUT_SOURCE_KEYBOARD = 0,
+    PW_INPUT_SOURCE_MOUSE = 1,
+    PW_INPUT_SOURCE_PANEL = 2,  /* the on-screen key bar and keyboard */
+};
+enum {
+    PW_INPUT_CHAR_SHIFT = 1 << 16,
+};
 /// Sets the mouse mode (GAME, DESKTOP) or the touch mode (TRACKPAD, DIRECT);
 /// a change lets go of everything held.
 void pw_input_mode(uint32_t mode);
-/// A key by HID usage; only the keyboard page 0x07 is taken.
-void pw_input_key(uint16_t usage_page, uint16_t usage, bool down);
+/// A key by HID usage from a PW_INPUT_SOURCE_*; only the keyboard page 0x07 is taken.
+void pw_input_key(uint32_t source, uint16_t usage_page, uint16_t usage, bool down);
+/// The HID usage that types the Unicode scalar `c` on a US keyboard, with
+/// PW_INPUT_CHAR_SHIFT if it takes Shift; 0 for none.
+uint32_t pw_input_char_usage(uint32_t c);
 /// Types UTF-8 text on a PC.
 void pw_input_text(const char *text);
 /// Relative motion in host pixels, `dy` positive down; a PC in DESKTOP mode ignores it.
 void pw_input_mouse_move(float dx, float dy);
 /// The pointer over the video, 0…1 from its top left; only a PC in DESKTOP mode takes it.
 void pw_input_mouse_position(float x, float y);
-void pw_input_mouse_button(uint32_t button, bool down);
+/// A PW_INPUT_BUTTON_* from a PW_INPUT_SOURCE_*.
+void pw_input_mouse_button(uint32_t source, uint32_t button, bool down);
 /// Wheel notches, fractions allowed: `dy` positive scrolls up, `dx` right.
 void pw_input_scroll(float dx, float dy);
 /// The touch surface in points, for trackpad distances.
@@ -167,7 +183,7 @@ void pw_input_surface(float width, float height);
 /// PC without touch gets the left button there. ENDED carries the last point.
 /// Returns PW_INPUT_SHOW_KEYBOARD when three fingers ask for the keyboard.
 uint32_t pw_input_touch(uint32_t id, uint32_t phase, float x, float y, float pressure, double now_ms);
-/// Lets go of every key and button: on focus loss or when the stream menu opens.
+/// Lets go of every key and button, from every source: on focus loss.
 void pw_input_release_all(void);
 /// Whether the PC stream takes touches; false without one.
 bool pw_input_host_supports_touch(void);

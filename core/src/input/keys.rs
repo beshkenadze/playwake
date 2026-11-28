@@ -2,9 +2,8 @@
 //! and Linux evdev `KEY_*` codes to the Windows virtual-key codes that
 //! GameStream hosts take.
 
-use super::Usage;
+use super::{Device, Holds, Usage};
 use gamestream::{MODIFIER_ALT, MODIFIER_CTRL, MODIFIER_META, MODIFIER_SHIFT};
-use std::collections::BTreeSet;
 
 impl Usage {
     /// The Windows virtual-key code of this key on a US keyboard.
@@ -156,24 +155,51 @@ pub fn modifier(vk: u8) -> u8 {
     }
 }
 
+/// The HID usage that types `c` on a US keyboard, and whether it takes Shift.
+pub fn char_usage(c: char) -> Option<(u16, bool)> {
+    /// Usages with their plain and shifted characters.
+    const PUNCTUATION: [(u16, char, char); 11] = [
+        (0x2D, '-', '_'), (0x2E, '=', '+'), (0x2F, '[', '{'), (0x30, ']', '}'), (0x31, '\\', '|'),
+        (0x33, ';', ':'), (0x34, '\'', '"'), (0x35, '`', '~'), (0x36, ',', '<'), (0x37, '.', '>'),
+        (0x38, '/', '?'),
+    ];
+    /// Shift with 1…9 and 0, the usages 0x1E…0x27.
+    const SHIFTED_DIGITS: [char; 10] = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')'];
+    let offset = |first: char| c as u16 - first as u16;
+    Some(match c {
+        'a'..='z' => (0x04 + offset('a'), false),
+        'A'..='Z' => (0x04 + offset('A'), true),
+        '1'..='9' => (0x1E + offset('1'), false),
+        '0' => (0x27, false),
+        ' ' => (0x2C, false),
+        _ => match SHIFTED_DIGITS.iter().position(|&digit| digit == c) {
+            Some(index) => (0x1E + index as u16, true),
+            None => PUNCTUATION.iter().find_map(|&(usage, plain, shifted)| {
+                (c == plain || c == shifted).then_some((usage, c == shifted))
+            })?,
+        },
+    })
+}
+
 /// The keys held down, for the modifier mask each key packet carries.
 #[derive(Default)]
 pub(super) struct Keyboard {
-    held: BTreeSet<u8>,
+    held: Holds<u8>,
 }
 
 impl Keyboard {
-    /// The key's virtual-key code and the modifiers held with it. A modifier
-    /// counts itself while it goes down and no longer once it goes up.
-    pub(super) fn key(&mut self, usage: Usage, down: bool) -> Option<(u8, u8)> {
+    /// The key's virtual-key code and the modifiers held with it, if the
+    /// host is to hear it: a press always, a release once no device holds
+    /// the key. A modifier counts itself while it goes down and no longer
+    /// once it goes up.
+    pub(super) fn key(&mut self, device: Device, usage: Usage, down: bool) -> Option<(u8, u8)> {
         let vk = usage.vk()?;
-        if down { self.held.insert(vk); } else { self.held.remove(&vk); }
-        Some((vk, self.held.iter().fold(0, |mask, &held| mask | modifier(held))))
+        self.held.change(vk, device, down).then(|| (vk, self.held.keys().fold(0, |mask, held| mask | modifier(held))))
     }
 
     /// Every key still held, now forgotten as released.
     pub(super) fn release_all(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.held).into_iter().collect()
+        self.held.take()
     }
 }
 
@@ -301,21 +327,55 @@ mod tests {
     #[test]
     fn modifier_mask_follows_the_held_keys() {
         let mut keyboard = Keyboard::default();
-        assert_eq!(keyboard.key(Usage::Hid(0xE1), true), Some((0xA0, MODIFIER_SHIFT)));
-        assert_eq!(keyboard.key(Usage::Hid(0x04), true), Some((0x41, MODIFIER_SHIFT)));
-        assert_eq!(keyboard.key(Usage::Evdev(29), true), Some((0xA2, MODIFIER_SHIFT | MODIFIER_CTRL)));
-        assert_eq!(keyboard.key(Usage::Hid(0xE1), false), Some((0xA0, MODIFIER_CTRL)));
-        assert_eq!(keyboard.key(Usage::Hid(0x04), false), Some((0x41, MODIFIER_CTRL)));
-        assert_eq!(keyboard.key(Usage::Hid(0xE0), false), Some((0xA2, 0)));
-        assert_eq!(keyboard.key(Usage::Hid(0x00), true), None);
+        let mut key = |usage, down| keyboard.key(Device::Keyboard, usage, down);
+        assert_eq!(key(Usage::Hid(0xE1), true), Some((0xA0, MODIFIER_SHIFT)));
+        assert_eq!(key(Usage::Hid(0x04), true), Some((0x41, MODIFIER_SHIFT)));
+        assert_eq!(key(Usage::Evdev(29), true), Some((0xA2, MODIFIER_SHIFT | MODIFIER_CTRL)));
+        assert_eq!(key(Usage::Hid(0xE1), false), Some((0xA0, MODIFIER_CTRL)));
+        assert_eq!(key(Usage::Hid(0x04), false), Some((0x41, MODIFIER_CTRL)));
+        assert_eq!(key(Usage::Hid(0xE0), false), Some((0xA2, 0)));
+        assert_eq!(key(Usage::Hid(0x00), true), None);
+    }
+
+    #[test]
+    fn a_key_two_devices_hold_goes_up_with_the_last() {
+        let mut keyboard = Keyboard::default();
+        let ctrl = Usage::Hid(0xE0);
+        assert_eq!(keyboard.key(Device::Keyboard, ctrl, true), Some((0xA2, MODIFIER_CTRL)));
+        assert_eq!(keyboard.key(Device::Panel, ctrl, true), Some((0xA2, MODIFIER_CTRL)));
+        assert_eq!(keyboard.key(Device::Panel, ctrl, false), None);
+        assert_eq!(keyboard.key(Device::Keyboard, Usage::Hid(0x06), true), Some((0x43, MODIFIER_CTRL)));
+        assert_eq!(keyboard.key(Device::Keyboard, ctrl, false), Some((0xA2, 0)));
+        // A release of a key nobody holds still goes out.
+        assert_eq!(keyboard.key(Device::Panel, ctrl, false), Some((0xA2, 0)));
+    }
+
+    #[test]
+    fn characters_type_with_their_us_keys() {
+        let typed = |text: &str| text.chars().map(|c| char_usage(c).unwrap()).collect::<Vec<_>>();
+        assert_eq!(typed("aZ0 9"), [(0x04, false), (0x1D, true), (0x27, false), (0x2C, false), (0x26, false)]);
+        assert_eq!(typed("!@)"), [(0x1E, true), (0x1F, true), (0x27, true)]);
+        assert_eq!(typed("-_\\|'\"`~/?"), [
+            (0x2D, false), (0x2D, true), (0x31, false), (0x31, true), (0x34, false), (0x34, true),
+            (0x35, false), (0x35, true), (0x38, false), (0x38, true),
+        ]);
+        for c in ['é', '\n', '\t', '£', '\u{0}'] { assert_eq!(char_usage(c), None, "{c:?}"); }
+    }
+
+    #[test]
+    fn every_printable_ascii_character_types_with_a_key_that_has_a_virtual_key() {
+        for c in ' '..='~' {
+            let (usage, _) = char_usage(c).unwrap_or_else(|| panic!("{c:?} has no key"));
+            assert!(Usage::Hid(usage).vk().is_some(), "{c:?}");
+        }
     }
 
     #[test]
     fn release_all_forgets_the_held_keys() {
         let mut keyboard = Keyboard::default();
-        keyboard.key(Usage::Hid(0xE3), true);
-        keyboard.key(Usage::Hid(0x04), true);
+        keyboard.key(Device::Keyboard, Usage::Hid(0xE3), true);
+        keyboard.key(Device::Panel, Usage::Hid(0x04), true);
         assert_eq!(keyboard.release_all(), vec![0x41, 0x5B]);
-        assert_eq!(keyboard.key(Usage::Hid(0x05), true), Some((0x42, 0)));
+        assert_eq!(keyboard.key(Device::Keyboard, Usage::Hid(0x05), true), Some((0x42, 0)));
     }
 }

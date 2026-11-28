@@ -26,6 +26,8 @@ final class KeyboardMouse: ObservableObject {
     /// Every stream is 16:9 (`SessionController.resolution`).
     nonisolated static let videoAspect: CGFloat = 16.0 / 9.0
     nonisolated static let keyboardPage: UInt16 = 0x07
+    nonisolated static let keyboard = UInt32(PW_INPUT_SOURCE_KEYBOARD)
+    nonisolated static let mouse = UInt32(PW_INPUT_SOURCE_MOUSE)
     private nonisolated static let leftCommand: UInt16 = 0xE3
     private nonisolated static let rightCommand: UInt16 = 0xE7
     /// `GCMouse` scroll units in one wheel notch (Moonlight: ×20 of 120).
@@ -108,7 +110,7 @@ final class KeyboardMouse: ObservableObject {
             for event in events {
                 switch event {
                 case .position(let place): pw_input_mouse_position(Float(place.x), Float(place.y))
-                case .left(let down): pw_input_mouse_button(UInt32(PW_INPUT_BUTTON_LEFT), down)
+                case .left(let down): pw_input_mouse_button(Self.mouse, UInt32(PW_INPUT_BUTTON_LEFT), down)
                 }
             }
         }
@@ -184,7 +186,7 @@ final class KeyboardMouse: ObservableObject {
             let command = input.button(forKeyCode: .leftGUI)?.isPressed == true
                 || input.button(forKeyCode: .rightGUI)?.isPressed == true
             guard Self.forwards(usage: usage, pressed: pressed, command: command) else { return }
-            gate.send { pw_input_key(Self.keyboardPage, usage, pressed) }
+            gate.send { pw_input_key(Self.keyboard, Self.keyboardPage, usage, pressed) }
         }
     }
 
@@ -198,7 +200,7 @@ final class KeyboardMouse: ObservableObject {
         }
         func bind(_ button: GCControllerButtonInput?, _ code: UInt32, inDesktop: Bool = true) {
             button?.pressedChangedHandler = { _, _, pressed in
-                gate.send(inDesktop: inDesktop) { pw_input_mouse_button(code, pressed) }
+                gate.send(inDesktop: inDesktop) { pw_input_mouse_button(Self.mouse, code, pressed) }
             }
         }
         // In desktop mode the view over the video sends the left button with its place.
@@ -247,18 +249,18 @@ extension KeyboardMouse {
             return text.hasPrefix("0x") ? Float(UInt32(text.dropFirst(2), radix: 16) ?? 0) : Float(text) ?? 0
         }
         func press(_ usages: [UInt16]) {
-            usages.forEach { pw_input_key(keyboardPage, $0, true) }
+            usages.forEach { pw_input_key(keyboard, keyboardPage, $0, true) }
             usleep(50_000)
-            usages.reversed().forEach { pw_input_key(keyboardPage, $0, false) }
+            usages.reversed().forEach { pw_input_key(keyboard, keyboardPage, $0, false) }
         }
         switch step[0] {
         case "move": pw_input_mouse_move(number(1), number(2))
         case "pos": pw_input_mouse_position(number(1), number(2))
         case "click":
             let button = UInt32(step.count > 1 && step[1] == "right" ? PW_INPUT_BUTTON_RIGHT : PW_INPUT_BUTTON_LEFT)
-            pw_input_mouse_button(button, true)
+            pw_input_mouse_button(mouse, button, true)
             usleep(50_000)
-            pw_input_mouse_button(button, false)
+            pw_input_mouse_button(mouse, button, false)
         case "scroll": pw_input_scroll(0, number(1))
         case "text": pw_input_text(step.dropFirst().joined(separator: " "))
         case "key": press((1..<step.count).map { UInt16(number($0)) })

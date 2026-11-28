@@ -143,8 +143,8 @@ struct TouchTracker<Key: Hashable> {
     private var next: UInt32 = 0
 
     /// `place`: 0…1 over the video, beyond it over the bars. In direct mode a
-    /// finger that lands on the bars stays out, and one that slides onto
-    /// them stops at the video's edge. `nil` for a finger not followed.
+    /// finger that lands on the bars stays out; one that slides onto them
+    /// the core stops at the video's edge. `nil` for a finger not followed.
     mutating func call(for key: Key, phase: TouchPhase, at place: CGPoint, direct: Bool,
                        pressure: Float, now: Double) -> TouchCall? {
         let id: UInt32
@@ -161,9 +161,7 @@ struct TouchTracker<Key: Hashable> {
             guard let known = ids.removeValue(forKey: key) else { return nil }
             id = known
         }
-        let x = direct ? min(max(place.x, 0), 1) : place.x
-        let y = direct ? min(max(place.y, 0), 1) : place.y
-        return TouchCall(id: id, phase: phase, x: Float(x), y: Float(y), pressure: pressure, now: now)
+        return TouchCall(id: id, phase: phase, x: Float(place.x), y: Float(place.y), pressure: pressure, now: now)
     }
 
     /// Forgets the fingers down: the rest of their touches stay out.

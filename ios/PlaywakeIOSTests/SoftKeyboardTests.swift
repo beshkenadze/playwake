@@ -75,7 +75,7 @@ struct SoftKeyboardTests {
                                                        .key(delete, false), .key(alt, false), .key(control, false)])
     }
 
-    @Test func lettersDigitsAndSpaceHaveUsages() {
+    @Test func charactersOnUSKeysHaveUsages() {
         #expect(StickyKeys.usage(of: "a")! == (0x04, false))
         #expect(StickyKeys.usage(of: "z")! == (0x1D, false))
         #expect(StickyKeys.usage(of: "Z")! == (0x1D, true))
@@ -83,6 +83,9 @@ struct SoftKeyboardTests {
         #expect(StickyKeys.usage(of: "9")! == (0x26, false))
         #expect(StickyKeys.usage(of: "0")! == (0x27, false))
         #expect(StickyKeys.usage(of: " ")! == (0x2C, false))
+        #expect(StickyKeys.usage(of: "!")! == (0x1E, true))
+        #expect(StickyKeys.usage(of: "/")! == (0x38, false))
+        #expect(StickyKeys.usage(of: "?")! == (0x38, true))
         #expect(StickyKeys.usage(of: "ab") == nil)
         #expect(StickyKeys.usage(of: "ж") == nil)
     }
