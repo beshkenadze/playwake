@@ -131,6 +131,34 @@ final class TouchPadUITests: XCTestCase {
         XCTAssertTrue(waitForJournal(app, toContain: "touch began"), "a touch beside the pad did not reach the stream")
     }
 
+    /// Sideways the panel covers the middle controls; hidden, it lets them move.
+    @MainActor
+    func testTheEditorReachesEveryControlSideways() {
+        let app = launch(extra: ["-uiLandscape"])
+        let menuButton = app.buttons["streamMenuButton"]
+        XCTAssertTrue(menuButton.waitForExistence(timeout: 20))
+        let window = app.windows.firstMatch
+        let deadline = Date().addingTimeInterval(10)
+        while window.frame.width <= window.frame.height, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        menuButton.tap()
+        app.buttons["On-screen controller"].tap()
+        let l3 = element(app, "L3")
+        XCTAssertTrue(l3.waitForExistence(timeout: 5), "the editor did not open")
+        app.buttons["Reset"].tap()
+        attach("touch-pad-editor-landscape")
+        app.buttons["Hide"].tap()
+        let before = l3.frame
+        let center = l3.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        center.press(forDuration: 0.2, thenDragTo: center.withOffset(CGVector(dx: 30, dy: 40)))
+        let after = l3.frame
+        XCTAssertEqual(after.midX - before.midX, 30, accuracy: 6, "\(before) -> \(after)")
+        XCTAssertEqual(after.midY - before.midY, 40, accuracy: 6, "\(before) -> \(after)")
+        app.buttons["Show panel"].tap()
+        app.buttons["Cancel"].tap()
+    }
+
     @MainActor
     func testTheEditorMovesAControlAndKeepsIt() {
         let app = launch("settings")

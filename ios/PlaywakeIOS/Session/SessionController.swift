@@ -227,6 +227,7 @@ final class SessionController: ObservableObject {
         streaming = false
         firstFrame = false
         menuOpen = false
+        editingPad = false
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
@@ -316,6 +317,7 @@ final class SessionController: ObservableObject {
         streamTitle = title
         firstFrame = false
         menuOpen = false
+        editingPad = false
         streaming = true
         streamStart = .now()
         streamStartedAt = CFAbsoluteTimeGetCurrent()

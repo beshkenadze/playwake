@@ -12,6 +12,8 @@ struct TouchPadEditor: View {
     @State private var drag: (index: Int, offset: CGSize)?
     @State private var forGame: Bool
     @State private var surface = CGSize.zero
+    /// Hidden, the panel uncovers the controls under it.
+    @State private var panelShown = true
     private let store: PadLayoutStore
 
     init(game: String?, store: PadLayoutStore = PadLayoutStore()) {
@@ -38,7 +40,15 @@ struct TouchPadEditor: View {
                         selected = nil
                     }
             }
-            panel
+            if panelShown {
+                panel
+            } else {
+                Button("Show panel") { panelShown = true }
+                    .buttonStyle(.playwakeSecondary)
+                    .fixedSize()
+                    .frame(maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 8)
+            }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -98,6 +108,8 @@ struct TouchPadEditor: View {
                 Toggle("Only for \(game)", isOn: $forGame)
             }
             HStack(spacing: 10) {
+                Button("Hide") { panelShown = false }
+                    .buttonStyle(.playwakeSecondary)
                 Button("Reset") { apply(PadLayout.defaultJSON) }
                     .buttonStyle(.playwakeSecondary)
                 Button("Cancel") { dismiss() }
