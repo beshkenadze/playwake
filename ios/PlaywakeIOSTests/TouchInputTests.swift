@@ -93,7 +93,7 @@ struct TouchInputTests {
 
     @Test func theSurfaceTakesFingersAndLeavesTheMouseToTheViewsBelow() {
         #expect(TouchSurfaceView.takes(.touches, buttons: []))
-        // A mouse click over the video in desktop mode: `PointerArea` sends it.
+        // A mouse click: `KeyboardMouse` sends it.
         #expect(!TouchSurfaceView.takes(.touches, buttons: .primary))
         #expect(!TouchSurfaceView.takes(.touches, buttons: .secondary))
         #expect(!TouchSurfaceView.takes(.hover, buttons: []))

@@ -198,7 +198,7 @@ final class TouchSurfaceView: UIView {
     }
 
     /// Fingers only: the mouse's hover, clicks and scrolls go on to the
-    /// views below (`PointerArea`) and to `KeyboardMouse`.
+    /// views below and to `KeyboardMouse`.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if let event, !Self.takes(event.type, buttons: event.buttonMask) { return nil }
         return super.hitTest(point, with: event)
