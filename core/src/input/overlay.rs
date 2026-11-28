@@ -67,6 +67,8 @@ const MIN_OPACITY: f32 = 0.1;
 const MAX_DEAD_ZONE: f32 = 0.9;
 /// Within this part of its radius from the centre the d-pad presses nothing.
 const DPAD_DEAD_ZONE: f32 = 0.2;
+/// Up, down, left and right.
+const DPAD: u16 = 256 | 512 | 1024 | 2048;
 /// sin 22.5°: a direction is held within 67.5° of it, so the d-pad has
 /// eight even sectors.
 const DPAD_SECTOR: f32 = 0.383;
@@ -324,7 +326,11 @@ impl Overlay {
             Phase::Ended | Phase::Cancelled => { self.fingers.remove(&id); }
         }
         let haptic = self.presses().difference(&before.0).next().is_some();
-        self.latched |= self.state().buttons;
+        // A d-pad direction replaces the one kept before it, so a finger
+        // sliding from left to right never sends both in one packet.
+        let buttons = self.state().buttons;
+        if buttons & DPAD != 0 { self.latched &= !DPAD; }
+        self.latched |= buttons;
         Change { events: changes(&before.1, &self.held()), haptic }
     }
 
@@ -572,6 +578,22 @@ mod tests {
         assert_eq!(overlay.state().buttons, A);
         overlay.touch(1, Phase::Ended, x, y, 1.0);
         assert_eq!(overlay.state(), Routed { axes: [0; 4], buttons: 0, lt: 0, rt: 0 });
+    }
+
+    #[test]
+    fn a_slide_across_the_dpad_between_samples_sends_one_direction() {
+        let mut overlay = overlay(PHONE_LANDSCAPE);
+        let dpad = overlay.elements().iter().find(|element| matches!(element.control, Control::Dpad)).unwrap().clone();
+        let (x, y) = overlay.surface.center(&dpad);
+        let r = overlay.surface.radius(&dpad);
+        overlay.touch(1, Phase::Began, x - r * 0.8, y, 1.0);
+        overlay.touch(1, Phase::Moved, x + r * 0.8, y, 1.0);
+        assert_eq!(overlay.sample().buttons & DPAD, Target::DpadRight.bit());
+        // Left, then right, then lifted before the sample: the last direction only.
+        overlay.touch(1, Phase::Moved, x - r * 0.8, y, 1.0);
+        overlay.touch(1, Phase::Moved, x + r * 0.8, y, 1.0);
+        overlay.touch(1, Phase::Ended, x + r * 0.8, y, 1.0);
+        assert_eq!(overlay.sample().buttons & DPAD, Target::DpadRight.bit());
     }
 
     #[test]
