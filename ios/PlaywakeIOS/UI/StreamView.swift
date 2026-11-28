@@ -68,7 +68,7 @@ struct StreamView: View {
                 scene?.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight))
             }
             #endif
-            TouchPad.shared.load(game: controller.streamTitle)
+            TouchPad.shared.load(game: controller.padGame)
             VirtualPad.shared.setActive(padActive)
             keyboardMouse.setStreamActive(padActive)
             touch.setStreamActive(padActive)
@@ -86,7 +86,7 @@ struct StreamView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .fullScreenCover(isPresented: $controller.editingPad) {
-            TouchPadEditor(game: controller.streamTitle)
+            TouchPadEditor(game: controller.padGame)
         }
     }
 

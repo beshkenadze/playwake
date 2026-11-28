@@ -14,6 +14,20 @@ struct VirtualPadTests {
         #expect(VirtualPad.shouldShow(mode: .always, active: true, physicalPad: false))
     }
 
+    @Test func theStreamMenuOffersTheEditorOnlyForPlaywakesPadWhenItIsOn() {
+        #expect(VirtualPad.editable(style: .custom, mode: .auto) == VirtualPad.supported)
+        #expect(VirtualPad.editable(style: .custom, mode: .always) == VirtualPad.supported)
+        #expect(!VirtualPad.editable(style: .custom, mode: .never))
+        #expect(!VirtualPad.editable(style: .system, mode: .always))
+    }
+
+    @Test func aHomeConsoleKeepsNoLayoutOfItsOwn() {
+        let console = XboxConsole(id: "F4000", name: "Living Room", model: "XboxSeriesX", power: "On")
+        #expect(SessionController.padGame(target: .console(console), title: "Living Room") == nil)
+        #expect(SessionController.padGame(target: nil, title: "Halo") == "Halo")
+        #expect(SessionController.padGame(target: nil, title: "") == nil)
+    }
+
     @Test func neverShows() {
         #expect(!VirtualPad.shouldShow(mode: .never, active: true, physicalPad: false))
     }

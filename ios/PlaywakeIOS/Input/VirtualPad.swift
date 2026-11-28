@@ -34,6 +34,12 @@ final class VirtualPad: ObservableObject {
     static let supported = true
     #endif
 
+    /// The stream menu offers the pad's editor only for Playwake's own pad,
+    /// and not while the on-screen pad is off.
+    static func editable(style: Style, mode: Mode) -> Bool {
+        supported && style == .custom && mode != .never
+    }
+
     static func shouldShow(mode: Mode, active: Bool, physicalPad: Bool) -> Bool {
         guard supported, active else { return false }
         switch mode {

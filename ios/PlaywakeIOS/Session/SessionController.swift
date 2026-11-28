@@ -257,7 +257,16 @@ final class SessionController: ObservableObject {
 
     var menuItems: [MenuItem] {
         MenuItem.shown(touches: streamTakesTouches,
-                       customPad: VirtualPad.supported && VirtualPad.Style.stored() == .custom)
+                       customPad: VirtualPad.editable(style: .stored(), mode: .stored()))
+    }
+
+    /// The game a pad layout of its own is kept for: a home console's stream
+    /// is named after the console, whatever it plays, so it has none.
+    var padGame: String? { Self.padGame(target: lastTarget, title: streamTitle) }
+
+    nonisolated static func padGame(target: StreamTarget?, title: String) -> String? {
+        if case .console = target { return nil }
+        return title.isEmpty ? nil : title
     }
 
     func perform(_ item: MenuItem) {
