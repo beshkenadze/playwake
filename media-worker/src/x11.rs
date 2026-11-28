@@ -132,7 +132,8 @@ impl X11Window {
                 let res_conn = if vulkan { Some(x11rb::connect(None).map_err(|e| format!("X11 res connect: {e}"))?.0) } else { None };
                 (xid, parent_xid, res_conn)
             };
-            // A held key repeats as presses alone, not as a release and a press.
+            // A held key repeats as presses alone, not as a release and a
+            // press, so the PC does not see it let go.
             let mut supported = 0;
             if (xlib.XkbSetDetectableAutoRepeat)(display, 1, &mut supported) == 0 || supported == 0 {
                 eprintln!("pw-key no detectable auto-repeat");

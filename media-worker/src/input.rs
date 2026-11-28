@@ -408,8 +408,8 @@ impl Keys {
                     self.pc.send(sink, Device::Keyboard, usage((key.keycode - 8) as u16));
                 }
             } else if let Some(code) = x11::own_key(key).filter(|_| self.active) {
-                self.held.insert(key.keycode);
-                self.pc.send(sink, Device::Keyboard, usage(code));
+                // The host repeats a held key itself, as it does for Moonlight.
+                if self.held.insert(key.keycode) { self.pc.send(sink, Device::Keyboard, usage(code)); }
             } else if let Some(code) = x11::virtual_key(key.keysym) {
                 sink.key(code, true, 0);
                 sink.key(code, false, 0);
@@ -701,10 +701,10 @@ mod tests {
     fn keyboard_keys_go_down_and_up_with_their_modifiers() {
         let sink = Recorder::default();
         let mut keys = Keys::default();
-        // Shift, A typed as "A" and held through a repeat, then both let go.
+        // Shift, A typed as "A" and held through a repeat, which the PC makes itself, then both let go.
         keys.send(&sink, &[key(50, 0xffe1, "", true), key(38, 0x41, "A", true), key(38, 0x41, "A", true),
             key(38, 0x41, "", false), key(50, 0xffe1, "", false)], true);
-        assert_eq!(sink.take(), ["key 0xa0 true 1", "key 0x41 true 1", "key 0x41 true 1", "key 0x41 false 1", "key 0xa0 false 0"]);
+        assert_eq!(sink.take(), ["key 0xa0 true 1", "key 0x41 true 1", "key 0x41 false 1", "key 0xa0 false 0"]);
     }
 
     #[test]
