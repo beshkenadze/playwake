@@ -94,6 +94,7 @@ struct Worker {
     /// The pointer of a PC stream's video window.
     pointer: Option<x11::Pointer>,
     mouse: input::Mouse,
+    keys: input::Keys,
     /// Gamescope shows this app, not Steam or another one.
     focused: bool,
 }
@@ -232,15 +233,16 @@ fn run() -> Result<(), String> {
                 // A PC stream takes typed text, so its picture moves out of
                 // the way of Steam's on-screen keyboard.
                 let keyboard = w.pc.is_some() && w.focus.as_mut().is_some_and(|focus| focus.keyboard_shown());
+                if let Some(x11) = w.x11.as_mut() { x11.keyboard = keyboard; }
+                let keys_active = w.keys_active();
                 if let Some(x11) = w.x11.as_mut() {
-                    x11.keyboard = keyboard;
                     match x11.tick(now) {
                         Ok(tick) => {
                             // The video window has the keyboard focus: what is
                             // typed goes to the PC, as the app sent it before.
                             if w.preview {
-                                for (keysym, _) in &tick.keys {
-                                    match keysym {
+                                for key in tick.keys.iter().filter(|key| key.down) {
+                                    match key.keysym {
                                         0xff0d | 0xff8d => protocol::event("preview-toggle", serde_json::json!({})),
                                         0xff1b => protocol::event("preview-back", serde_json::json!({})),
                                         _ => {}
@@ -248,14 +250,7 @@ fn run() -> Result<(), String> {
                                 }
                             }
                             if let Some(pc) = w.pc.as_ref().filter(|_| !w.input.route.overlay) {
-                                for (keysym, text) in &tick.keys {
-                                    if let Some(code) = x11::virtual_key(*keysym) {
-                                        pc.key(code, true, 0);
-                                        pc.key(code, false, 0);
-                                    } else if !text.is_empty() {
-                                        pc.text(text);
-                                    }
-                                }
+                                w.keys.send(pc.as_ref(), &tick.keys, keys_active);
                             }
                             if tick.adopted {
                                 protocol::event("vulkan-window-embedded", serde_json::json!({}));
@@ -345,7 +340,7 @@ fn run() -> Result<(), String> {
                     let events = w.input.route.focus(w.focused && !typing);
                     input::emit_route_events(events);
                 }
-                w.sync_mouse();
+                w.sync_pc_input();
             }
             glib::ControlFlow::Continue
         });
@@ -354,7 +349,10 @@ fn run() -> Result<(), String> {
     quit.run();
 
     if let Some(mut w) = slot.lock().unwrap().take() {
-        if let Some(pc) = &w.pc { w.mouse.update(pc.as_ref(), false, [], (0, 0), (0, 0)); }
+        if let Some(pc) = &w.pc {
+            w.keys.send(pc.as_ref(), &[], false);
+            w.mouse.update(pc.as_ref(), false, [], (0, 0), (0, 0));
+        }
         if let Some(overlay) = w.overlay.as_mut() { overlay.close(); }
         if let Some(x11) = w.x11.as_mut() { x11.close(); }
         if let Some(pc) = &w.pc { pc.stop(); }
@@ -425,21 +423,21 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 let events = w.input.route.open_overlay();
                 input::emit_route_events(events);
-                w.sync_mouse();
+                w.sync_pc_input();
             }
         }
         Command::OverlayClose => {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 let events = w.input.route.close_overlay(false);
                 input::emit_route_events(events);
-                w.sync_mouse();
+                w.sync_pc_input();
             }
         }
         Command::XboxGuide => {
             if let Some(w) = slot.lock().unwrap().as_mut() {
                 let events = w.input.route.close_overlay(true);
                 input::emit_route_events(events);
-                w.sync_mouse();
+                w.sync_pc_input();
             }
         }
         Command::MouseModeToggle => {
@@ -448,7 +446,7 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
                 let desktop = w.mouse.mode == input::MouseMode::Desktop;
                 if let Some(overlay) = w.overlay.as_mut() { overlay.desktop_mouse = desktop; }
                 protocol::event("stream-mouse-mode", serde_json::json!({ "mode": if desktop { "desktop" } else { "game" } }));
-                w.sync_mouse();
+                w.sync_pc_input();
             }
         }
         Command::Type { text } => {
@@ -465,7 +463,7 @@ fn dispatch(slot: &Slot, quit: &glib::MainLoop, command: protocol::Command) {
                 w.focused = active;
                 let events = w.input.route.focus(active);
                 input::emit_route_events(events);
-                w.sync_mouse();
+                w.sync_pc_input();
             }
         }
         Command::Trial { restore_view } => {
@@ -629,7 +627,19 @@ fn start(
             // The fd is closed once its worker is replaced or gone.
             if alive.strong_count() == 0 { return glib::ControlFlow::Break; }
             let Some(w) = guard.as_mut() else { return glib::ControlFlow::Break };
-            w.sync_mouse();
+            w.sync_pc_input();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // A PC stream sends keys as they come, not on the next geometry tick.
+    if let Some((fd, alive)) = x11_window.as_ref().filter(|_| matches!(source, Source::Pc(_))).map(x11::X11Window::watch) {
+        let slot = slot.clone();
+        glib::unix_fd_add_local(fd, glib::IOCondition::IN, move |_, _| {
+            let mut guard = slot.lock().unwrap();
+            if alive.strong_count() == 0 { return glib::ControlFlow::Break; }
+            let Some(w) = guard.as_mut() else { return glib::ControlFlow::Break };
+            w.send_keys();
             glib::ControlFlow::Continue
         });
     }
@@ -639,7 +649,8 @@ fn start(
         x11: x11_window, overlay, focus, target_app,
         input, renderer: renderer.clone(), window, lsfg, volume,
         tracked: std::collections::HashSet::new(), quit: quit.clone(), start_time, input_retry: false,
-        hud_active: false, preview, bus_watch: None, pointer, mouse: input::Mouse::default(), focused: true,
+        hud_active: false, preview, bus_watch: None, pointer, mouse: input::Mouse::default(), keys: input::Keys::new(std::env::var_os("ALLY_MOUSE_DEBUG").is_some()),
+        focused: true,
     });
 
     // pad-added → branch attachment.
@@ -775,9 +786,30 @@ fn arm_input(slot: &Slot, w: &mut Worker) {
 
 #[cfg(target_os = "linux")]
 impl Worker {
-    /// Sends the pointer events that arrived to the PC, then grabs the
-    /// pointer while the stream has the mouse and lets it go otherwise.
-    fn sync_mouse(&mut self) {
+    /// Sends the keys pressed in the video window to a PC stream, unless its menu is open.
+    fn send_keys(&mut self) {
+        let active = self.keys_active();
+        let Some(x11) = self.x11.as_mut() else { return };
+        let keys = x11.take_keys();
+        if let Some(pc) = self.pc.as_ref().filter(|_| !self.input.route.overlay) {
+            self.keys.send(pc.as_ref(), &keys, active);
+        }
+    }
+
+    /// Whether keys go to a PC stream as keys: it has them and Steam's
+    /// on-screen keyboard is down.
+    fn keys_active(&self) -> bool {
+        let typing = self.x11.as_ref().is_some_and(|x11| x11.keyboard);
+        self.focused && !self.input.route.overlay && self.pc.as_ref().is_some_and(|pc| !pc.ended()) && !typing
+    }
+
+    /// Gives the keys to a PC stream while it has them and Steam's on-screen
+    /// keyboard is down. Sends the pointer events that arrived to the PC,
+    /// then grabs the pointer while the stream has the mouse and lets it go
+    /// otherwise.
+    fn sync_pc_input(&mut self) {
+        let active = self.keys_active();
+        if let Some(pc) = self.pc.as_ref() { self.keys.send(pc.as_ref(), &[], active); }
         let Some(pointer) = self.pointer.as_mut() else { return };
         let events = pointer.events();
         let Some(pc) = self.pc.as_ref() else { return };

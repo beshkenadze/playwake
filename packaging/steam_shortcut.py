@@ -7,12 +7,18 @@ while shortcuts.vdf is written: Steam rewrites the file from memory on exit.
 App ids follow Steam's own scheme (crc32 of Exe + AppName, high bit set):
 the signed 32-bit value goes into shortcuts.vdf, the unsigned one names the
 artwork files in userdata/<id>/config/grid.
+
+The Steam Deck gets a Steam Input layout of its own for the shortcut
+(packaging/steam_input_neptune.vdf): a gamepad for the games, with the right
+trackpad as the mouse and the left one as the wheel for a PC stream. Steam
+keys a shortcut's layout by its lowercased name in configset_controller_neptune.vdf.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import re
@@ -30,6 +36,12 @@ APP_NAME = "Playwake"
 LAUNCHER = "launch-steamos.sh"
 STEAMID64_BASE = 76561197960265728
 BACKUPS_KEPT = 3
+LAYOUT = "packaging/steam_input_neptune.vdf"
+LAYOUT_KEY = APP_NAME.lower()
+CONFIGSET = "configset_controller_neptune.vdf"
+# Steam reads the layout in config/<key>/controller_neptune.vdf for an
+# "autosave" entry, and saves the user's edits to it there.
+LAYOUT_ENTRY = f'\t"{LAYOUT_KEY}"\n\t{{\n\t\t"autosave"\t\t"1"\n\t}}\n'
 
 # assets/branding source -> grid filename template ({id} = unsigned app id)
 ARTWORK = {
@@ -143,6 +155,97 @@ def parse_text_vdf(text: str) -> dict:
         return obj, i
 
     return walk(0)[0]
+
+
+def scan_vdf(text: str) -> tuple[dict, int | None]:
+    """The root map's entries that hold a map in a text VDF, by lowercased
+    key, each as the span from its key to its closing brace, and where the
+    root's closing brace is. Steam writes these files, so editing one entry
+    in place keeps the rest of it byte for byte."""
+    entries: dict = {}
+    depth = 0
+    named = None
+    current = None
+    for match in re.finditer(r'//[^\n]*|"((?:[^"\\]|\\.)*)"|([{}])', text):
+        key, brace = match.group(1), match.group(2)
+        if key is None and brace is None:
+            continue
+        if brace == "{":
+            depth += 1
+            if depth == 2 and named is not None:
+                current = named
+        elif brace == "}":
+            depth -= 1
+            if depth == 1 and current is not None:
+                entries.setdefault(current[0], (current[1], match.end()))
+                current = None
+            elif depth == 0:
+                return entries, match.start()
+        named = (key.lower(), match.start()) if key is not None and depth == 1 else None
+    return entries, None
+
+
+def read_vdf(path: Path) -> str:
+    """A text VDF with its line endings as they are."""
+    return path.read_bytes().decode("utf-8")
+
+
+def whole_lines(text: str, start: int, end: int) -> tuple[int, int]:
+    """The span widened to whole lines when nothing else shares them."""
+    line = text.rfind("\n", 0, start) + 1
+    stop = text.find("\n", end)
+    stop = len(text) if stop < 0 else stop
+    if text[line:start].strip() or text[end:stop].strip():
+        return start, end
+    return line, min(stop + 1, len(text))
+
+
+def install_layout(configs: Path, layout: Path, dry_run: bool) -> str:
+    """Makes the shortcut's layout ours unless the user picked one; returns
+    what was done: "added", "kept" or "missing" (no layout file to add). A
+    layout file already there is the user's, which uninstall left, and stays."""
+    configset = configs / CONFIGSET
+    text = read_vdf(configset) if configset.is_file() else '"controller_config"\n{\n}\n'
+    entries, close = scan_vdf(text)
+    if LAYOUT_KEY in entries:
+        return "kept"
+    if not layout.is_file():
+        log(f"layout missing, skipped: {layout}")
+        return "missing"
+    if close is None:
+        fail(f"cannot read {configset}")
+    if dry_run:
+        return "added"
+    target = configs / LAYOUT_KEY / "controller_neptune.vdf"
+    if not target.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(layout, target)
+    entry = LAYOUT_ENTRY.replace("\n", "\r\n") if "\r\n" in text else LAYOUT_ENTRY
+    backup(configset)
+    write_atomic(configset, (text[:close] + entry + text[close:]).encode("utf-8"))
+    return "added"
+
+
+def remove_layout(configs: Path, layout: Path, dry_run: bool) -> bool:
+    """Drops the shortcut's layout entry, and the layout file if it is still
+    the one the installer put there."""
+    configset = configs / CONFIGSET
+    if not configset.is_file():
+        return False
+    text = read_vdf(configset)
+    span = scan_vdf(text)[0].get(LAYOUT_KEY)
+    if span is None:
+        return False
+    if not dry_run:
+        start, end = whole_lines(text, *span)
+        backup(configset)
+        write_atomic(configset, (text[:start] + text[end:]).encode("utf-8"))
+        ours = configs / LAYOUT_KEY / "controller_neptune.vdf"
+        if ours.is_file() and layout.is_file() and ours.read_bytes() == layout.read_bytes():
+            ours.unlink()
+            with contextlib.suppress(OSError):
+                ours.parent.rmdir()
+    return True
 
 
 def ids_from_top(top: int) -> dict:
@@ -328,6 +431,7 @@ def run(args: argparse.Namespace) -> dict:
     config = root / "userdata" / account / "config"
     vdf_path = config / "shortcuts.vdf"
     grid_dir = config / "grid"
+    configs = root / "steamapps/common/Steam Controller Configs" / account / "config"
 
     exe = f'"{launcher}"'
     ids = app_ids(exe)
@@ -363,6 +467,7 @@ def run(args: argparse.Namespace) -> dict:
         result["artwork"] = install_artwork(
             grid_dir, install_dir / "assets/branding", ids["short"], args.dry_run
         )
+        result["layout"] = install_layout(configs, install_dir / LAYOUT, args.dry_run)
     else:
         if key is not None:
             del shortcuts[key]
@@ -370,6 +475,7 @@ def run(args: argparse.Namespace) -> dict:
         result["removed_entry"] = key is not None
         result["backup"] = save_shortcuts(vdf_path, data, args.dry_run)
         result["artwork_removed"] = remove_artwork(grid_dir, ids["short"], args.dry_run)
+        result["layout_removed"] = remove_layout(configs, install_dir / LAYOUT, args.dry_run)
 
     return result
 
@@ -382,12 +488,14 @@ def report(result: dict) -> None:
         log(f"  exe:   {result['exe']}")
         for source, target in result.get("artwork", {}).items():
             log(f"  art:   {source} -> {target}")
+        log(f"  Steam Deck layout: {result.get('layout')}")
         if result.get("backup"):
             log(f"  backup: {result['backup']}")
     else:
         log(f"removed shortcut: {result['removed_entry']}")
         for path in result.get("artwork_removed", []):
             log(f"  art removed: {path}")
+        log(f"  Steam Deck layout removed: {result.get('layout_removed')}")
 
 
 CDP_PORT = 8080

@@ -50,7 +50,7 @@ cp "${CARGO_TARGET_DIR:-target}/release/playwake" "$bundle/playwake"
 cp "${CARGO_TARGET_DIR:-target}/release/playwake-media" "$bundle/playwake-media"
 cp launch-steamos.sh "$bundle/"
 cp assets/branding/*.png "$bundle/assets/branding/"
-cp packaging/install.sh packaging/uninstall.sh packaging/steam_shortcut.py "$bundle/packaging/"
+cp packaging/install.sh packaging/uninstall.sh packaging/steam_shortcut.py packaging/steam_input_neptune.vdf "$bundle/packaging/"
 mkdir -p "$bundle/runtime"
 pkgs=$(mktemp -d)
 grep -vE '^[[:space:]]*(#|$)' packaging/runtime-packages.txt | while read -r url; do

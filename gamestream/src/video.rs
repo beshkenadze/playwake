@@ -84,6 +84,13 @@ impl Assembler {
         self.waiting_for_key
     }
 
+    /// The host has sent nothing for a while. A frame still missing packets
+    /// will not get them, and a host showing a still picture may send no next
+    /// frame to reveal the loss: the frame is lost now.
+    pub(crate) fn idle(&mut self) {
+        if let Some(frame) = self.block.as_ref().map(|block| block.frame) { self.give_up(frame); }
+    }
+
     fn give_up(&mut self, frame: u32) {
         self.done = self.done.max(frame);
         self.block = None;
@@ -171,14 +178,14 @@ impl Assembler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const PAYLOAD: usize = 16;
 
     /// The packets of one frame the way the host cuts them: `blocks` blocks,
     /// each followed by its parity packets (a fifth of the data, rounded up).
-    fn packets(frame: u32, key: bool, bitstream: &[u8], blocks: usize) -> Vec<Vec<u8>> {
+    pub(crate) fn packets(frame: u32, key: bool, bitstream: &[u8], blocks: usize) -> Vec<Vec<u8>> {
         let mut body = vec![1, 0x34, 0x12, if key { 2 } else { 1 }, 0, 0, 0, 0];
         body.extend_from_slice(bitstream);
         let used = match body.len() % PAYLOAD { 0 => PAYLOAD, used => used };
@@ -318,5 +325,24 @@ mod tests {
         let two_blocks = packets(2, false, &[1; 100], 2);
         assert!(feed(&mut assembler, &two_blocks[two_blocks.len() / 2..]).is_empty());
         assert!(assembler.needs_key_frame());
+    }
+
+    #[test]
+    fn a_frame_left_unfinished_when_the_host_goes_quiet_needs_a_key_frame() {
+        let mut assembler = Assembler::new();
+        feed(&mut assembler, &packets(1, true, &[1; 40], 1));
+        // Quiet after a whole frame: nothing is lost.
+        assembler.idle();
+        assert!(!assembler.needs_key_frame());
+        // The end of the last frame before a still picture never comes.
+        let mut cut = packets(2, false, &[2; 40], 1);
+        cut.truncate(1);
+        assert!(feed(&mut assembler, &cut).is_empty());
+        assert!(!assembler.needs_key_frame());
+        assembler.idle();
+        assert!(assembler.needs_key_frame());
+        // Its missing packets, arriving after all, change nothing.
+        assert!(feed(&mut assembler, &packets(2, false, &[2; 40], 1)).is_empty());
+        assert!(matches!(&feed(&mut assembler, &packets(3, true, &[3; 40], 1))[..], [Frame { index: 3, key: true, .. }]));
     }
 }
