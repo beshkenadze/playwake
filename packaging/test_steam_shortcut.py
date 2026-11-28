@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import struct
 import sys
 import tempfile
@@ -58,6 +59,8 @@ class Tree:
         (self.app / sc.LAUNCHER).write_text("#!/bin/sh\n")
         for name in sc.ARTWORK:
             (self.app / "assets/branding" / name).write_bytes(b"png-" + name.encode())
+        (self.app / "packaging").mkdir()
+        (self.app / sc.LAYOUT).write_text('"controller_mappings"\n{\n}\n')
         self.root = self.root.resolve()
         self.app = self.app.resolve()
 
@@ -79,6 +82,47 @@ class Tree:
 
     def write_shortcuts(self, entries: dict) -> None:
         self.vdf.write_bytes(sc.dump_vdf({"shortcuts": entries}))
+
+    @property
+    def configs(self) -> Path:
+        return self.root / "steamapps/common/Steam Controller Configs/123/config"
+
+    @property
+    def configset(self) -> Path:
+        return self.configs / sc.CONFIGSET
+
+
+# What Steam writes: tabs, the layouts other apps use, our key's name inside another entry.
+CONFIGSET = (
+    '"controller_config"\n{\n'
+    '\t"261640"\n\t{\n\t\t"template"\t\t"gamepad+mouse.vdf"\n\t}\n'
+    '\t"moonlight"\n\t{\n\t\t"template"\t\t"controller_neptune_gamepad_fps.vdf"\n\t\t"playwake"\t\t"x"\n\t}\n'
+    '}\n'
+)
+OUR_ENTRY = '\t"playwake"\n\t{\n\t\t"autosave"\t\t"1"\n\t}\n'
+
+
+def vdf_pairs(text: str) -> list:
+    """A text VDF as nested (key, value) lists, keeping repeated keys."""
+    tokens = [m.group(1) if m.group(1) is not None else m.group(2)
+              for m in re.finditer(r'"((?:[^"\\]|\\.)*)"|([{}])', text)]
+
+    def walk(i: int) -> tuple[list, int]:
+        pairs = []
+        while i < len(tokens) and tokens[i] != "}":
+            key, i = tokens[i], i + 1
+            if tokens[i] == "{":
+                value, i = walk(i + 1)
+            else:
+                value, i = tokens[i], i + 1
+            pairs.append((key, value))
+        return pairs, i + 1
+
+    return walk(0)[0]
+
+
+def values(pairs: list, key: str) -> list:
+    return [value for name, value in pairs if name == key]
 
 
 class AppIdTests(unittest.TestCase):
@@ -222,6 +266,84 @@ class UninstallTests(unittest.TestCase):
         result = self.tree.cli("uninstall")
         self.assertFalse(result["removed_entry"])
         self.assertEqual(result["artwork_removed"], [])
+
+
+class LayoutTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tree = Tree(Path(self.tmp.name))
+        self.tree.configs.mkdir(parents=True)
+
+    def test_install_adds_our_layout_after_the_others(self):
+        self.tree.configset.write_text(CONFIGSET)
+        self.assertEqual(self.tree.cli("install")["layout"], "added")
+        self.assertEqual(self.tree.configset.read_text(), CONFIGSET[:-2] + OUR_ENTRY + "}\n")
+        layout = self.tree.configs / "playwake/controller_neptune.vdf"
+        self.assertEqual(layout.read_text(), (self.tree.app / sc.LAYOUT).read_text())
+        self.assertEqual(len(list(self.tree.configs.glob(sc.CONFIGSET + ".bak-*"))), 1)
+
+    def test_install_makes_the_configset_when_steam_has_none(self):
+        self.tree.cli("install")
+        self.assertEqual(self.tree.configset.read_text(), '"controller_config"\n{\n' + OUR_ENTRY + "}\n")
+
+    def test_a_layout_the_user_picked_stays(self):
+        picked = CONFIGSET[:-2] + '\t"Playwake"\n\t{\n\t\t"template"\t\t"controller_neptune_wasd.vdf"\n\t}\n}\n'
+        self.tree.configset.write_text(picked)
+        self.assertEqual(self.tree.cli("install")["layout"], "kept")
+        self.assertEqual(self.tree.configset.read_text(), picked)
+        self.assertFalse((self.tree.configs / "playwake").exists())
+
+    def test_a_second_install_keeps_the_layout_steam_saved(self):
+        self.tree.configset.write_text(CONFIGSET)
+        self.tree.cli("install")
+        layout = self.tree.configs / "playwake/controller_neptune.vdf"
+        layout.write_text("edited in Steam")
+        self.assertEqual(self.tree.cli("install")["layout"], "kept")
+        self.assertEqual(self.tree.configset.read_text(), CONFIGSET[:-2] + OUR_ENTRY + "}\n")
+        self.assertEqual(layout.read_text(), "edited in Steam")
+
+    def test_uninstall_removes_only_our_entry_and_layout(self):
+        self.tree.configset.write_text(CONFIGSET)
+        self.tree.cli("install")
+        self.assertTrue(self.tree.cli("uninstall")["layout_removed"])
+        self.assertEqual(self.tree.configset.read_text(), CONFIGSET)
+        self.assertFalse((self.tree.configs / "playwake").exists())
+        self.assertFalse(self.tree.cli("uninstall")["layout_removed"])
+
+    def test_dry_run_writes_no_layout(self):
+        self.tree.cli("install", "--dry-run")
+        self.assertFalse(self.tree.configset.exists())
+
+    def test_shipped_layout_keeps_the_gamepad_and_makes_the_trackpads_a_mouse(self):
+        layout = Path(__file__).resolve().parent / "steam_input_neptune.vdf"
+        mappings = dict(vdf_pairs(layout.read_text(encoding="utf-8")))["controller_mappings"]
+        self.assertEqual(values(mappings, "controller_type"), ["controller_neptune"])
+        groups = {values(group, "id")[0]: group for group in values(mappings, "group")}
+        sources = dict(values(values(mappings, "preset")[0], "group_source_bindings")[0])
+        active = {source.split()[0]: groups[gid] for gid, source in sources.items() if source.endswith(" active")}
+
+        def bindings(group: list) -> list:
+            return [binding for _, inp in values(group, "inputs")[0]
+                    for _, activator in values(inp, "activators")[0]
+                    for bound in values(activator, "bindings") for binding in values(bound, "binding")]
+
+        self.assertEqual(values(active["right_trackpad"], "mode"), ["absolute_mouse"])
+        self.assertEqual(bindings(active["right_trackpad"]), ["mouse_button LEFT"])
+        self.assertEqual(values(active["left_trackpad"], "mode"), ["scrollwheel"])
+        self.assertIn("mouse_button RIGHT", bindings(active["left_trackpad"]))
+        self.assertIn("mouse_wheel SCROLL_UP", bindings(active["left_trackpad"]))
+        for source in ("left_trigger", "right_trigger"):
+            self.assertEqual(values(active[source], "mode"), ["trigger"])
+        self.assertEqual(bindings(active["button_diamond"]), [f"xinput_button {b}" for b in "ABXY"])
+        self.assertEqual(values(active["joystick"], "mode"), ["joystick_move"])
+        self.assertEqual(values(active["right_joystick"], "mode"), ["joystick_move"])
+
+    def test_finds_only_a_root_entry_that_holds_a_map(self):
+        text = '"c"\n{\n\t"a"\t\t"playwake"\n\t"playwake"\t\t"1"\n\t"b"\n\t{\n\t\t"playwake"\n\t\t{\n\t\t}\n\t}\n}\n'
+        self.assertIsNone(sc.top_level_block(text, "playwake"))
+        start, end = sc.top_level_block(CONFIGSET + "", "moonlight")
+        self.assertTrue(CONFIGSET[start:end].startswith('\t"moonlight"') and CONFIGSET[start:end].endswith("\t}\n"))
 
 
 class AccountTests(unittest.TestCase):
