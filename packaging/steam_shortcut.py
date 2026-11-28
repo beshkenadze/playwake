@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import re
@@ -156,27 +157,42 @@ def parse_text_vdf(text: str) -> dict:
     return walk(0)[0]
 
 
-def top_level_block(text: str, key: str) -> tuple[int, int] | None:
-    """Where the root map's `key` entry starts and ends in a text VDF,
-    whole lines, or None. Steam writes these files, so editing one entry in
-    place keeps the rest of it byte for byte."""
+def scan_vdf(text: str) -> tuple[dict, int | None]:
+    """The root map's entries that hold a map in a text VDF, by lowercased
+    key, each as the span from its key to its closing brace, and where the
+    root's closing brace is. Steam writes these files, so editing one entry
+    in place keeps the rest of it byte for byte."""
+    entries: dict = {}
     depth = 0
-    start = None
     named = None
-    for match in re.finditer(r'"([^"]*)"|([{}])', text):
-        if match.group(2) == "{":
+    current = None
+    for match in re.finditer(r'//[^\n]*|"((?:[^"\\]|\\.)*)"|([{}])', text):
+        key, brace = match.group(1), match.group(2)
+        if key is None and brace is None:
+            continue
+        if brace == "{":
             depth += 1
             if depth == 2 and named is not None:
-                start = named
-        elif match.group(2) == "}":
+                current = named
+        elif brace == "}":
             depth -= 1
-            if start is not None and depth == 1:
-                end = text.find("\n", match.end())
-                return start, len(text) if end < 0 else end + 1
-        named = None
-        if depth == 1 and start is None and match.group(1) is not None and match.group(1).lower() == key:
-            named = text.rfind("\n", 0, match.start()) + 1
-    return None
+            if depth == 1 and current is not None:
+                entries.setdefault(current[0], (current[1], match.end()))
+                current = None
+            elif depth == 0:
+                return entries, match.start()
+        named = (key.lower(), match.start()) if key is not None and depth == 1 else None
+    return entries, None
+
+
+def whole_lines(text: str, start: int, end: int) -> tuple[int, int]:
+    """The span widened to whole lines when nothing else shares them."""
+    line = text.rfind("\n", 0, start) + 1
+    stop = text.find("\n", end)
+    stop = len(text) if stop < 0 else stop
+    if text[line:start].strip() or text[end:stop].strip():
+        return start, end
+    return line, min(stop + 1, len(text))
 
 
 def install_layout(configs: Path, layout: Path, dry_run: bool) -> str:
@@ -184,16 +200,16 @@ def install_layout(configs: Path, layout: Path, dry_run: bool) -> str:
     what was done: "added", "kept" or "missing" (no layout file to add)."""
     configset = configs / CONFIGSET
     text = configset.read_text(encoding="utf-8") if configset.is_file() else '"controller_config"\n{\n}\n'
-    if top_level_block(text, LAYOUT_KEY) is not None:
+    entries, close = scan_vdf(text)
+    if LAYOUT_KEY in entries:
         return "kept"
     if not layout.is_file():
         log(f"layout missing, skipped: {layout}")
         return "missing"
+    if close is None:
+        fail(f"cannot read {configset}")
     if dry_run:
         return "added"
-    close = text.rstrip().rfind("}")
-    if close < 0:
-        fail(f"cannot read {configset}")
     target = configs / LAYOUT_KEY / "controller_neptune.vdf"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(layout, target)
@@ -202,19 +218,25 @@ def install_layout(configs: Path, layout: Path, dry_run: bool) -> str:
     return "added"
 
 
-def remove_layout(configs: Path, dry_run: bool) -> bool:
-    """Drops the shortcut's layout entry and the layout Steam keeps for it."""
+def remove_layout(configs: Path, layout: Path, dry_run: bool) -> bool:
+    """Drops the shortcut's layout entry, and the layout file if it is still
+    the one the installer put there."""
     configset = configs / CONFIGSET
     if not configset.is_file():
         return False
     text = configset.read_text(encoding="utf-8")
-    block = top_level_block(text, LAYOUT_KEY)
-    if block is None:
+    span = scan_vdf(text)[0].get(LAYOUT_KEY)
+    if span is None:
         return False
     if not dry_run:
+        start, end = whole_lines(text, *span)
         backup(configset)
-        write_atomic(configset, (text[:block[0]] + text[block[1]:]).encode("utf-8"))
-        shutil.rmtree(configs / LAYOUT_KEY, ignore_errors=True)
+        write_atomic(configset, (text[:start] + text[end:]).encode("utf-8"))
+        ours = configs / LAYOUT_KEY / "controller_neptune.vdf"
+        if ours.is_file() and layout.is_file() and ours.read_bytes() == layout.read_bytes():
+            ours.unlink()
+            with contextlib.suppress(OSError):
+                ours.parent.rmdir()
     return True
 
 
@@ -445,7 +467,7 @@ def run(args: argparse.Namespace) -> dict:
         result["removed_entry"] = key is not None
         result["backup"] = save_shortcuts(vdf_path, data, args.dry_run)
         result["artwork_removed"] = remove_artwork(grid_dir, ids["short"], args.dry_run)
-        result["layout_removed"] = remove_layout(configs, args.dry_run)
+        result["layout_removed"] = remove_layout(configs, install_dir / LAYOUT, args.dry_run)
 
     return result
 

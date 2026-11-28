@@ -341,9 +341,30 @@ class LayoutTests(unittest.TestCase):
 
     def test_finds_only_a_root_entry_that_holds_a_map(self):
         text = '"c"\n{\n\t"a"\t\t"playwake"\n\t"playwake"\t\t"1"\n\t"b"\n\t{\n\t\t"playwake"\n\t\t{\n\t\t}\n\t}\n}\n'
-        self.assertIsNone(sc.top_level_block(text, "playwake"))
-        start, end = sc.top_level_block(CONFIGSET + "", "moonlight")
-        self.assertTrue(CONFIGSET[start:end].startswith('\t"moonlight"') and CONFIGSET[start:end].endswith("\t}\n"))
+        entries, close = sc.scan_vdf(text)
+        self.assertEqual(list(entries), ["b"])
+        self.assertEqual(close, len(text) - 2)
+        start, end = sc.scan_vdf(CONFIGSET)[0]["moonlight"]
+        self.assertTrue(CONFIGSET[start:end].startswith('"moonlight"') and CONFIGSET[start:end].endswith("}"))
+
+    def test_uninstall_from_a_one_line_configset_keeps_the_others(self):
+        self.tree.configset.write_text('"c" { "other" { "template" "x.vdf" } "Playwake" { "autosave" "1" } }')
+        self.assertTrue(self.tree.cli("uninstall")["layout_removed"])
+        self.assertEqual(self.tree.configset.read_text(), '"c" { "other" { "template" "x.vdf" }  }')
+
+    def test_a_brace_in_a_comment_is_no_brace(self):
+        commented = CONFIGSET[:-2] + "\t// a { in a comment\n}\n"
+        self.tree.configset.write_text(commented)
+        self.tree.cli("install")
+        self.assertEqual(self.tree.configset.read_text(), commented[:-2] + OUR_ENTRY + "}\n")
+
+    def test_uninstall_keeps_a_layout_the_user_edited(self):
+        self.tree.cli("install")
+        layout = self.tree.configs / "playwake/controller_neptune.vdf"
+        layout.write_text("edited in Steam")
+        self.tree.cli("uninstall")
+        self.assertNotIn("playwake", self.tree.configset.read_text().lower())
+        self.assertEqual(layout.read_text(), "edited in Steam")
 
 
 class AccountTests(unittest.TestCase):
