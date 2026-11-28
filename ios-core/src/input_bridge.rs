@@ -1,7 +1,9 @@
 //! C ABI for keyboard, mouse and touch input to the current stream. With a
 //! PC stream the core sends it as GameStream packets (`PcInput`); without
 //! one it becomes a gamepad (`PadFromKeys`) that the Xbox stream mixes into
-//! its controller with `pw_input_pad` before the stream-input route.
+//! its controller with `pw_input_pad` before the stream-input route. The
+//! on-screen pad (`overlay_bridge`) is input too: its keys come from the
+//! panel and its pad state joins in `pw_input_pad`.
 //! While the route's menu is open (`menu`) the gate is shut: input calls
 //! change nothing. Every call is safe from any thread.
 
@@ -9,10 +11,12 @@ use crate::bridge::{lock, read_string};
 use crate::input_route::PwPad;
 use crate::pc_bridge;
 use playwake_core::gamestream;
+use playwake_core::input::overlay::{Layout, Overlay, Surface};
 use playwake_core::input::{
     char_usage, Device, Gesture, InputEvent, MouseButton, PadFromKeys, PadLayout, PcInput, Phase, Sink, Touch,
     Trackpad, Usage,
 };
+use playwake_core::route::Routed;
 use std::collections::BTreeMap;
 use std::os::raw::c_char;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -50,13 +54,16 @@ pub const PW_INPUT_CHAR_SHIFT: u32 = 1 << 16;
 /// Returned by `pw_input_touch`: three fingers asked for the on-screen keyboard.
 pub const PW_INPUT_SHOW_KEYBOARD: u32 = 1 << 0;
 
+/// Returned by `pw_overlay_touch`: a control was newly pressed.
+pub const PW_OVERLAY_HAPTIC: u32 = 1 << 0;
+
 /// The HID usage page of keyboard keys.
 const KEYBOARD_PAGE: u16 = 0x07;
 
 /// The PC stream input goes to, with its session.
-type Pc<'a, S> = Option<(u64, &'a S)>;
+pub(crate) type Pc<'a, S> = Option<(u64, &'a S)>;
 
-struct Input {
+pub(crate) struct Input {
     /// The route of the current stream, by address; only its menu shuts the gate.
     route: usize,
     /// The route's menu is open: input waits, nothing is held.
@@ -72,6 +79,7 @@ struct Input {
     finger: Option<u32>,
     /// Direct touches the host has down, with their last point.
     touches: BTreeMap<u32, (f32, f32)>,
+    overlay: Overlay,
 }
 
 impl Default for Input {
@@ -87,6 +95,7 @@ impl Default for Input {
             trackpad: Trackpad::new(0.0, 0.0),
             finger: None,
             touches: BTreeMap::new(),
+            overlay: Overlay::default(),
         }
     }
 }
@@ -103,6 +112,7 @@ impl Input {
             self.trackpad.reset();
             self.finger = None;
             self.touches.clear();
+            self.overlay.release_all();
         }
         pc.map(|(_, sink)| sink)
     }
@@ -221,6 +231,7 @@ impl Input {
         // The PC side lets go of a drag's or a finger's button with the rest.
         self.trackpad.reset();
         self.finger = None;
+        self.overlay.release_all();
         match self.sync(pc) {
             Some(sink) => {
                 for (id, (x, y)) in std::mem::take(&mut self.touches) {
@@ -232,23 +243,62 @@ impl Input {
         }
     }
 
-    /// Mixes the keyboard-and-mouse pad into `pad`: buttons add up, the
-    /// triggers take the stronger press, and a stick axis the keys push wins.
+    /// Mixes the keyboard-and-mouse pad and the on-screen pad into `pad`.
     fn pad(&mut self, pad: &mut PwPad, now: f64) {
-        let keys = self.pad.state(now);
-        pad.buttons |= keys.buttons;
-        pad.lt = pad.lt.max(keys.lt);
-        pad.rt = pad.rt.max(keys.rt);
-        for (axis, key) in pad.axes.iter_mut().zip(keys.axes) {
-            if key != 0 { *axis = key; }
-        }
+        mix(pad, self.pad.state(now));
+        mix(pad, self.overlay.state());
+    }
+
+    /// The on-screen pad's keys and mouse buttons, from the panel.
+    fn overlay_events<S: Sink>(&mut self, pc: Pc<S>, events: Vec<InputEvent>) {
+        for event in events { self.send(pc, Device::Panel, event); }
+    }
+
+    pub(crate) fn overlay(&self) -> &Overlay { &self.overlay }
+
+    pub(crate) fn overlay_layout<S: Sink>(&mut self, pc: Pc<S>, layout: Layout) {
+        let released = self.overlay.set_layout(layout);
+        self.overlay_events(pc, released);
+    }
+
+    pub(crate) fn overlay_surface<S: Sink>(&mut self, pc: Pc<S>, surface: Surface) {
+        let released = self.overlay.set_surface(surface);
+        self.overlay_events(pc, released);
+    }
+
+    pub(crate) fn overlay_touch<S: Sink>(&mut self, pc: Pc<S>, id: u32, phase: Phase, x: f32, y: f32,
+        pressure: f32) -> u32
+    {
+        if self.paused { return 0; }
+        // First, so a new stream's reset cannot drop the touch's own keys.
+        self.sync(pc);
+        let change = self.overlay.touch(id, phase, x, y, pressure);
+        self.overlay_events(pc, change.events);
+        if change.haptic { PW_OVERLAY_HAPTIC } else { 0 }
+    }
+
+    /// Lets go of the on-screen pad alone, as it hides.
+    pub(crate) fn overlay_release<S: Sink>(&mut self, pc: Pc<S>) {
+        let released = self.overlay.release_all();
+        self.overlay_events(pc, released);
+    }
+}
+
+/// Mixes `other` into `pad`: buttons add up, the triggers take the stronger
+/// press, and a stick axis `other` pushes wins.
+fn mix(pad: &mut PwPad, other: Routed) {
+    pad.buttons |= other.buttons;
+    pad.lt = pad.lt.max(other.lt);
+    pad.rt = pad.rt.max(other.rt);
+    for (axis, value) in pad.axes.iter_mut().zip(other.axes) {
+        if value != 0 { *axis = value; }
     }
 }
 
 static INPUT: LazyLock<Mutex<Input>> = LazyLock::new(Mutex::default);
 
 /// Runs `f` on the input state and the current PC stream.
-fn with<R>(f: impl FnOnce(&mut Input, Pc<gamestream::Stream>) -> R) -> R {
+pub(crate) fn with<R>(f: impl FnOnce(&mut Input, Pc<gamestream::Stream>) -> R) -> R {
     locked(&INPUT, pc_bridge::stream, f)
 }
 
@@ -303,7 +353,7 @@ fn button(button: u32) -> Option<MouseButton> {
     })
 }
 
-fn phase(phase: u32) -> Option<Phase> {
+pub(crate) fn phase(phase: u32) -> Option<Phase> {
     Some(match phase {
         PW_INPUT_PHASE_BEGAN => Phase::Began,
         PW_INPUT_PHASE_MOVED => Phase::Moved,
@@ -466,6 +516,113 @@ mod tests {
     fn pad() -> PwPad { PwPad { axes: [0; 4], buttons: 0, lt: 0, rt: 0 } }
 
     fn touch(id: u32, phase: Phase, x: f32, y: f32) -> Touch { Touch { id, phase, x, y, pressure: 1.0 } }
+
+    /// An Esc key and A, the left button and the left stick over a 400 by
+    /// 400 point surface.
+    fn overlay_input() -> Input {
+        use playwake_core::input::overlay::{Control, Element, Side};
+        use playwake_core::input::Target;
+        let element = |control, x, y| Element { control, x, y, size: 0.2 };
+        let mut input = Input::default();
+        let layout = Layout {
+            portrait: vec![],
+            landscape: vec![
+                element(Control::Key { usage: 0x29, label: "Esc".into() }, 0.2, 0.2),
+                element(Control::Button { target: Target::A }, 0.8, 0.2),
+                element(Control::Mouse { button: MouseButton::Left }, 0.2, 0.8),
+                element(Control::Stick { side: Side::Left }, 0.8, 0.8),
+            ],
+            ..Layout::default()
+        };
+        input.overlay_layout(XBOX, layout);
+        input.overlay_surface(XBOX, Surface { width: 400.0, height: 400.0 });
+        input
+    }
+
+    #[test]
+    fn overlay_keys_reach_a_pc_from_the_panel() {
+        let (host, mut input) = (Host::default(), overlay_input());
+        let pc = Some((1, &host));
+        assert_eq!(input.overlay_touch(pc, 1, Phase::Began, 80.0, 80.0, 1.0), PW_OVERLAY_HAPTIC);
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, 0x29, true);
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, 0x29, false);
+        assert_eq!(host.take(), [Call::Key(0x1B, true, 0), Call::Key(0x1B, true, 0)],
+            "the keyboard letting go of Esc leaves the panel's held");
+        input.overlay_touch(pc, 1, Phase::Ended, 80.0, 80.0, 1.0);
+        input.overlay_touch(pc, 2, Phase::Began, 80.0, 320.0, 1.0);
+        input.overlay_touch(pc, 2, Phase::Ended, 80.0, 320.0, 1.0);
+        assert_eq!(host.take(), [Call::Key(0x1B, false, 0), Call::Button(MouseButton::Left, true),
+            Call::Button(MouseButton::Left, false)]);
+    }
+
+    #[test]
+    fn on_a_pc_the_pad_mix_leaves_the_controller_alone_while_the_overlay_is_idle() {
+        let (host, mut input) = (Host::default(), overlay_input());
+        let pc = Some((1, &host));
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, W, true);
+        input.send(pc, Device::Mouse, InputEvent::MouseButton { button: MouseButton::Left, down: true });
+        input.mouse_move(pc, 40.0, 0.0);
+        for now in [0.0, 8.0] {
+            let mut physical = PwPad { axes: [100, -200, 300, 0], buttons: 16, lt: 9, rt: 0 };
+            input.pad(&mut physical, now);
+            assert_eq!((physical.axes, physical.buttons, physical.lt, physical.rt), ([100, -200, 300, 0], 16, 9, 0));
+        }
+    }
+
+    #[test]
+    fn overlay_keys_on_an_xbox_become_its_pad() {
+        let mut input = overlay_input();
+        input.overlay_touch(XBOX, 1, Phase::Began, 80.0, 80.0, 1.0);
+        let mut sample = pad();
+        input.pad(&mut sample, 0.0);
+        assert_eq!(sample.buttons, 4, "Escape is Menu in the keyboard layout");
+    }
+
+    #[test]
+    fn the_overlay_joins_the_physical_pad() {
+        let mut input = overlay_input();
+        input.overlay_touch(XBOX, 1, Phase::Began, 320.0, 80.0, 1.0);
+        input.overlay_touch(XBOX, 2, Phase::Began, 320.0, 320.0, 1.0);
+        input.overlay_touch(XBOX, 2, Phase::Moved, 360.0, 320.0, 1.0);
+        let mut physical = PwPad { axes: [100, 200, 300, 0], buttons: 32, lt: 5, rt: 0 };
+        input.pad(&mut physical, 0.0);
+        assert_eq!(physical.buttons, 32 | 16);
+        assert_eq!(physical.axes, [i16::MAX, 200, 300, 0], "the stick the overlay leans wins on its axis");
+        assert_eq!((physical.lt, physical.rt), (5, 0));
+    }
+
+    #[test]
+    fn the_menu_and_a_new_stream_let_go_of_the_overlay() {
+        let (host, mut input) = (Host::default(), overlay_input());
+        let pc = Some((1, &host));
+        input.overlay_touch(pc, 1, Phase::Began, 80.0, 80.0, 1.0);
+        input.overlay_touch(pc, 2, Phase::Began, 320.0, 80.0, 1.0);
+        host.take();
+        input.menu(pc, true);
+        assert_eq!(host.take(), [Call::Key(0x1B, false, 0)]);
+        assert_eq!(input.overlay_touch(pc, 3, Phase::Began, 320.0, 80.0, 1.0), 0, "the menu shuts the gate");
+        input.menu(pc, false);
+        let mut sample = pad();
+        input.pad(&mut sample, 0.0);
+        assert_eq!(sample.buttons, 0, "fingers down through the menu stay out");
+        input.overlay_touch(pc, 4, Phase::Began, 320.0, 80.0, 1.0);
+        let new = Host::default();
+        input.overlay_touch(Some((2, &new)), 5, Phase::Began, 360.0, 360.0, 1.0);
+        let mut sample = pad();
+        input.pad(&mut sample, 8.0);
+        assert_eq!(sample.buttons, 0, "a new stream forgot A");
+    }
+
+    #[test]
+    fn hiding_the_overlay_lets_go_of_its_keys_only() {
+        let (host, mut input) = (Host::default(), overlay_input());
+        let pc = Some((1, &host));
+        input.key(pc, Device::Keyboard, KEYBOARD_PAGE, A, true);
+        input.overlay_touch(pc, 1, Phase::Began, 80.0, 80.0, 1.0);
+        host.take();
+        input.overlay_release(pc);
+        assert_eq!(host.take(), [Call::Key(0x1B, false, 0)]);
+    }
 
     #[test]
     fn pc_keys_carry_held_modifiers_and_other_pages_are_ignored() {
