@@ -4,7 +4,7 @@
 //! Port of media/gstreamer_player.py:859-921 + StreamInput wiring.
 
 use crate::{clock, protocol, route::{Route, Routed, RouteEvent, GUIDE}, x11::PointerEvent};
-use playwake_core::input::{InputEvent, MouseButton, PcInput, Sink};
+use playwake_core::input::{Device, InputEvent, MouseButton, PcInput, Sink};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
@@ -333,7 +333,7 @@ impl Mouse {
             (PointerEvent::Button { button, down }, _) => button_event(button, down),
             _ => None,
         };
-        if let Some(event) = event { self.pc.send(sink, event); }
+        if let Some(event) = event { self.pc.send(sink, Device::Mouse, event); }
     }
 }
 
