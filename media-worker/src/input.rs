@@ -301,7 +301,15 @@ pub struct Mouse {
     pub mode: MouseMode,
     active: bool,
     pc: PcInput,
+    /// When an absolute device last put the pointer somewhere.
+    jumped_at: Option<u32>,
+    /// X buttons a tap on the touchscreen holds, which game mode keeps local.
+    tapped: std::collections::BTreeSet<u32>,
 }
+
+/// How soon after an absolute jump a press counts as the tap that made it:
+/// Gamescope moves the pointer to the finger and presses at once.
+const TAP_MS: u32 = 250;
 
 impl Mouse {
     /// Sends `events` from a `window`-sized video window showing a
@@ -330,10 +338,26 @@ impl Mouse {
             (PointerEvent::Moved { dx, dy }, MouseMode::Game) => Some(InputEvent::MouseMove { dx: dx as f32, dy: dy as f32 }),
             (PointerEvent::At { x, y }, MouseMode::Desktop) => over_picture((x, y), window, picture)
                 .map(|(x, y)| InputEvent::MousePosition { x, y }),
-            (PointerEvent::Button { button, down }, _) => button_event(button, down),
+            (PointerEvent::Jumped { time }, _) => {
+                self.jumped_at = Some(time);
+                None
+            }
+            // A tap clicks where the finger is, which game mode does not track.
+            (PointerEvent::Button { button, down, time }, MouseMode::Game) if self.tap(button, down, time) => None,
+            (PointerEvent::Button { button, down, .. }, _) => button_event(button, down),
             _ => None,
         };
         if let Some(event) = event { self.pc.send(sink, Device::Mouse, event); }
+    }
+}
+
+impl Mouse {
+    /// Whether a button change belongs to a tap on the touchscreen.
+    fn tap(&mut self, button: u32, down: bool, time: u32) -> bool {
+        if !down { return self.tapped.remove(&button); }
+        let tap = self.jumped_at.is_some_and(|at| time.wrapping_sub(at) <= TAP_MS);
+        if tap { self.tapped.insert(button); }
+        tap
     }
 }
 
@@ -519,8 +543,8 @@ mod tests {
         let sink = Recorder::default();
         let mut mouse = active_mouse(&sink);
         for button in 1..=9 {
-            mouse.update(&sink, true, [PointerEvent::Button { button, down: true }], SCREEN, SCREEN);
-            mouse.update(&sink, true, [PointerEvent::Button { button, down: false }], SCREEN, SCREEN);
+            mouse.update(&sink, true, [PointerEvent::Button { button, down: true, time: 0 }], SCREEN, SCREEN);
+            mouse.update(&sink, true, [PointerEvent::Button { button, down: false, time: 0 }], SCREEN, SCREEN);
         }
         assert_eq!(sink.take(), [
             "Left true", "Left false", "Middle true", "Middle false", "Right true", "Right false",
@@ -533,11 +557,11 @@ mod tests {
     fn losing_the_mouse_lets_go_of_held_buttons_and_drops_later_events() {
         let sink = Recorder::default();
         let mut mouse = active_mouse(&sink);
-        mouse.update(&sink, true, [PointerEvent::Button { button: 1, down: true }], SCREEN, SCREEN);
-        mouse.update(&sink, true, [PointerEvent::Button { button: 3, down: true }], SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::Button { button: 1, down: true, time: 0 }], SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::Button { button: 3, down: true, time: 0 }], SCREEN, SCREEN);
         sink.take();
         // A click read as the menu opens stays local.
-        mouse.update(&sink, false, [PointerEvent::Button { button: 2, down: true }], SCREEN, SCREEN);
+        mouse.update(&sink, false, [PointerEvent::Button { button: 2, down: true, time: 0 }], SCREEN, SCREEN);
         assert_eq!(sink.take(), ["Left false", "Right false"]);
         mouse.update(&sink, false, [PointerEvent::Moved { dx: 4.0, dy: 4.0 }], SCREEN, SCREEN);
         // Motion made while the menu was open stays local as the mouse is taken again.
@@ -547,10 +571,34 @@ mod tests {
     }
 
     #[test]
+    fn a_tap_on_the_screen_does_not_click_in_game_mode() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        let left = |down, time| PointerEvent::Button { button: 1, down, time };
+        // Gamescope puts the pointer at the finger, then presses and releases.
+        mouse.update(&sink, true, [PointerEvent::Jumped { time: 1000 }, PointerEvent::At { x: 639.0, y: 319.0 },
+            left(true, 1000), left(false, 1080)], SCREEN, SCREEN);
+        assert_eq!(sink.take(), Vec::<String>::new());
+        // The mouse's own click a moment later goes to the PC.
+        mouse.update(&sink, true, [left(true, 1400), left(false, 1450)], SCREEN, SCREEN);
+        assert_eq!(sink.take(), ["Left true", "Left false"]);
+    }
+
+    #[test]
+    fn a_tap_on_the_screen_clicks_where_the_finger_is_in_desktop_mode() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        mouse.toggle_mode(&sink);
+        mouse.update(&sink, true, [PointerEvent::Jumped { time: 1000 }, PointerEvent::At { x: 640.0, y: 400.0 },
+            PointerEvent::Button { button: 1, down: true, time: 1000 }], SCREEN, SCREEN);
+        assert_eq!(sink.take(), ["at 16384 16384", "Left true"]);
+    }
+
+    #[test]
     fn switching_modes_lets_go_of_held_buttons() {
         let sink = Recorder::default();
         let mut mouse = active_mouse(&sink);
-        mouse.update(&sink, true, [PointerEvent::Button { button: 1, down: true }], SCREEN, SCREEN);
+        mouse.update(&sink, true, [PointerEvent::Button { button: 1, down: true, time: 0 }], SCREEN, SCREEN);
         sink.take();
         mouse.toggle_mode(&sink);
         mouse.toggle_mode(&sink);

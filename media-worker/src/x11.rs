@@ -337,10 +337,14 @@ unsafe impl Send for X11Window {}
 pub enum PointerEvent {
     /// How far the device moved, before the cursor stops at a screen edge.
     Moved { dx: f64, dy: f64 },
+    /// The pointer was put somewhere by an absolute device: Gamescope does
+    /// this for a tap on the touchscreen. `time` is the server's, in ms.
+    Jumped { time: u32 },
     /// Where the pointer is in the grab window, in pixels.
     At { x: f64, y: f64 },
-    /// An X button: 1–3 left, middle, right; 4–7 the wheel; 8 and 9 back and forward.
-    Button { button: u32, down: bool },
+    /// An X button: 1–3 left, middle, right; 4–7 the wheel; 8 and 9 back
+    /// and forward. `time` is the server's, in ms.
+    Button { button: u32, down: bool, time: u32 },
 }
 
 /// The pointer read through XInput2, on a connection of its own so its grab
@@ -348,6 +352,10 @@ pub enum PointerEvent {
 pub struct Pointer {
     connection: RustConnection,
     device: u16,
+    /// The devices that report where the pointer is, not how far it moved.
+    absolute: Vec<u16>,
+    /// ALLY_MOUSE_DEBUG: log every pointer event.
+    debug: bool,
     /// A cursor with no pixels, shown while the pointer is hidden.
     blank: u32,
     /// The window holding the grab, and whether the cursor is hidden.
@@ -370,6 +378,14 @@ impl Pointer {
         let devices = connection.xinput_xi_query_device(Device::ALL_MASTER).map_err(|e| error(&e))?
             .reply().map_err(|e| error(&e))?.infos;
         let device = master_pointer(&devices).ok_or("XInput2 pointer: no master pointer")?;
+        let slaves = connection.xinput_xi_query_device(Device::ALL).map_err(|e| error(&e))?
+            .reply().map_err(|e| error(&e))?.infos;
+        let absolute = absolute_pointers(&slaves);
+        let debug = std::env::var_os("ALLY_MOUSE_DEBUG").is_some();
+        if debug {
+            for d in &slaves { eprintln!("pw-mouse device {} {}", d.deviceid, String::from_utf8_lossy(&d.name)); }
+            eprintln!("pw-mouse absolute devices {absolute:?}");
+        }
         // Raw motion goes only to the root window, whatever has the grab.
         connection.xinput_xi_select_events(root, &[EventMask {
             deviceid: Device::ALL_MASTER.into(), mask: vec![XIEventMask::RAW_MOTION],
@@ -382,7 +398,7 @@ impl Pointer {
         connection.create_cursor(blank, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 0, 0).map_err(|e| error(&e))?;
         connection.free_gc(gc).map_err(|e| error(&e))?;
         connection.free_pixmap(pixmap).map_err(|e| error(&e))?.check().map_err(|e| error(&e))?;
-        Ok(Self { connection, device, blank, grabbed: None, alive: std::sync::Arc::new(()) })
+        Ok(Self { connection, device, absolute, debug, blank, grabbed: None, alive: std::sync::Arc::new(()) })
     }
 
     /// The fd to watch for events, and a token that dies with this pointer.
@@ -418,7 +434,11 @@ impl Pointer {
     /// The events that arrived since the last call.
     pub fn events(&mut self) -> Vec<PointerEvent> {
         let mut events = Vec::new();
-        while let Ok(Some(event)) = self.connection.poll_for_event() { events.extend(pointer_events(event)); }
+        while let Ok(Some(event)) = self.connection.poll_for_event() {
+            let pointer = pointer_events(event, &self.absolute);
+            if self.debug && !pointer.is_empty() { eprintln!("pw-mouse {pointer:?}"); }
+            events.extend(pointer);
+        }
         events
     }
 }
@@ -431,21 +451,32 @@ fn master_pointer(devices: &[x11rb::protocol::xinput::XIDeviceInfo]) -> Option<u
 
 /// What an X event says about the pointer. A button comes with where it
 /// was pressed, which a click without motion before it needs.
-fn pointer_events(event: x11rb::protocol::Event) -> Vec<PointerEvent> {
+fn pointer_events(event: x11rb::protocol::Event, absolute: &[u16]) -> Vec<PointerEvent> {
     use x11rb::protocol::Event;
     let at = |x: i32, y: i32| PointerEvent::At { x: f64::from(x) / 65536.0, y: f64::from(y) / 65536.0 };
     match event {
+        // An absolute device's raw values are a place, not a distance.
+        Event::XinputRawMotion(raw) if absolute.contains(&raw.sourceid) => vec![PointerEvent::Jumped { time: raw.time }],
         Event::XinputRawMotion(raw) => {
             let (dx, dy) = raw_motion(&raw.valuator_mask, &raw.axisvalues_raw);
             vec![PointerEvent::Moved { dx, dy }]
         }
         Event::XinputMotion(motion) => vec![at(motion.event_x, motion.event_y)],
         Event::XinputButtonPress(press) => vec![at(press.event_x, press.event_y),
-            PointerEvent::Button { button: press.detail, down: true }],
+            PointerEvent::Button { button: press.detail, down: true, time: press.time }],
         Event::XinputButtonRelease(release) => vec![at(release.event_x, release.event_y),
-            PointerEvent::Button { button: release.detail, down: false }],
+            PointerEvent::Button { button: release.detail, down: false, time: release.time }],
         _ => Vec::new(),
     }
+}
+
+/// The pointers whose first valuator is absolute: Xwayland's pointer, which
+/// carries Gamescope's absolute motion, as opposed to its relative one.
+fn absolute_pointers(devices: &[x11rb::protocol::xinput::XIDeviceInfo]) -> Vec<u16> {
+    use x11rb::protocol::xinput::{DeviceClassData, ValuatorMode};
+    devices.iter().filter(|device| device.classes.iter().any(|class| matches!(&class.data,
+        DeviceClassData::Valuator(valuator) if valuator.number == 0 && valuator.mode == ValuatorMode::ABSOLUTE)))
+        .map(|device| device.deviceid).collect()
 }
 
 /// The motion along valuators 0 and 1 of a raw event. Its values come one
@@ -581,10 +612,37 @@ mod tests {
     #[test]
     fn a_button_comes_with_where_it_was_pressed() {
         use x11rb::protocol::{Event, xinput::ButtonPressEvent};
-        let press = ButtonPressEvent { detail: 1, event_x: 100 << 16, event_y: (50 << 16) + (1 << 15), ..Default::default() };
-        assert_eq!(pointer_events(Event::XinputButtonPress(press.clone())), [
-            PointerEvent::At { x: 100.0, y: 50.5 }, PointerEvent::Button { button: 1, down: true }]);
-        assert_eq!(pointer_events(Event::XinputButtonRelease(press))[1], PointerEvent::Button { button: 1, down: false });
+        let press = ButtonPressEvent { detail: 1, time: 7, event_x: 100 << 16, event_y: (50 << 16) + (1 << 15), ..Default::default() };
+        assert_eq!(pointer_events(Event::XinputButtonPress(press.clone()), &[]), [
+            PointerEvent::At { x: 100.0, y: 50.5 }, PointerEvent::Button { button: 1, down: true, time: 7 }]);
+        assert_eq!(pointer_events(Event::XinputButtonRelease(press), &[])[1], PointerEvent::Button { button: 1, down: false, time: 7 });
+    }
+
+    #[test]
+    fn raw_values_of_an_absolute_device_are_a_jump_not_a_move() {
+        use x11rb::protocol::{Event, xinput::{Fp3232, RawMotionEvent}};
+        // A tap on the Deck's screen: Xwayland's absolute pointer at 639, 319.
+        let raw = |sourceid| RawMotionEvent { sourceid, time: 5, valuator_mask: vec![0b11],
+            axisvalues_raw: vec![Fp3232 { integral: 639, frac: 0 }, Fp3232 { integral: 319, frac: 0 }], ..Default::default() };
+        assert_eq!(pointer_events(Event::XinputRawMotion(raw(6)), &[6]), [PointerEvent::Jumped { time: 5 }]);
+        assert_eq!(pointer_events(Event::XinputRawMotion(raw(7)), &[6]), [PointerEvent::Moved { dx: 639.0, dy: 319.0 }]);
+    }
+
+    #[test]
+    fn finds_the_pointers_with_an_absolute_first_valuator() {
+        use x11rb::protocol::xinput::{DeviceClass, DeviceClassData, DeviceClassDataValuator, DeviceType, Fp3232, ValuatorMode, XIDeviceInfo};
+        let valuator = |number, mode| DeviceClass { len: 0, sourceid: 0, data: DeviceClassData::Valuator(DeviceClassDataValuator {
+            number, label: 0, min: Fp3232::default(), max: Fp3232::default(), value: Fp3232::default(), resolution: 0, mode }) };
+        let device = |deviceid, classes| XIDeviceInfo { deviceid, type_: DeviceType::SLAVE_POINTER, attachment: 2, enabled: true,
+            name: Vec::new(), classes };
+        let devices = [
+            device(6, vec![valuator(0, ValuatorMode::ABSOLUTE), valuator(1, ValuatorMode::ABSOLUTE)]),
+            device(7, vec![valuator(0, ValuatorMode::RELATIVE), valuator(1, ValuatorMode::RELATIVE)]),
+            // Only a scroll valuator is absolute.
+            device(8, vec![valuator(0, ValuatorMode::RELATIVE), valuator(2, ValuatorMode::ABSOLUTE)]),
+            device(9, Vec::new()),
+        ];
+        assert_eq!(absolute_pointers(&devices), [6]);
     }
 }
 
