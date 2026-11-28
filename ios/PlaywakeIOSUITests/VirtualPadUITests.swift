@@ -1,8 +1,8 @@
 import XCTest
 
 final class VirtualPadUITests: XCTestCase {
-    /// Touches on the on-screen pad play the game and leave the stream menu
-    /// shut; its own button opens it (a tap on the video goes to the stream).
+    /// Touches on the on-screen pad play the game; only touches elsewhere
+    /// open the stream menu.
     @MainActor
     func testViewAndMenuShowWithThePad() {
         let app = XCUIApplication()
@@ -44,7 +44,8 @@ final class VirtualPadUITests: XCTestCase {
         view.tap()
         XCTAssertFalse(menu.waitForExistence(timeout: 2), "a touch on View opened the stream menu")
 
-        app.buttons["streamMenuButton"].tap()
-        XCTAssertTrue(menu.waitForExistence(timeout: 5), "the menu button did not open the stream menu")
+        XCTAssertFalse(app.buttons["streamMenuButton"].exists, "an Xbox stream showed the menu button")
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
+        XCTAssertTrue(menu.waitForExistence(timeout: 5), "a touch on the video did not open the stream menu")
     }
 }

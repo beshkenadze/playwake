@@ -40,8 +40,14 @@ final class SessionController: ObservableObject {
         case consoles, cloud, pcs, settings
     }
 
+    /// In the order the menu shows them.
     enum MenuItem: CaseIterable {
-        case resume, guide, statistics, mouse, reconnect, end
+        case resume, guide, statistics, mouse, touch, keyboard, reconnect, end
+
+        /// The rows shown: Touch and Keyboard only while the stream takes touches.
+        static func shown(touches: Bool) -> [MenuItem] {
+            allCases.filter { touches || ($0 != .touch && $0 != .keyboard) }
+        }
     }
 
     @Published private(set) var phase: Phase = .restoring
@@ -64,6 +70,8 @@ final class SessionController: ObservableObject {
         didSet { if !fixture { UserDefaults.standard.set(showStats, forKey: "showStats") } }
     }
     @Published private(set) var streamTitle = ""
+    /// The stream is from a PC: taps and the pointer over the video go to it.
+    @Published private(set) var pcStream = false
     /// False until the first decoded frame; the connecting screen covers the video.
     @Published private(set) var firstFrame = false
     @Published private(set) var menuOpen = false
@@ -239,12 +247,22 @@ final class SessionController: ObservableObject {
         if let pcPlayer { pcPlayer.closeMenu(guide: guide) } else if let rtc { rtc.closeMenu(guide: guide) } else if fixture { handleMenu(UInt32(PW_ROUTE_MENU_CLOSED)) }
     }
 
+    /// Fingers on the video go to the stream, not to the menu: a PC stream
+    /// on a touch screen.
+    var streamTakesTouches: Bool { pcStream && TouchInput.supported }
+
+    var menuItems: [MenuItem] { MenuItem.shown(touches: streamTakesTouches) }
+
     func perform(_ item: MenuItem) {
         switch item {
         case .resume: closeMenu()
         case .guide: closeMenu(guide: true)
         case .statistics: showStats.toggle()
         case .mouse: KeyboardMouse.shared.toggleMode()
+        case .touch: TouchInput.shared.toggleMode()
+        case .keyboard:
+            SoftKeyboard.shared.show()
+            closeMenu()
         case .reconnect: reconnect()
         case .end: stop()
         }
@@ -258,7 +276,8 @@ final class SessionController: ObservableObject {
         if events & UInt32(PW_ROUTE_MENU_CLOSED) != 0 {
             menuOpen = false
         }
-        let count = MenuItem.allCases.count
+        let items = menuItems
+        let count = items.count
         if events & UInt32(PW_ROUTE_KEY_PREVIOUS) != 0 {
             menuSelection = (menuSelection + count - 1) % count
         }
@@ -266,7 +285,7 @@ final class SessionController: ObservableObject {
             menuSelection = (menuSelection + 1) % count
         }
         if events & UInt32(PW_ROUTE_KEY_ACTIVATE) != 0 {
-            perform(MenuItem.allCases[menuSelection])
+            perform(items[menuSelection])
         }
         if events & UInt32(PW_ROUTE_KEY_BACK) != 0 {
             closeMenu()
@@ -275,6 +294,7 @@ final class SessionController: ObservableObject {
 
     private func beginStreaming(_ target: StreamTarget, title: String, status: String = "Starting the Xbox session…") {
         lastTarget = target
+        if case .pc = target { pcStream = true } else { pcStream = false }
         streamTitle = title
         firstFrame = false
         menuOpen = false
@@ -440,7 +460,7 @@ final class SessionController: ObservableObject {
 
     /// `-uiFixture <state>`: fills the screens with sample data so every state
     /// can be checked without a console (welcome, signin, code, consoles,
-    /// cloud, settings, connecting, stream, menu).
+    /// cloud, settings, connecting, stream, menu; pcstream, a PC's).
     func loadFixture(_ name: String) {
         fixture = true
         consoles = [
@@ -466,8 +486,9 @@ final class SessionController: ObservableObject {
                                 code: "K7PM-Q2XD", prefilled: true)
         case "cloud": section = .cloud
         case "settings": section = .settings
-        case "connecting", "stream", "menu":
-            streamTitle = "Living Room"
+        case "connecting", "stream", "menu", "pcstream":
+            pcStream = name == "pcstream"
+            streamTitle = pcStream ? "Gaming PC" : "Living Room"
             streaming = true
             status = "Starting the Xbox session…"
             firstFrame = name != "connecting"

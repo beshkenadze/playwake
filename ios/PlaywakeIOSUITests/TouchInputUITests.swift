@@ -1,7 +1,8 @@
 import XCTest
 
-/// Real touches on the stream fixture. `-inputJournal` shows the touch and
-/// keyboard calls the app made to the core.
+/// Real touches on the stream fixtures: a PC's takes them, an Xbox's opens
+/// its menu. `-inputJournal` shows the touch and keyboard calls the app made
+/// to the core.
 final class TouchInputUITests: XCTestCase {
     override func setUp() {
         continueAfterFailure = false
@@ -9,9 +10,9 @@ final class TouchInputUITests: XCTestCase {
     }
 
     @MainActor
-    private func launch(touch: String = "trackpad", pad: String = "never") -> XCUIApplication {
+    private func launch(touch: String = "trackpad", pad: String = "never", extra: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", pad, "-touchMode", touch, "-inputJournal"]
+        app.launchArguments = ["-uiFixture", "pcstream", "-virtualPad", pad, "-touchMode", touch, "-inputJournal"] + extra
         app.launch()
         XCTAssertTrue(app.otherElements["touchSurface"].waitForExistence(timeout: 20), "the stream did not take touches")
         return app
@@ -135,5 +136,31 @@ final class TouchInputUITests: XCTestCase {
         XCTAssertTrue(waitForJournal(app, toContain: "touch ended 0.25 0.75"), journal(app))
         XCTAssertEqual(journal(app).components(separatedBy: "touch began").count - 1, 1,
                        "a touch on the bars reached the stream: \(journal(app))")
+    }
+
+    /// The view that follows a mouse in desktop mode lets fingers through.
+    @MainActor
+    func testFingersPassThroughThePointerArea() {
+        let app = launch(extra: ["-pointerArea"])
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(waitForJournal(app, toContain: "touch began"), "the pointer area took the finger: \(journal(app))")
+        XCTAssertTrue(waitForJournal(app, toContain: "touch ended"), journal(app))
+    }
+
+    @MainActor
+    func testAnXboxStreamOpensItsMenuWithATapAndHasNoMenuButton() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiFixture", "stream", "-virtualPad", "never", "-inputJournal"]
+        app.launch()
+        let stats = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'fps'")).firstMatch
+        XCTAssertTrue(stats.waitForExistence(timeout: 20), "the stream did not open")
+        XCTAssertFalse(app.otherElements["touchSurface"].exists, "an Xbox stream took touches")
+        XCTAssertFalse(app.buttons["streamMenuButton"].exists, "an Xbox stream showed the menu button")
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(app.staticTexts["Input paused"].waitForExistence(timeout: 5), "a tap on the video did not open the menu")
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Touch'")).firstMatch.exists,
+                       "an Xbox menu has the touch row")
+        XCTAssertFalse(app.buttons["Keyboard"].exists, "an Xbox menu has the keyboard row")
+        XCTAssertFalse(journal(app).contains("touch"), "a tap reached the stream: \(journal(app))")
     }
 }

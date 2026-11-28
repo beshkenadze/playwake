@@ -3,9 +3,9 @@ import UIKit
 
 /// Fingers on the video for the stream. The core reads the gestures
 /// (`pw_input_touch`): as a laptop trackpad, or touching the video where the
-/// finger lands. A PC gets them as mouse or touch input, an Xbox as the
-/// keyboard-and-mouse pad. While the stream takes touches, the menu opens
-/// with its own button: a tap on the video clicks.
+/// finger lands; a PC gets them as mouse or touch input. Only a PC stream
+/// takes touches; then the menu opens with its own button, as a tap on the
+/// video clicks. On an Xbox a tap opens the menu.
 @MainActor
 final class TouchInput: ObservableObject {
     enum Mode: String {
@@ -234,24 +234,27 @@ final class TouchSurfaceView: UIView {
     }
 }
 
-/// Opens the stream menu while taps on the video belong to the stream.
+/// Opens the stream menu while taps on the video belong to the stream;
+/// without an `action` no button shows.
 struct StreamMenuButton: View {
-    let action: () -> Void
+    let action: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Button(action: action) {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 36, height: 36)
-                    .background(Circle().fill(Color.black.opacity(0.45)))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
+            if let action {
+                Button(action: action) {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(Circle().fill(Color.black.opacity(0.45)))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Stream menu")
+                .accessibilityIdentifier("streamMenuButton")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Stream menu")
-            .accessibilityIdentifier("streamMenuButton")
             #if DEBUG
             InputJournalView()
             #endif

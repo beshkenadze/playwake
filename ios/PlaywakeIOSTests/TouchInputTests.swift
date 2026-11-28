@@ -83,6 +83,12 @@ struct TouchInputTests {
         #expect(moved.x == 1.4 && moved.y == -0.3)
     }
 
+    @Test func theMenuHasTouchAndKeyboardRowsOnlyWhileTheStreamTakesTouches() {
+        #expect(SessionController.MenuItem.shown(touches: true)
+                == [.resume, .guide, .statistics, .mouse, .touch, .keyboard, .reconnect, .end])
+        #expect(SessionController.MenuItem.shown(touches: false) == [.resume, .guide, .statistics, .mouse, .reconnect, .end])
+    }
+
     @Test func theSurfaceIsTheVideoNotTheBars() {
         // iPhone landscape: wider than 16:9, bars at the sides.
         let landscape = TouchInput.videoSize(in: CGSize(width: 874, height: 402))

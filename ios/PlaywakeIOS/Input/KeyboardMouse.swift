@@ -42,6 +42,8 @@ final class KeyboardMouse: ObservableObject {
         }
     }
     @Published private(set) var mouseConnected = false
+    /// The system captured the pointer (game mode): clicks reach no view.
+    @Published private(set) var pointerLocked = false
 
     /// The stream shows video and its menu is closed.
     private var streamActive = false
@@ -83,6 +85,7 @@ final class KeyboardMouse: ObservableObject {
         center.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { note in
             let locked = (note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene)?.pointerLockState?.isLocked
             LabLog.write("pointer lock \(locked.map { $0 ? "on" : "off" } ?? "unknown")")
+            MainActor.assumeIsolated { KeyboardMouse.shared.pointerLocked = locked ?? false }
         }
         connect()
     }
@@ -114,6 +117,13 @@ final class KeyboardMouse: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Whether a tap or click on the video opens the stream menu. A PC takes
+    /// the mouse's clicks; an Xbox has no pointer, so a click opens the menu
+    /// unless the pointer is captured, when the mouse is the right stick.
+    nonisolated static func tapOpensMenu(pcStream: Bool, mouseConnected: Bool, pointerLocked: Bool) -> Bool {
+        !mouseConnected || !pcStream && !pointerLocked
     }
 
     /// Lets go of the left button if the view still holds it.
@@ -345,27 +355,66 @@ private enum PointerLock {
 
 /// Desktop mode: follows the pointer over the stream, also while a button
 /// is held, and sends the left button with the pointer's place.
-struct PointerArea: View {
-    @GestureState private var pressing = false
+struct PointerArea: UIViewRepresentable {
+    func makeUIView(context: Context) -> PointerAreaView { PointerAreaView() }
+    func updateUIView(_ view: PointerAreaView, context: Context) {}
 
-    var body: some View {
-        GeometryReader { geometry in
-            Color.clear
-                .contentShape(Rectangle())
-                .onContinuousHover { phase in
-                    if case .active(let point) = phase {
-                        KeyboardMouse.shared.pointer(at: point, in: geometry.size)
-                    }
-                }
-                .gesture(DragGesture(minimumDistance: 0)
-                    .updating($pressing) { _, pressing, _ in pressing = true }
-                    .onChanged { drag in KeyboardMouse.shared.pointer(at: drag.location, in: geometry.size, pressed: true) }
-                    .onEnded { drag in KeyboardMouse.shared.pointer(at: drag.location, in: geometry.size, pressed: false) })
-                // A cancelled drag never ends, but its gesture state resets.
-                .onChange(of: pressing) { _, pressing in
-                    if !pressing { KeyboardMouse.shared.pointerLifted() }
-                }
-                .onDisappear { KeyboardMouse.shared.pointerLifted() }
-        }
+    static func dismantleUIView(_ view: PointerAreaView, coordinator: ()) {
+        KeyboardMouse.shared.pointerLifted()
+    }
+
+    #if DEBUG
+    /// `-pointerArea`: shown without a mouse, for UI tests in the simulator.
+    static let forced = ProcessInfo.processInfo.arguments.contains("-pointerArea")
+    #else
+    static let forced = false
+    #endif
+}
+
+final class PointerAreaView: UIView {
+    /// The touch of the primary button while it is held.
+    private var press: UITouch?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hover(_:))))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    /// The pointer's hover and clicks; fingers go on to the touch surface below.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if let event, TouchSurfaceView.takes(event.type, buttons: event.buttonMask) { return nil }
+        return super.hitTest(point, with: event)
+    }
+
+    @objc private func hover(_ recognizer: UIHoverGestureRecognizer) {
+        guard recognizer.state == .began || recognizer.state == .changed else { return }
+        KeyboardMouse.shared.pointer(at: recognizer.location(in: self), in: bounds.size)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard press == nil, event?.buttonMask.contains(.primary) == true,
+              let touch = touches.first(where: { $0.type == .indirectPointer }) else { return }
+        press = touch
+        KeyboardMouse.shared.pointer(at: touch.location(in: self), in: bounds.size, pressed: true)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let press, touches.contains(press) else { return }
+        KeyboardMouse.shared.pointer(at: press.location(in: self), in: bounds.size, pressed: true)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let press, touches.contains(press) else { return }
+        self.press = nil
+        KeyboardMouse.shared.pointer(at: press.location(in: self), in: bounds.size, pressed: false)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let press, touches.contains(press) else { return }
+        self.press = nil
+        KeyboardMouse.shared.pointerLifted()
     }
 }

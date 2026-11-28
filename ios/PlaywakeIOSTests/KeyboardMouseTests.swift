@@ -98,6 +98,14 @@ struct KeyboardMouseTests {
         #expect(sent == 10)
     }
 
+    @Test func aTapOpensTheMenuUnlessThePcOrTheCapturedMouseTakesIt() {
+        #expect(KeyboardMouse.tapOpensMenu(pcStream: true, mouseConnected: false, pointerLocked: false))
+        #expect(!KeyboardMouse.tapOpensMenu(pcStream: true, mouseConnected: true, pointerLocked: false))
+        #expect(KeyboardMouse.tapOpensMenu(pcStream: false, mouseConnected: false, pointerLocked: false))
+        #expect(KeyboardMouse.tapOpensMenu(pcStream: false, mouseConnected: true, pointerLocked: false))
+        #expect(!KeyboardMouse.tapOpensMenu(pcStream: false, mouseConnected: true, pointerLocked: true))
+    }
+
     @Test func storedModeDefaultsToGame() throws {
         let defaults = try #require(UserDefaults(suiteName: "KeyboardMouseTests"))
         defer { defaults.removePersistentDomain(forName: "KeyboardMouseTests") }

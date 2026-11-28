@@ -16,8 +16,8 @@ struct StreamView: View {
             if touchActive {
                 TouchSurface().ignoresSafeArea()
             }
-            // With a mouse in desktop mode it takes fingers too, as the pointer.
-            if padActive && keyboardMouse.mouseConnected && keyboardMouse.mode == .desktop {
+            // Over the touch surface; fingers pass through it.
+            if pointerActive {
                 PointerArea().ignoresSafeArea()
             }
             if !controller.firstFrame {
@@ -29,9 +29,7 @@ struct StreamView: View {
                     .allowsHitTesting(false)
             }
             VirtualPadButtons()
-            if touchActive {
-                StreamMenuButton { controller.openMenu() }
-            }
+            StreamMenuButton(action: touchActive ? { controller.openMenu() } : nil)
             SoftKeyboardField().frame(width: 0, height: 0)
             // Shown while connecting too: View+Menu opens the route's menu and
             // pauses the pad, so the menu must be visible whenever it is open.
@@ -47,11 +45,14 @@ struct StreamView: View {
             }
         }
         .contentShape(Rectangle())
-        // With touch, a tap on the video clicks and the menu has its button;
-        // a tap gesture here would hold back the fingers' lift.
+        // When the stream takes touches, a tap on the video clicks and the
+        // menu has its button; a tap gesture here would hold back the fingers' lift.
         .gesture(TapGesture().onEnded {
-            // A mouse click belongs to the stream; Cmd+K opens the menu.
-            guard controller.firstFrame, !keyboardMouse.mouseConnected else { return }
+            // Otherwise Cmd+K and View+Menu open the menu.
+            guard controller.firstFrame,
+                  KeyboardMouse.tapOpensMenu(pcStream: controller.pcStream, mouseConnected: keyboardMouse.mouseConnected,
+                                             pointerLocked: keyboardMouse.pointerLocked)
+            else { return }
             controller.menuOpen ? controller.closeMenu() : controller.openMenu()
         }, including: touchActive ? .subviews : .all)
         .background { shortcuts }
@@ -77,7 +78,13 @@ struct StreamView: View {
     /// The on-screen pad would cover the menu, which takes taps instead.
     private var padActive: Bool { controller.firstFrame && !controller.menuOpen }
 
-    private var touchActive: Bool { padActive && TouchInput.supported }
+    private var touchActive: Bool { padActive && controller.streamTakesTouches }
+
+    /// A PC in desktop mode takes the pointer's place over the video.
+    private var pointerActive: Bool {
+        padActive && controller.pcStream
+            && (keyboardMouse.mouseConnected && keyboardMouse.mode == .desktop || PointerArea.forced)
+    }
 
     /// Keyboard shortcuts (Mac, iPad with a keyboard).
     private var shortcuts: some View {
@@ -208,15 +215,11 @@ private struct StreamMenu: View {
             row(.mouse, "Mouse") {
                 Text(keyboardMouse.mode == .game ? "Game" : "Desktop").foregroundStyle(Theme.muted)
             }
-            if TouchInput.supported {
-                // Touch only, so outside `MenuItem`, which the gamepad steps through.
-                button("Touch", selected: false, action: touch.toggleMode) {
+            if controller.streamTakesTouches {
+                row(.touch, "Touch") {
                     Text(touch.mode == .trackpad ? "Trackpad" : "Direct").foregroundStyle(Theme.muted)
                 }
-                button("Keyboard", selected: false, action: {
-                    SoftKeyboard.shared.show()
-                    controller.closeMenu()
-                })
+                row(.keyboard, "Keyboard")
             }
             row(.reconnect, "Reconnect")
             Spacer(minLength: 12)
@@ -226,13 +229,8 @@ private struct StreamMenu: View {
 
     private func row(_ item: SessionController.MenuItem, _ title: String, danger: Bool = false,
                      @ViewBuilder trailing: () -> some View = { EmptyView() }) -> some View {
-        let selected = SessionController.MenuItem.allCases.firstIndex(of: item) == controller.menuSelection
-        return button(title, selected: selected, danger: danger, action: { controller.perform(item) }, trailing: trailing)
-    }
-
-    private func button(_ title: String, selected: Bool, danger: Bool = false, action: @escaping () -> Void,
-                        @ViewBuilder trailing: () -> some View = { EmptyView() }) -> some View {
-        Button(action: action) {
+        let selected = controller.menuItems.firstIndex(of: item) == controller.menuSelection
+        return Button { controller.perform(item) } label: {
             HStack {
                 Text(title)
                 Spacer()
