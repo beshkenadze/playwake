@@ -23,9 +23,9 @@ pub struct PwPad {
 }
 
 /// The event mask, after opening or shutting the input gate with the menu.
-fn report(events: &[RouteEvent]) -> u32 {
+fn report(route: *const Route, events: &[RouteEvent]) -> u32 {
     for event in events {
-        if let RouteEvent::Overlay(open) = event { crate::input_bridge::menu(*open); }
+        if let RouteEvent::Overlay(open) = event { crate::input_bridge::menu(route as usize, *open); }
     }
     mask(events)
 }
@@ -44,9 +44,10 @@ fn mask(events: &[RouteEvent]) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pw_route_new() -> *mut Route {
+    let route = Box::into_raw(Box::new(Route::default()));
     // A stream stopped with its menu open never closed it.
-    crate::input_bridge::menu(false);
-    Box::into_raw(Box::new(Route::default()))
+    crate::input_bridge::route_started(route as usize);
+    route
 }
 
 /// # Safety
@@ -65,6 +66,7 @@ pub unsafe extern "C" fn pw_route_free(route: *mut Route) {
 /// `route` and `pad` must be valid, or null (then nothing happens).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pw_route_input(route: *mut Route, pad: *mut PwPad, now_ms: f64) -> u32 {
+    let address = route;
     let (Some(route), Some(pad)) = (unsafe { route.as_mut() }, unsafe { pad.as_mut() }) else {
         return 0;
     };
@@ -73,7 +75,7 @@ pub unsafe extern "C" fn pw_route_input(route: *mut Route, pad: *mut PwPad, now_
     pad.buttons = routed.buttons;
     pad.lt = routed.lt;
     pad.rt = routed.rt;
-    report(&events)
+    report(address, &events)
 }
 
 /// Opens the stream menu (touch, keyboard). Returns the event mask.
@@ -82,7 +84,7 @@ pub unsafe extern "C" fn pw_route_input(route: *mut Route, pad: *mut PwPad, now_
 /// `route` must be valid, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pw_route_open(route: *mut Route) -> u32 {
-    unsafe { route.as_mut() }.map_or(0, |route| report(&route.open_overlay()))
+    unsafe { route.as_mut() }.map_or(0, |route| report(route, &route.open_overlay()))
 }
 
 /// Closes the stream menu; `guide` sends one Xbox Guide press afterwards.
@@ -91,7 +93,7 @@ pub unsafe extern "C" fn pw_route_open(route: *mut Route) -> u32 {
 /// `route` must be valid, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pw_route_close(route: *mut Route, guide: bool) -> u32 {
-    unsafe { route.as_mut() }.map_or(0, |route| report(&route.close_overlay(guide)))
+    unsafe { route.as_mut() }.map_or(0, |route| report(route, &route.close_overlay(guide)))
 }
 
 #[cfg(test)]

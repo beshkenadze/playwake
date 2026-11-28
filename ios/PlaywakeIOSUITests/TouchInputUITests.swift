@@ -142,6 +142,7 @@ final class TouchInputUITests: XCTestCase {
     @MainActor
     func testFingersPassThroughThePointerArea() {
         let app = launch(extra: ["-pointerArea"])
+        XCTAssertTrue(waitForJournal(app, toContain: "pointer area"), "the pointer area is not over the video")
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         XCTAssertTrue(waitForJournal(app, toContain: "touch began"), "the pointer area took the finger: \(journal(app))")
         XCTAssertTrue(waitForJournal(app, toContain: "touch ended"), journal(app))

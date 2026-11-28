@@ -57,6 +57,8 @@ const KEYBOARD_PAGE: u16 = 0x07;
 type Pc<'a, S> = Option<(u64, &'a S)>;
 
 struct Input {
+    /// The route of the current stream, by address; only its menu shuts the gate.
+    route: usize,
     /// The route's menu is open: input waits, nothing is held.
     paused: bool,
     desktop: bool,
@@ -75,6 +77,7 @@ struct Input {
 impl Default for Input {
     fn default() -> Self {
         Self {
+            route: 0,
             paused: false,
             desktop: false,
             direct: false,
@@ -259,9 +262,18 @@ fn locked<R, S: Sink>(input: &Mutex<Input>, stream: impl FnOnce() -> Option<(u64
     f(&mut input, stream.as_ref().map(|(session, stream)| (*session, &**stream)))
 }
 
-/// Opens or shuts the input gate with the route's menu.
-pub(crate) fn menu(open: bool) {
-    with(|input, pc| input.menu(pc, open));
+/// A new stream's route: its gate starts open, and an older route's menu
+/// no longer moves it.
+pub(crate) fn route_started(route: usize) {
+    with(|input, pc| {
+        input.route = route;
+        input.menu(pc, false);
+    });
+}
+
+/// Opens or shuts the input gate with the current route's menu.
+pub(crate) fn menu(route: usize, open: bool) {
+    with(|input, pc| if input.route == route { input.menu(pc, open) });
 }
 
 /// Serialises the tests that use the global input state.
@@ -678,7 +690,7 @@ mod tests {
     #[test]
     fn c_calls_without_a_pc_drive_the_pad_and_ignore_bad_arguments() {
         let _global = global();
-        menu(false);
+        route_started(0);
         for button in [5, 99, u32::MAX] { pw_input_mouse_button(PW_INPUT_SOURCE_MOUSE, button, true); }
         pw_input_mouse_button(7, PW_INPUT_BUTTON_LEFT, true);
         pw_input_key(PW_INPUT_SOURCE_KEYBOARD, 0x0C, W, true);
@@ -715,17 +727,31 @@ mod tests {
         unsafe { pw_input_pad(&mut sample, 1.0) };
         assert_eq!(sample.axes, [0; 4], "a key reached the pad behind the menu");
         unsafe { crate::pw_route_close(route, false) };
+        let mut sample = pad();
+        unsafe { pw_input_pad(&mut sample, 2.0) };
+        assert_eq!(sample.axes, [0; 4], "W pressed behind the menu was held after it");
         pw_input_key(PW_INPUT_SOURCE_KEYBOARD, KEYBOARD_PAGE, W, true);
         unsafe { pw_input_pad(&mut sample, 2.0) };
         assert_eq!(sample.axes[1], -i16::MAX, "the closed menu kept the gate shut");
+        let w_reaches_the_pad = |now| {
+            pw_input_release_all();
+            pw_input_key(PW_INPUT_SOURCE_KEYBOARD, KEYBOARD_PAGE, W, true);
+            let mut sample = pad();
+            unsafe { pw_input_pad(&mut sample, now) };
+            sample.axes[1] == -i16::MAX
+        };
         // A stream stopped with its menu open leaves the next one open.
         unsafe { crate::pw_route_open(route) };
-        unsafe { crate::pw_route_free(route) };
         let next = crate::pw_route_new();
-        pw_input_key(PW_INPUT_SOURCE_KEYBOARD, KEYBOARD_PAGE, W, true);
-        let mut sample = pad();
-        unsafe { pw_input_pad(&mut sample, 3.0) };
-        assert_eq!(sample.axes[1], -i16::MAX, "the new stream started with the gate shut");
+        assert!(w_reaches_the_pad(3.0), "the new stream started with the gate shut");
+        // The old route's menu no longer moves the gate.
+        unsafe { crate::pw_route_open(route) };
+        assert!(w_reaches_the_pad(4.0), "the old route's menu shut the new stream's gate");
+        unsafe { crate::pw_route_open(next) };
+        unsafe { crate::pw_route_close(route, false) };
+        assert!(!w_reaches_the_pad(5.0), "the old route's close opened the new stream's gate");
+        unsafe { crate::pw_route_close(next, false) };
+        unsafe { crate::pw_route_free(route) };
         pw_input_release_all();
         unsafe { crate::pw_route_free(next) };
     }

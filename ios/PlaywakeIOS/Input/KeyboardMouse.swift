@@ -354,13 +354,16 @@ private enum PointerLock {
 }
 
 /// Desktop mode: follows the pointer over the stream, also while a button
-/// is held, and sends the left button with the pointer's place.
-struct PointerArea: UIViewRepresentable {
-    func makeUIView(context: Context) -> PointerAreaView { PointerAreaView() }
-    func updateUIView(_ view: PointerAreaView, context: Context) {}
-
-    static func dismantleUIView(_ view: PointerAreaView, coordinator: ()) {
-        KeyboardMouse.shared.pointerLifted()
+/// is held, and sends the left button with the pointer's place. On a touch
+/// screen fingers pass through it to the touch surface below.
+struct PointerArea: View {
+    var body: some View {
+        #if targetEnvironment(macCatalyst)
+        // A Mac has no fingers; these gestures were checked there with a mouse.
+        PointerGestures()
+        #else
+        PointerAreaRepresentable()
+        #endif
     }
 
     #if DEBUG
@@ -369,6 +372,40 @@ struct PointerArea: UIViewRepresentable {
     #else
     static let forced = false
     #endif
+}
+
+private struct PointerGestures: View {
+    @GestureState private var pressing = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            Color.clear
+                .contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    if case .active(let point) = phase {
+                        KeyboardMouse.shared.pointer(at: point, in: geometry.size)
+                    }
+                }
+                .gesture(DragGesture(minimumDistance: 0)
+                    .updating($pressing) { _, pressing, _ in pressing = true }
+                    .onChanged { drag in KeyboardMouse.shared.pointer(at: drag.location, in: geometry.size, pressed: true) }
+                    .onEnded { drag in KeyboardMouse.shared.pointer(at: drag.location, in: geometry.size, pressed: false) })
+                // A cancelled drag never ends, but its gesture state resets.
+                .onChange(of: pressing) { _, pressing in
+                    if !pressing { KeyboardMouse.shared.pointerLifted() }
+                }
+                .onDisappear { KeyboardMouse.shared.pointerLifted() }
+        }
+    }
+}
+
+private struct PointerAreaRepresentable: UIViewRepresentable {
+    func makeUIView(context: Context) -> PointerAreaView { PointerAreaView() }
+    func updateUIView(_ view: PointerAreaView, context: Context) {}
+
+    static func dismantleUIView(_ view: PointerAreaView, coordinator: ()) {
+        KeyboardMouse.shared.pointerLifted()
+    }
 }
 
 final class PointerAreaView: UIView {
@@ -380,6 +417,13 @@ final class PointerAreaView: UIView {
         backgroundColor = .clear
         addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hover(_:))))
     }
+
+    #if DEBUG
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { InputJournal.shared.write("pointer area") }
+    }
+    #endif
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
