@@ -198,7 +198,7 @@ impl Media {
     }
 
     /// Receives one datagram, pinging the host on the way when it is time.
-    fn receive<'a>(&mut self, buffer: &'a mut [u8]) -> Option<&'a [u8]> {
+    fn receive<'a>(&mut self, buffer: &'a mut [u8]) -> std::io::Result<&'a [u8]> {
         if Instant::now() >= self.next_ping {
             self.pings += 1;
             self.ping[16..].copy_from_slice(&self.pings.to_be_bytes());
@@ -206,8 +206,8 @@ impl Media {
             // A fixed beat, so the two streams' pings stay apart.
             self.next_ping += MEDIA_PING;
         }
-        let length = self.socket.recv(buffer).ok()?;
-        Some(&buffer[..length])
+        let length = self.socket.recv(buffer)?;
+        Ok(&buffer[..length])
     }
 }
 
@@ -309,7 +309,7 @@ impl Stream {
             let mut buffer = vec![0u8; 2048];
             let mut last = None;
             while !running.load(Ordering::Relaxed) {
-                let Some(datagram) = audio.receive(&mut buffer) else { continue };
+                let Ok(datagram) = audio.receive(&mut buffer) else { continue };
                 if datagram.len() <= RTP_HEADER || datagram[1] != OPUS_DATA { continue; }
                 let sequence = u16::from_be_bytes([datagram[2], datagram[3]]);
                 // Sound is played as it arrives, so a late packet or a repeat
@@ -400,9 +400,11 @@ fn play_video(mut video: Media, link: &Control, sender: &mpsc::Sender<Event>, ru
     let mut asked_at = Instant::now();
     while !running.load(Ordering::Relaxed) {
         let frame = match video.receive(&mut buffer) {
-            Some(datagram) => assembler.push(datagram),
+            Ok(datagram) => assembler.push(datagram),
             // Nothing for RECEIVE_WAIT: a frame still missing packets is lost.
-            None => { assembler.idle(); None }
+            Err(error) if quiet(&error) => { assembler.idle(); None }
+            // A signal or a refused ping says nothing about the frame.
+            Err(_) => None,
         };
         if let Some(frame) = frame { let _ = sender.send(Event::Video(frame)); }
         // The answer to a request can be lost as well, so ask again
@@ -412,6 +414,11 @@ fn play_video(mut video: Media, link: &Control, sender: &mpsc::Sender<Event>, ru
             link.send(CHANNEL_URGENT, control::REQUEST_IDR, &[0, 0]);
         }
     }
+}
+
+/// Whether a receive ended because the host sent nothing for RECEIVE_WAIT.
+fn quiet(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
 #[cfg(test)]
@@ -431,7 +438,7 @@ mod tests {
         let threads: Vec<_> = [(video, stop.clone()), (audio, stop.clone())].into_iter().map(|(mut media, stop)| {
             thread::spawn(move || {
                 let mut buffer = [0u8; 64];
-                while !stop.load(Ordering::Relaxed) { media.receive(&mut buffer); }
+                while !stop.load(Ordering::Relaxed) { let _ = media.receive(&mut buffer); }
             })
         }).collect();
         let started = Instant::now();
@@ -547,6 +554,15 @@ mod tests {
     }
 
     #[test]
+    fn only_a_receive_that_timed_out_means_the_host_is_quiet() {
+        use std::io::{Error, ErrorKind};
+        assert!(quiet(&Error::from(ErrorKind::WouldBlock)));
+        assert!(quiet(&Error::from(ErrorKind::TimedOut)));
+        assert!(!quiet(&Error::from(ErrorKind::Interrupted)));
+        assert!(!quiet(&Error::from(ErrorKind::ConnectionRefused)));
+    }
+
+    #[test]
     fn a_frame_cut_off_before_a_still_picture_makes_the_client_ask_for_a_key_frame() {
         let (asked, requests) = mpsc::channel();
         let (address, host) = crate::enet::tests::host(move |host, _| {
@@ -579,17 +595,21 @@ mod tests {
 
         for packet in crate::video::tests::packets(1, true, &[1; 40], 1) { sender.send_to(&packet, to).unwrap(); }
         assert!(matches!(frames.recv_timeout(Duration::from_secs(2)), Ok(Event::Video(Frame { index: 1, key: true, .. }))));
-        // Requests for the first key frame, if the machine was slow to deliver it, do not count.
-        thread::sleep(Duration::from_millis(50));
-        let _ = requests.try_iter().count();
+        // A whole frame and silence ask for nothing. Requests for the first
+        // key frame, if the machine was slow to deliver it, end here too.
+        while requests.recv_timeout(KEY_FRAME_REQUEST_GAP + RECEIVE_WAIT).is_ok() {}
         // The end of the next frame never comes, and the host sends nothing
-        // more on a still picture: the client asks, and asks again.
+        // more on a still picture: the client asks once the host has been
+        // quiet, and asks again while no key frame comes.
         sender.send_to(&crate::video::tests::packets(2, false, &[2; 40], 1)[0], to).unwrap();
         let sent = Instant::now();
+        let mut asked_at = Vec::new();
         for _ in 0..2 {
             assert_eq!(requests.recv_timeout(Duration::from_secs(2)), Ok((control::REQUEST_IDR, vec![0, 0])));
+            asked_at.push(sent.elapsed());
         }
-        assert!(sent.elapsed() >= RECEIVE_WAIT + KEY_FRAME_REQUEST_GAP / 2);
+        assert!(asked_at[0] >= RECEIVE_WAIT * 9 / 10, "{asked_at:?}");
+        assert!(asked_at[1] - asked_at[0] >= KEY_FRAME_REQUEST_GAP / 2, "{asked_at:?}");
 
         stop.store(true, Ordering::Relaxed);
         player.join().unwrap();
