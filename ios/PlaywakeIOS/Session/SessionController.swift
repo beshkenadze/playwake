@@ -9,12 +9,19 @@ struct DeviceCode {
 
 @MainActor
 final class SessionController: ObservableObject {
-    enum Phase: Equatable {
+    /// The Microsoft account, which only the Xbox sections need.
+    enum Account: Equatable {
         case restoring
         case signedOut
         case signingIn
-        case ready
-        case failed(String)
+        case signedIn
+    }
+
+    /// What shows when no stream and no sign-in code is up.
+    enum Screen: Equatable {
+        case splash
+        case welcome
+        case home
     }
 
     enum Target: Equatable {
@@ -51,7 +58,13 @@ final class SessionController: ObservableObject {
         }
     }
 
-    @Published private(set) var phase: Phase = .restoring
+    @Published private(set) var account: Account = .restoring
+    @Published private(set) var screen: Screen = .splash
+    /// Why Xbox is not available: a saved sign-in that could not be read or
+    /// refreshed, or a failed sign-in. Shown on the Xbox sections only.
+    @Published private(set) var xboxError = ""
+    /// A sign-in was tried in this launch, so the welcome shows why it failed.
+    @Published private(set) var signInTried = false
     @Published private(set) var device: DeviceCode?
     @Published private(set) var consoles: [XboxConsole] = []
     @Published private(set) var cloud: [CloudGame] = []
@@ -60,6 +73,8 @@ final class SessionController: ObservableObject {
     @Published private(set) var pcLoading = true
     @Published private(set) var pairing: Pairing?
     @Published private(set) var status = ""
+    /// What the PCs are doing or why they failed, for the PC section.
+    @Published private(set) var pcStatus = ""
     @Published private(set) var streaming = false
     @Published private(set) var stats = LabStats()
     @Published var target: Target = .home
@@ -90,9 +105,11 @@ final class SessionController: ObservableObject {
     private var pcPlayer: PcPlayer?
     private var autoAdded = false
     private var streamStart: DispatchTime?
-    private var accountActive = false
+    private var restoreAsked = false
     private var lastTarget: StreamTarget?
     private var fixture = false
+    private var pairedPc = false
+    private var opensSection = false
     private var streamStartedAt: CFAbsoluteTime = 0
 
     init() {
@@ -108,6 +125,8 @@ final class SessionController: ObservableObject {
         core.onEvent = { [weak self] event in
             self?.handle(event)
         }
+        // Read before the catalog's thread can rewrite the saved PCs.
+        pairedPc = core.hasPairedPc
         core.pcCatalog()
         #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
@@ -118,8 +137,78 @@ final class SessionController: ObservableObject {
         if let i = arguments.firstIndex(of: "-section"), i + 1 < arguments.count,
            let opened = Section.allCases.first(where: { "\($0)" == arguments[i + 1] }) {
             section = opened
+            opensSection = true
+        }
+        // `-pcPair` and `-pcPlay` work on the PC section.
+        if !opensSection, arguments.contains("-pcPair") || arguments.contains("-pcPlay") {
+            section = .pcs
+            opensSection = true
         }
         #endif
+        if !fixture {
+            showStart()
+        }
+    }
+
+    /// The first screen: home once signed in, with a paired PC or a section
+    /// asked for; the welcome when neither; the splash while the saved
+    /// sign-in is read and nothing else decides.
+    nonisolated static func startScreen(account: Account, pairedPc: Bool, opensSection: Bool) -> Screen {
+        if account == .signedIn || pairedPc || opensSection { return .home }
+        return account == .restoring ? .splash : .welcome
+    }
+
+    /// The account after a core `error` came while it was `account`, and
+    /// whether the message says why Xbox is unavailable rather than being a
+    /// status. A saved sign-in that cannot be read or refreshed leaves the
+    /// account signed out, so it keeps no one from the PCs.
+    nonisolated static func afterError(_ account: Account, codeShown: Bool) -> (account: Account, xbox: Bool) {
+        switch account {
+        case .restoring: (.signedOut, true)
+        // With the code up, `done` ends the sign-in.
+        case .signingIn: (codeShown ? .signingIn : .signedOut, true)
+        case .signedOut, .signedIn: (account, false)
+        }
+    }
+
+    /// A PC stream ends with `pcEnded`; an Xbox error, such as a late
+    /// restore, leaves it alone.
+    nonisolated static func errorEndsStream(streaming: Bool, pcStream: Bool) -> Bool {
+        streaming && !pcStream
+    }
+
+    /// The Settings row for the Microsoft account.
+    nonisolated static func accountSummary(_ account: Account, consoles: Int) -> String {
+        switch account {
+        case .signedIn: consoles == 1 ? "1 console" : "\(consoles) consoles"
+        case .restoring, .signingIn: "Signing in…"
+        case .signedOut: "Not signed in"
+        }
+    }
+
+    /// The section home opens on: the PCs without a Microsoft account.
+    nonisolated static func startSection(account: Account, asked: Section?) -> Section {
+        asked ?? (account == .signedIn ? .consoles : .pcs)
+    }
+
+    /// Leaves the splash or the welcome once the account is known; home stays.
+    private func showStart() {
+        guard screen != .home else { return }
+        screen = Self.startScreen(account: account, pairedPc: pairedPc, opensSection: opensSection)
+        if screen == .home {
+            section = Self.startSection(account: account, asked: opensSection ? section : nil)
+        }
+    }
+
+    /// The welcome's way to the PCs, without a Microsoft account.
+    func openPcs() {
+        open(.pcs)
+    }
+
+    /// Opens home on `section`, as the menu's Settings does from the welcome.
+    func open(_ section: Section) {
+        self.section = section
+        if screen != .splash { screen = .home }
     }
 
     func refreshPcs() {
@@ -132,14 +221,14 @@ final class SessionController: ObservableObject {
         let address = address.trimmingCharacters(in: .whitespaces)
         guard !address.isEmpty else { return }
         pcLoading = true
-        status = "Looking for Sunshine at \(address)…"
+        pcStatus = "Looking for Sunshine at \(address)…"
         core.addPc(address: address)
     }
 
     /// Pairs with an unpaired PC; `pairing` shows the PIN meanwhile.
     func pair(_ computer: PcComputer) {
         guard let address = computer.address else { return }
-        status = "Pairing with \(computer.name)…"
+        pcStatus = "Pairing with \(computer.name)…"
         core.pairPc(address: address)
     }
 
@@ -180,13 +269,15 @@ final class SessionController: ObservableObject {
     }
 
     func restore() {
-        guard phase == .restoring || phase == .signedOut, !fixture else { return }
-        phase = .restoring
+        guard account == .restoring, !restoreAsked, !fixture else { return }
+        restoreAsked = true
         core.restore()
     }
 
     func signIn() {
-        phase = .signingIn
+        account = .signingIn
+        signInTried = true
+        xboxError = ""
         status = "Contacting Microsoft…"
         core.signIn()
     }
@@ -194,7 +285,7 @@ final class SessionController: ObservableObject {
     func cancelSignIn() {
         core.cancelSignIn()
         device = nil
-        phase = .signedOut
+        account = .signedOut
         status = ""
     }
 
@@ -341,29 +432,27 @@ final class SessionController: ObservableObject {
             device = DeviceCode(url: url, code: code, prefilled: prefilled)
             status = "Enter the code at \(url?.host ?? "microsoft.com/link")"
         case .account:
-            accountActive = true
-            phase = .ready
+            account = .signedIn
+            xboxError = ""
             device = nil
+            if screen != .home { section = .consoles }
+            screen = .home
             status = "Loading consoles…"
             core.consoles()
             core.cloudCatalog()
         case .signedOut:
-            accountActive = false
-            phase = .signedOut
+            account = .signedOut
             consoles = []
             cloud = []
             status = ""
+            showStart()
         case .error(let message):
-            status = message
-            if case .restoring = phase {
-                phase = .signedOut
-            }
-            if case .signingIn = phase, device == nil {
-                phase = .signedOut
-            }
-            if streaming {
+            let (next, xbox) = Self.afterError(account, codeShown: device != nil)
+            account = next
+            if xbox { xboxError = message } else { status = message }
+            showStart()
+            if Self.errorEndsStream(streaming: streaming, pcStream: pcStream) {
                 stop()
-                phase = accountActive ? .ready : .signedOut
             }
         case .consoles(let list):
             consoles = list
@@ -381,8 +470,8 @@ final class SessionController: ObservableObject {
             startMedia(stun: stun.first)
         case .done:
             device = nil
-            if case .signingIn = phase {
-                phase = .signedOut
+            if account == .signingIn {
+                account = .signedOut
             }
         case .pcs(let computers, let games):
             pcs = computers
@@ -393,11 +482,11 @@ final class SessionController: ObservableObject {
             #endif
         case .pcPin(let pin, let name):
             pairing = Pairing(name: name, pin: pin)
-            status = "Enter \(pin) in Sunshine on \(name)"
+            pcStatus = "Enter \(pin) in Sunshine on \(name)"
             LabLog.write("pc: pairing PIN \(pin) for \(name)")
         case .pcPaired(let name):
             pairing = nil
-            status = "Paired with \(name)"
+            pcStatus = "Paired with \(name)"
             refreshPcs()
         case .pcStreaming(let session, let hevc, let hdr):
             guard session == pcPlayer?.session else { break }
@@ -408,12 +497,12 @@ final class SessionController: ObservableObject {
             // A stream that was replaced or stopped already is not this one.
             if session == pcPlayer?.session, streaming {
                 stop()
-                status = error ?? ""
+                pcStatus = error ?? ""
             }
         case .pcError(let message):
             pairing = nil
             pcLoading = false
-            status = message
+            pcStatus = message
             LabLog.write("pc: \(message)")
         }
     }
@@ -488,8 +577,8 @@ final class SessionController: ObservableObject {
     }
 
     /// `-uiFixture <state>`: fills the screens with sample data so every state
-    /// can be checked without a console (welcome, signin, code, consoles,
-    /// cloud, settings, connecting, stream, menu; pcstream, a PC's).
+    /// can be checked without a console (welcome, signedout, signin, code,
+    /// consoles, cloud, settings, connecting, stream, menu; pcstream, a PC's).
     func loadFixture(_ name: String) {
         fixture = true
         consoles = [
@@ -504,13 +593,21 @@ final class SessionController: ObservableObject {
                       monogram: name.split(separator: " ").prefix(2).compactMap(\.first).map(String.init).joined().uppercased(),
                       hue: Double(index * 47 % 360))
         }
-        phase = .ready
+        account = .signedIn
+        screen = .home
         status = ""
         switch name {
-        case "welcome": phase = .signedOut
-        case "signin": phase = .signingIn
+        case "welcome":
+            account = .signedOut
+            screen = .welcome
+        case "signedout":
+            // Home without a Microsoft account; `-section` picks the section.
+            account = .signedOut
+            consoles = []
+            cloud = []
+        case "signin": account = .signingIn
         case "code":
-            phase = .signingIn
+            account = .signingIn
             device = DeviceCode(url: URL(string: "https://www.microsoft.com/link?otc=K7PMQ2XD"),
                                 code: "K7PM-Q2XD", prefilled: true)
         case "cloud": section = .cloud

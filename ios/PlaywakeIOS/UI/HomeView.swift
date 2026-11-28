@@ -66,6 +66,14 @@ struct ConsolesView: View {
     }
 
     var body: some View {
+        if controller.account == .signedIn {
+            consoles
+        } else {
+            XboxSignIn(controller: controller, cloud: false)
+        }
+    }
+
+    private var consoles: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 if !controller.status.isEmpty {
@@ -182,6 +190,57 @@ private struct ConsoleCard: View {
     }
 }
 
+/// An Xbox section without a Microsoft account: why, and the way to sign in.
+/// The PCs need no account.
+private struct XboxSignIn: View {
+    @ObservedObject var controller: SessionController
+    let cloud: Bool
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(cloud ? "Xbox Cloud Gaming" : "Stream from your Xbox")
+                    .font(.system(size: 26, weight: .bold))
+                Text(cloud ? "Sign in to Microsoft to play cloud games."
+                     : "Sign in to the Microsoft account your console uses.")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.muted)
+                if controller.account == .restoring {
+                    HStack(spacing: 10) {
+                        ProgressView().tint(Theme.mint)
+                        Text("Restoring your Microsoft sign-in…").foregroundStyle(Theme.muted)
+                    }
+                    .padding(.top, 8)
+                } else {
+                    if !controller.xboxError.isEmpty {
+                        Text(controller.xboxError)
+                            .font(.footnote)
+                            .foregroundStyle(Theme.danger)
+                            .accessibilityIdentifier("xboxError")
+                            .padding(.top, 4)
+                    }
+                    Button("Sign in with Microsoft") { controller.signIn() }
+                        .buttonStyle(.playwake)
+                        .accessibilityIdentifier("xboxSignIn")
+                        .padding(.top, 8)
+                }
+                Text("Streams from a PC need no account.")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+                    .padding(.top, 4)
+            }
+            .padding(22)
+            .frame(maxWidth: 520, alignment: .leading)
+            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .padding(.horizontal, 20)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Theme.canvas)
+        .navigationTitle(cloud ? "Xbox Cloud" : "Consoles")
+    }
+}
+
 // MARK: - Cloud
 
 struct CloudView: View {
@@ -189,8 +248,16 @@ struct CloudView: View {
     @State private var query = ""
 
     var body: some View {
+        if controller.account == .signedIn {
+            catalog
+        } else {
+            XboxSignIn(controller: controller, cloud: true)
+        }
+    }
+
+    private var catalog: some View {
         let games = searched(controller.cloud, query)
-        Group {
+        return Group {
             if controller.cloud.isEmpty {
                 VStack(spacing: 14) {
                     ProgressView().tint(Theme.mint)
@@ -238,6 +305,13 @@ struct PcView: View {
                     .padding(.horizontal, 20)
                     .padding(.vertical, 10)
                 }
+            }
+            if !controller.pcStatus.isEmpty {
+                Text(controller.pcStatus)
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 6)
             }
             if controller.pcGames.isEmpty {
                 VStack(spacing: 14) {
@@ -362,9 +436,18 @@ struct SettingsView: View {
                 Toggle("Sync to display refresh (V-Sync)", isOn: Binding(get: { controller.vsyncOn },
                                                                        set: { controller.setVsync($0) }))
                 #endif
-                LabeledContent("Microsoft account", value: controller.consoles.count == 1
-                               ? "1 console" : "\(controller.consoles.count) consoles")
-                Button("Sign out of Microsoft", role: .destructive) { confirmSignOut = true }
+                LabeledContent("Microsoft account",
+                               value: SessionController.accountSummary(controller.account,
+                                                                       consoles: controller.consoles.count))
+                switch controller.account {
+                case .signedIn:
+                    Button("Sign out of Microsoft", role: .destructive) { confirmSignOut = true }
+                case .signedOut:
+                    Button("Sign in") { controller.signIn() }
+                        .accessibilityIdentifier("settingsSignIn")
+                case .restoring, .signingIn:
+                    EmptyView()
+                }
             } header: {
                 Text("Xbox")
             } footer: {

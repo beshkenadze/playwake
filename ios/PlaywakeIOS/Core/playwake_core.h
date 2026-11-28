@@ -97,6 +97,8 @@ uint32_t pw_route_close(pw_route *route, bool guide);
 /// apps of the paired ones, then `pcs` again as their covers arrive. PC
 /// failures come as `pcError`, which leaves a running stream alone.
 void pw_pc_catalog(pw_emit callback);
+/// Whether a PC is paired, from the saved pairings alone (no network).
+bool pw_pc_has_paired(void);
 /// Remembers the PC at `address` (one the network search misses) once
 /// Sunshine answers there, then emits `pcs`; `pcError` otherwise.
 void pw_pc_add(pw_emit callback, const char *address);

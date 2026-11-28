@@ -236,7 +236,11 @@ fn save_session(client_id: &str, refresh_token: &str, catalog_key: &str) {
 
 pub fn restore_sign_in() -> Result<Option<Xbox>> {
     let client_id = public_client_id();
-    let Some(previous) = session_store::load(&client_id).map_err(|_| "Could not read saved Microsoft sign-in")? else {
+    let Some(previous) = session_store::load(&client_id).map_err(|error| {
+        // An iCloud-evicted Documents file reads as `Deadlock` on the Mac.
+        journal::record("session_unreadable", json!({"kind": format!("{:?}", error.kind())}));
+        "Could not read saved Microsoft sign-in"
+    })? else {
         return Ok(None);
     };
     journal::record("session_restore_started", json!({}));

@@ -16,7 +16,7 @@ struct PlaywakeApp: App {
         }
         .commands {
             CommandGroup(replacing: .appSettings) {
-                Button("Settings…") { session.section = .settings }
+                Button("Settings…") { session.open(.settings) }
                     .keyboardShortcut(",", modifiers: .command)
             }
         }

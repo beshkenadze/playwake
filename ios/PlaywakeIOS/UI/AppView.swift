@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Top-level flow: restoring → welcome → sign-in → home, and the stream over
-/// everything while it runs.
+/// Top-level flow: splash → welcome or home, the Microsoft sign-in code over
+/// either, and the stream over everything while it runs.
 struct AppView: View {
     @ObservedObject var controller: SessionController
     @Environment(\.scenePhase) private var scenePhase
@@ -24,17 +24,16 @@ struct AppView: View {
     private var content: some View {
         if controller.streaming {
             StreamView(controller: controller)
+        } else if controller.account == .signingIn {
+            SignInView(controller: controller)
         } else {
-            switch controller.phase {
-            case .restoring:
+            switch controller.screen {
+            case .splash:
                 SplashView()
-            case .signedOut:
-                WelcomeView(controller: controller, message: controller.status)
-            case .failed(let message):
-                WelcomeView(controller: controller, message: message)
-            case .signingIn:
-                SignInView(controller: controller)
-            case .ready:
+            case .welcome:
+                WelcomeView(controller: controller,
+                            message: controller.signInTried ? controller.xboxError : "")
+            case .home:
                 HomeView(controller: controller)
             }
         }
@@ -66,7 +65,7 @@ private struct WelcomeView: View {
                 Text("Playwake")
                     .font(.system(size: 40, weight: .bold))
                     .padding(.top, 22)
-                Text("Stream your Xbox with the lowest latency we can get.")
+                Text("Stream from your Xbox or PC with the lowest latency we can get.")
                     .font(.system(size: 17))
                     .foregroundStyle(Color(hex: 0xC9CBCB))
                     .padding(.top, 10)
@@ -79,12 +78,22 @@ private struct WelcomeView: View {
                 }
                 Button("Sign in with Microsoft") { controller.signIn() }
                     .buttonStyle(.playwake)
-                Text("Use the Microsoft account your console is signed in to.")
+                Text("For Xbox consoles and Xbox Cloud: use the Microsoft account your console is signed in to.")
                     .font(.footnote)
                     .foregroundStyle(Theme.muted)
                     .frame(maxWidth: .infinity)
                     .multilineTextAlignment(.center)
                     .padding(.top, 14)
+                Button("Stream from a PC") { controller.openPcs() }
+                    .buttonStyle(.playwakeSecondary)
+                    .accessibilityIdentifier("welcomeOpenPcs")
+                    .padding(.top, 22)
+                Text("Sunshine or Vibeshine on the PC; no account needed.")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+                    .frame(maxWidth: .infinity)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 10)
                     .padding(.bottom, 24)
             }
             .frame(maxWidth: 420)

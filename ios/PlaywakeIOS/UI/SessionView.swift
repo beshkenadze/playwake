@@ -89,18 +89,18 @@ struct SessionView: View {
                         .foregroundStyle(.tertiary)
                 }
 
-                switch controller.phase {
+                switch controller.account {
                 case .restoring:
                     HStack(spacing: 10) {
                         ProgressView()
                         Text("Restoring your Xbox session…")
                             .font(.system(size: 13, design: .monospaced))
                     }
-                case .signedOut, .failed:
+                case .signedOut:
                     signInPanel
                 case .signingIn:
                     signingInPanel
-                case .ready:
+                case .signedIn:
                     catalogs
                 }
 

@@ -307,9 +307,17 @@ fn saved_path() -> Option<std::path::PathBuf> {
 }
 
 fn load() -> Saved {
-    saved_path().and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    parse(saved_path().and_then(|path| std::fs::read(path).ok()))
+}
+
+/// The saved PCs from the file's bytes; none from a missing or unreadable file.
+fn parse(bytes: Option<Vec<u8>>) -> Saved {
+    bytes.and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+}
+
+/// Whether a PC is paired, from the saved pairings alone: no network.
+pub fn has_paired() -> bool {
+    !load().hosts.is_empty()
 }
 
 fn store(saved: &Saved) -> Result<()> {
@@ -527,6 +535,16 @@ mod tests {
 
     fn game(name: &str, pc: &str) -> Game {
         Game { name: name.into(), pc: paired(pc, "10.0.0.1"), app: 1, running: false, hdr: false, end_other: None }
+    }
+
+    #[test]
+    fn a_pc_counts_as_paired_only_from_a_readable_saved_pairing() {
+        let saved = json!({"key": "", "certificate": "",
+            "hosts": [{"id": "den", "name": "den", "address": "10.0.0.1", "certificate": ""}]});
+        assert!(!parse(Some(serde_json::to_vec(&saved).unwrap())).hosts.is_empty());
+        assert!(parse(Some(br#"{"key": "", "certificate": ""}"#.to_vec())).hosts.is_empty());
+        assert!(parse(Some(b"{".to_vec())).hosts.is_empty());
+        assert!(parse(None).hosts.is_empty());
     }
 
     #[test]

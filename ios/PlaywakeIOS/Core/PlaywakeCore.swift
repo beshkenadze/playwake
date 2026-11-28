@@ -120,13 +120,29 @@ final class PlaywakeCore {
     }
 
     private init() {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let documents = Self.stateDirectory
+        try? FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
         let session = documents.appendingPathComponent("playwake-session.json").path
         let storage = documents.appendingPathComponent("playwake-storage").path
         try? FileManager.default.createDirectory(atPath: storage, withIntermediateDirectories: true)
         if pw_init(session) != 0 {
             NSLog("playwake-core: pw_init failed")
         }
+    }
+
+    /// Where the sign-in, the paired PCs and the caches are kept: Documents,
+    /// or in debug builds `-stateDir <path>` (relative to the temporary
+    /// directory), so a check can start empty without touching the saved state.
+    private static var stateDirectory: URL {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        #if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if let i = arguments.firstIndex(of: "-stateDir"), i + 1 < arguments.count, !arguments[i + 1].isEmpty {
+            return URL(fileURLWithPath: arguments[i + 1],
+                       relativeTo: FileManager.default.temporaryDirectory).standardizedFileURL
+        }
+        #endif
+        return documents
     }
 
     // MARK: - Account
@@ -154,6 +170,7 @@ final class PlaywakeCore {
     // MARK: - PCs
 
     func pcCatalog() { pw_pc_catalog(trampoline) }
+    var hasPairedPc: Bool { pw_pc_has_paired() }
     func pairPc(address: String) { pw_pc_pair(trampoline, address) }
     func addPc(address: String) { pw_pc_add(trampoline, address) }
 

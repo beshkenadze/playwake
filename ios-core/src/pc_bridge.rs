@@ -101,6 +101,13 @@ pub extern "C" fn pw_pc_catalog(callback: Emit) {
     std::thread::spawn(move || refresh(callback));
 }
 
+/// Whether a PC is paired, from the saved pairings: no network, so it can
+/// choose the first screen.
+#[unsafe(no_mangle)]
+pub extern "C" fn pw_pc_has_paired() -> bool {
+    pc::has_paired()
+}
+
 /// Remembers a PC the network search does not find, once Sunshine answers
 /// at `address`; then emits `pcs` as `pw_pc_catalog` does.
 #[unsafe(no_mangle)]
