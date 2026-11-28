@@ -309,22 +309,12 @@ struct SettingsView: View {
                     .labelsHidden()
                     .fixedSize()
                 }
-                Picker("Smoothing", selection: Binding(get: { controller.playoutMs },
-                                                       set: { controller.setPlayoutMs($0) })) {
-                    Text("Off").tag(0)
-                    ForEach([5, 10, 20, 50, 100, 150], id: \.self) { Text("\($0) ms").tag($0) }
-                }
+                Toggle("Statistics overlay", isOn: $controller.showStats)
             } header: {
-                Text("Stream")
+                Text("All streams")
             } footer: {
-                Text("Smoothing absorbs Wi-Fi jitter. 10 ms costs almost nothing; higher values add delay. A new value applies the next time Playwake starts.")
+                Text("For Xbox and PC streams.")
             }
-            #if targetEnvironment(macCatalyst)
-            Section("Display") {
-                Toggle("Sync to display refresh (V-Sync)", isOn: Binding(get: { controller.vsyncOn },
-                                                                       set: { controller.setVsync($0) }))
-            }
-            #endif
             Section {
                 LabeledContent("Controller") {
                     HStack(spacing: 6) {
@@ -357,16 +347,35 @@ struct SettingsView: View {
                 Text("Controls")
             } footer: {
                 if VirtualPad.supported {
-                    Text("Auto shows the on-screen controller during a stream when no controller is connected. Playwake's has every Xbox control and can be rearranged; the system one has fewer.")
+                    Text("For Xbox and PC streams. Auto shows the on-screen controller when no controller is connected. Playwake's has every Xbox control and can be rearranged; the system one has fewer.")
+                } else {
+                    Text("For Xbox and PC streams.")
                 }
             }
-            Section("Diagnostics") {
-                Toggle("Statistics overlay", isOn: $controller.showStats)
-            }
-            Section("Microsoft account") {
-                LabeledContent("Signed in", value: controller.consoles.count == 1
+            Section {
+                Picker("Smoothing", selection: Binding(get: { controller.playoutMs },
+                                                       set: { controller.setPlayoutMs($0) })) {
+                    Text("Off").tag(0)
+                    ForEach([5, 10, 20, 50, 100, 150], id: \.self) { Text("\($0) ms").tag($0) }
+                }
+                #if targetEnvironment(macCatalyst)
+                Toggle("Sync to display refresh (V-Sync)", isOn: Binding(get: { controller.vsyncOn },
+                                                                       set: { controller.setVsync($0) }))
+                #endif
+                LabeledContent("Microsoft account", value: controller.consoles.count == 1
                                ? "1 console" : "\(controller.consoles.count) consoles")
-                Button("Sign out", role: .destructive) { confirmSignOut = true }
+                Button("Sign out of Microsoft", role: .destructive) { confirmSignOut = true }
+            } header: {
+                Text("Xbox")
+            } footer: {
+                Text("Remote Play and Cloud. Smoothing absorbs Wi-Fi jitter: 10 ms costs almost nothing, higher values add delay. A new value applies the next time Playwake starts.")
+            }
+            Section {
+                LabeledContent("Paired PCs", value: "\(controller.pcs.filter { $0.state == .paired }.count)")
+            } header: {
+                Text("PC")
+            } footer: {
+                Text("Sunshine and Vibeshine. Add or pair a PC on the PC tab; a PC stream uses 20 Mbps at 60 fps.")
             }
             Section {
                 LabeledContent("Version", value: version)
