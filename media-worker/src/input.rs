@@ -323,6 +323,7 @@ impl Mouse {
             for event in events { self.send(sink, event, window, picture); }
         } else if self.active {
             self.pc.release_all(sink);
+            self.forget_taps();
         }
         self.active = active;
     }
@@ -330,12 +331,17 @@ impl Mouse {
     /// Switches between the game and desktop modes, letting go of held buttons.
     pub fn toggle_mode(&mut self, sink: &impl Sink) {
         self.pc.release_all(sink);
+        self.forget_taps();
         self.mode = match self.mode { MouseMode::Game => MouseMode::Desktop, MouseMode::Desktop => MouseMode::Game };
     }
 
     fn send(&mut self, sink: &impl Sink, event: PointerEvent, window: (u32, u32), picture: (u32, u32)) {
         let event = match (event, self.mode) {
-            (PointerEvent::Moved { dx, dy }, MouseMode::Game) => Some(InputEvent::MouseMove { dx: dx as f32, dy: dy as f32 }),
+            (PointerEvent::Moved { dx, dy }, MouseMode::Game) => {
+                // The mouse moved: a press now is its own, not a tap's.
+                self.jumped_at = None;
+                Some(InputEvent::MouseMove { dx: dx as f32, dy: dy as f32 })
+            }
             (PointerEvent::At { x, y }, MouseMode::Desktop) => over_picture((x, y), window, picture)
                 .map(|(x, y)| InputEvent::MousePosition { x, y }),
             (PointerEvent::Jumped { time }, _) => {
@@ -355,9 +361,17 @@ impl Mouse {
     /// Whether a button change belongs to a tap on the touchscreen.
     fn tap(&mut self, button: u32, down: bool, time: u32) -> bool {
         if !down { return self.tapped.remove(&button); }
-        let tap = self.jumped_at.is_some_and(|at| time.wrapping_sub(at) <= TAP_MS);
-        if tap { self.tapped.insert(button); }
+        // One jump makes one tap.
+        let tap = self.jumped_at.take().is_some_and(|at| time.wrapping_sub(at) <= TAP_MS);
+        if tap { self.tapped.insert(button); } else { self.tapped.remove(&button); }
         tap
+    }
+
+    /// Drops the taps in progress: their releases may come in another mode
+    /// or not at all, and must not swallow a later click's release.
+    fn forget_taps(&mut self) {
+        self.jumped_at = None;
+        self.tapped.clear();
     }
 }
 
@@ -581,6 +595,29 @@ mod tests {
         assert_eq!(sink.take(), Vec::<String>::new());
         // The mouse's own click a moment later goes to the PC.
         mouse.update(&sink, true, [left(true, 1400), left(false, 1450)], SCREEN, SCREEN);
+        assert_eq!(sink.take(), ["Left true", "Left false"]);
+    }
+
+    #[test]
+    fn a_tap_never_swallows_a_later_click_of_the_mouse() {
+        let sink = Recorder::default();
+        let mut mouse = active_mouse(&sink);
+        let left = |down, time| PointerEvent::Button { button: 1, down, time };
+        // A tap, then the mouse moves and clicks within the tap's window.
+        mouse.update(&sink, true, [PointerEvent::Jumped { time: 1000 }, left(true, 1000), left(false, 1050),
+            PointerEvent::Moved { dx: 1.0, dy: 0.0 }, left(true, 1100), left(false, 1150)], SCREEN, SCREEN);
+        // A second press after one jump is the mouse's too.
+        mouse.update(&sink, true, [PointerEvent::Jumped { time: 2000 }, left(true, 2000), left(false, 2050),
+            left(true, 2100), left(false, 2150)], SCREEN, SCREEN);
+        assert_eq!(sink.take(), ["move 1 0", "Left true", "Left false", "Left true", "Left false"]);
+        // A tap whose release comes in desktop mode leaves nothing behind
+        // to swallow the release of the next click in game mode.
+        mouse.update(&sink, true, [PointerEvent::Jumped { time: 3000 }, left(true, 3000)], SCREEN, SCREEN);
+        mouse.toggle_mode(&sink);
+        mouse.update(&sink, true, [left(false, 3050)], SCREEN, SCREEN);
+        mouse.toggle_mode(&sink);
+        sink.take();
+        mouse.update(&sink, true, [left(true, 9000), left(false, 9050)], SCREEN, SCREEN);
         assert_eq!(sink.take(), ["Left true", "Left false"]);
     }
 
